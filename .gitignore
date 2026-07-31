@@ -1,0 +1,36 @@
+# Build output (CRITICAL - don't commit!)
+target/
+
+# Generated documentation
+doc/
+
+# Benchmark results
+criterion/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.local
+
+# Test output
+*.tokio
+
+# Coverage
+*.profraw
+*.profdata
+coverage/
+
+# Release binaries
+/release/
+
+# Native build files (when using maturin for Python bindings)
+*.whl
+
+# OS-specific files
+.DS_Store
+Thumbs.db

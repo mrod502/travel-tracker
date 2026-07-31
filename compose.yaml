@@ -1,0 +1,123 @@
+networks:
+  dev:
+  test:
+  server:
+volumes:
+  db-data:
+  app-cache:
+  [language]-mod-cache:
+  [language]-build-cache:
+  [language]-bin-cache:
+  llm-home:
+services:
+  database:
+    # Add your database service here if needed
+    image: postgres:18
+    env_file: .env
+    networks:
+      - dev
+      - server
+    volumes:
+      - db-data:/var/lib/postgresql
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    ports:
+      - ${DB_PUBLIC_PORT}:5432
+  server:
+    # Your application server service
+    image: [YOUR_IMAGE_NAME]-server
+    volumes:
+      - app-cache:${[LANGUAGE]_CACHE}
+    build:
+      target: server
+    depends_on:
+      - database
+    networks:
+      - server
+      - dev
+    environment:
+      DOCKER: true
+    ports:
+      - ${LISTEN_PORT}:[APP_PORT]
+  llm:
+    # LLM coding agent container (e.g., qwen, claude-code)
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        # Match your host user so files created in the bind-mounted
+        # ./ -> /workspace aren't owned by a foreign UID. Set
+        # DEV_UID/DEV_GID in .env (e.g., `id -u`/`id -g`); defaults to 1000.
+        USER_UID: ${DEV_UID:-1000}
+        USER_GID: ${DEV_GID:-1000}
+
+    container_name: llm-dev
+
+    working_dir: /workspace
+
+    stdin_open: true
+    tty: true
+
+    networks:
+      - dev
+
+    volumes:
+      # Project - the only part of your filesystem the container can see
+      - .:/workspace
+
+      # Language-specific cache volumes (comment out if your language uses
+      # project-local directories like target/ or node_modules/)
+      - [language]-mod-cache:[LANGUAGE_MODULE_CACHE]
+      - [language]-build-cache:[LANGUAGE_BUILD_CACHE]
+      - [language]-bin-cache:[LANGUAGE_BIN_CACHE]
+
+      # Git identity + credentials, read-only. .gitconfig covers name/email
+      # and any credential.helper / url.insteadOf rewrites; .ssh covers
+      # key-based auth for private repositories.
+      - ${HOME}/.gitconfig:/home/dev/.gitconfig:ro
+      - ${HOME}/.ssh:/home/dev/.ssh:ro
+
+      # LLM agent keeps settings, auth, and session/checkpoint history
+      # under its config directory, which now persists via llm-home volume.
+
+      # /home/dev as a named volume rather than tmpfs. This persists
+      # LLM agent state, settings, and conversation history across restarts.
+      # Trade-off vs. tmpfs: $HOME no longer gets wiped on container
+      # restart. It's still fully isolated from your host and you can
+      # reset it anytime with `docker volume rm <project>_llm-home`.
+      - llm-home:/home/dev
+
+      # tmpfs is fine for pure scratch space with no ownership
+      # requirements like /tmp.
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          mode: 1777
+
+    environment:
+      HOME: /home/dev
+
+      # Language-specific environment variables
+      # Examples:
+      # Go: GOPATH, GOMODCACHE, GOCACHE, GOBIN
+      # Node.js: NODE_ENV, npm_config_cache
+      # Rust: CARGO_HOME, RUSTUP_HOME
+      # Python: VIRTUAL_ENV, PIP_CACHE_DIR
+      [LANGUAGE_ENV_VARS]
+
+    read_only: true
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    pids_limit: 512
+
+    mem_limit: 8g
+
+    cpus: 8
+
+    command: /bin/[SHELL]

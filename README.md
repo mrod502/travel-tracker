@@ -1,89 +1,156 @@
-# LLM Project Template
+# Travel Tracker
 
-This is a language-agnostic project template for setting up repositories to be developed with LLM coding agent assistance (e.g., Qwen Code, Claude Code).
+A Rust-based DB/HTTP server application for tracking travel data.
 
-## What's Included
+## Tech Stack
 
-- **AGENTS.md** - Agent instructions and project documentation (template)
-- **Dockerfile.dev** - Isolated development container for LLM agents
-- **compose.yaml** - Docker Compose configuration for LLM development environment
-- **.gitignore** - Git ignore patterns with language-agnostic defaults
-- **SETUP.md** - Step-by-step guide to customize for your language and project
-- **languages/** - Language-specific setup guides (Go, Node.js, Rust, Python, C/C++, React Native)
-- **.qwen/** - Qwen Code configuration (settings.json, skills/)
+- **Language**: Rust (2021 edition)
+- **Web Framework**: Axum (recommended)
+- **Database**: PostgreSQL with sqlx
+- **Async Runtime**: Tokio
+- **Serialization**: Serde + serde_json
+- **Error Handling**: anyhow + thiserror
+- **Logging**: tracing + tracing-subscriber
+
+## Directory Structure
+
+```
+.
+├── .cargo/
+│   └── config.toml
+├── migrations/
+│   └── 001_initial.sql
+├── src/
+│   ├── bin/
+│   │   └── main.rs
+│   ├── lib.rs
+│   ├── api/          # HTTP API handlers
+│   ├── db/           # Database operations
+│   ├── models/       # Data models
+│   ├── services/     # Business logic
+│   ├── types/        # Type definitions
+│   └── utils/        # Utility functions
+├── tests/
+│   └── integration_test.rs
+├── Cargo.toml
+├── Cargo.lock
+└── README.md
+```
+
+## Prerequisites
+
+- Docker Desktop or Podman installed
+- Docker Compose v2.x
+- Git configured with your identity
+- SSH keys set up for private repository access (if applicable)
 
 ## Quick Start
 
-1. **Read and follow SETUP.md** - This guide walks you through:
-   - Customizing Dockerfile.dev for your language/toolchain
-   - Configuring compose.yaml for your services
-   - Setting up language-specific caches and dependencies
-   - Tailoring .gitignore for your build artifacts
-   - Adapting CLAUDE.md for your project documentation
+### 1. Start the LLM development environment
 
-2. **Start the LLM development environment:**
-   ```bash
-   docker compose up -d llm
-   docker compose exec llm zsh
-   qwen  # or your chosen LLM agent
-   ```
+```bash
+docker compose up -d llm
+docker compose exec llm zsh
+qwen  # Start the LLM coding agent
+```
 
-## Key Features
+### 2. Initialize Rust project (first time only)
 
-### Qwen Code Configuration
+Inside the container:
 
-The `.qwen/` directory contains pre-configured settings for Qwen Code:
+```bash
+cargo init
+```
 
-- **settings.json** - Configured for local llama.cpp server at `http://192.168.50.115:8189/v1`
-- **Models configured**:
-  - `Qwen3.5-122b-a10b` - Default context (~200k tokens)
-  - `Qwen3.6-35b-a3b` - Fast context (~200k tokens)
-- **Skills directory** - Pre-configured debugging skill and documentation for creating custom skills
-- **No API key validation** - Configured for local development without authentication
+### 3. Add dependencies
 
-### Isolated LLM Development Environment
+```bash
+cargo add tokio --features full
+cargo add axum
+cargo add serde --features derive
+cargo add serde_json
+cargo add sqlx --features runtime-tokio-rustls,postgres
+cargo add anyhow thiserror
+cargo add tracing tracing-subscriber --features env-filter
+```
 
-- Non-root user with matched UID/GID for file permission compatibility
-- Read-only root filesystem for security
-- Named volumes for persistent caches and LLM agent state
-- tmpfs for temporary scratch space
-- Network isolation with dedicated Docker networks
+## Development Workflow
 
-### Language-Agnostic Design
+### Build & Run
 
-- Supports any programming language
-- Flexible cache directory configuration
-- Project-local build directories allowed (when appropriate)
-- Emphasis on `.gitignore` over restrictive policies
+```bash
+# Build in development mode
+cargo build
 
-### Security Hardening
+# Build in release mode
+cargo build --release
 
-- Droops all capabilities by default
-- Limits new privileges
-- Constrains process counts and memory usage
-- CPU resource allocation
+# Run the application
+cargo run
 
-## Customization Checklist
+# Run in release mode
+cargo run --release
+```
 
-Before using this template in a new project:
+### Testing
 
-- [ ] Replace all `[PLACEHOLDERS]` with language-specific values
-- [ ] Update `.gitignore` for your language's build artifacts
-- [ ] Configure Docker volumes based on your language's cache strategy
-- [ ] Tailor `CLAUDE.md` to document your project's architecture
-- [ ] Test that `git status` shows no unexpected build files
-- [ ] Verify LLM agent can run and access code intelligence tools
+```bash
+# Run all tests
+cargo test
 
-## Philosophy
+# Run tests with output
+cargo test -- --nocapture
+```
 
-This template follows these principles:
+### Code Quality
 
-1. **Clean Git history is paramount** - Never commit build artifacts or dependencies
-2. **Follow language conventions** - Don't fight your language's tooling
-3. **Isolation over integration** - LLM development happens in containers
-4. **Persistence where it matters** - LLM state and language caches survive restarts
-5. **Security by default** - Minimal privileges, read-only filesystems
+```bash
+# Format code
+cargo fmt
+
+# Lint code
+cargo clippy
+```
+
+## Docker Configuration
+
+### Services
+
+- **llm**: LLM coding agent container with Rust toolchain
+- **database**: PostgreSQL 18 database
+- **server**: Application server (when built)
+
+### Volumes
+
+- `llm-home`: Persists LLM agent state and settings
+- `db-data`: Persists PostgreSQL data
+
+### Environment Variables
+
+See `.env` file for configuration:
+- `DEV_UID/DEV_GID`: Match host user for file permissions
+- `DB_PASSWORD`: Database password
+- `DB_PUBLIC_PORT`: PostgreSQL port (default: 5432)
+- `LISTEN_PORT`: Application port (default: 8080)
+
+## Project Setup Checklist
+
+- [ ] Initialize Cargo project with `cargo init`
+- [ ] Configure `Cargo.toml` with project metadata
+- [ ] Add required dependencies
+- [ ] Set up database migrations in `migrations/`
+- [ ] Configure `.cargo/config.toml` for build optimizations
+- [ ] Create `rustfmt.toml` for code formatting
+- [ ] Implement core application logic
+- [ ] Write tests in `tests/`
+
+## Security Notes
+
+- Never commit `.env` file with sensitive data
+- Dependencies are pinned in `Cargo.lock`
+- Run `cargo audit` regularly to check for vulnerabilities
+- Use parameterized queries (sqlx does this by default)
 
 ## License
 
-This template is provided as-is for your projects. Feel free to modify and adapt.
+MIT

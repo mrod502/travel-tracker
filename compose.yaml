@@ -4,10 +4,6 @@ networks:
   server:
 volumes:
   db-data:
-  app-cache:
-  [language]-mod-cache:
-  [language]-build-cache:
-  [language]-bin-cache:
   llm-home:
 services:
   database:
@@ -23,12 +19,10 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
     ports:
-      - ${DB_PUBLIC_PORT}:5432
+      - ${DB_PUBLIC_PORT:-5432}:5432
   server:
     # Your application server service
-    image: [YOUR_IMAGE_NAME]-server
-    volumes:
-      - app-cache:${[LANGUAGE]_CACHE}
+    image: travel-tracker-server
     build:
       target: server
     depends_on:
@@ -39,7 +33,7 @@ services:
     environment:
       DOCKER: true
     ports:
-      - ${LISTEN_PORT}:[APP_PORT]
+      - ${LISTEN_PORT:-8080}:8080
   llm:
     # LLM coding agent container (e.g., qwen, claude-code)
     build:
@@ -48,7 +42,7 @@ services:
       args:
         # Match your host user so files created in the bind-mounted
         # ./ -> /workspace aren't owned by a foreign UID. Set
-        # DEV_UID/DEV_GID in .env (e.g., `id -u`/`id -g`); defaults to 1000.
+        # DEV_UID/DEV_GID in .env (e.g., `id -u`/`id -g`; defaults to 1000).
         USER_UID: ${DEV_UID:-1000}
         USER_GID: ${DEV_GID:-1000}
 
@@ -66,11 +60,10 @@ services:
       # Project - the only part of your filesystem the container can see
       - .:/workspace
 
-      # Language-specific cache volumes (comment out if your language uses
-      # project-local directories like target/ or node_modules/)
-      - [language]-mod-cache:[LANGUAGE_MODULE_CACHE]
-      - [language]-build-cache:[LANGUAGE_BUILD_CACHE]
-      - [language]-bin-cache:[LANGUAGE_BIN_CACHE]
+      # Rust uses project-local target/, so no language cache volumes needed
+      # Commented out for reference if you ever switch to CARGO_HOME volumes:
+      # - cargo-mod-cache:/usr/local/cargo
+      # - cargo-build-cache:/usr/local/cargo
 
       # Git identity + credentials, read-only. .gitconfig covers name/email
       # and any credential.helper / url.insteadOf rewrites; .ssh covers
@@ -98,13 +91,9 @@ services:
     environment:
       HOME: /home/dev
 
-      # Language-specific environment variables
-      # Examples:
-      # Go: GOPATH, GOMODCACHE, GOCACHE, GOBIN
-      # Node.js: NODE_ENV, npm_config_cache
-      # Rust: CARGO_HOME, RUSTUP_HOME
-      # Python: VIRTUAL_ENV, PIP_CACHE_DIR
-      [LANGUAGE_ENV_VARS]
+      # Rust environment variables
+      RUST_LOG: debug
+      RUST_BACKTRACE: 1
 
     read_only: true
 
@@ -120,4 +109,4 @@ services:
 
     cpus: 8
 
-    command: /bin/[SHELL]
+    command: /bin/zsh

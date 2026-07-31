@@ -5,27 +5,27 @@
 # Goals:
 #   - non-root user, matched to host UID/GID so the bind-mounted workspace
 #     doesn't end up with permission mismatches
-#   - [LANGUAGE] toolchain + runtime dependencies
+#   - Rust toolchain + runtime dependencies
 #   - read-only root fs at runtime (see compose.yaml), so everything the
 #     container needs to write to (language caches, home, tmp) is either a
 #     volume or tmpfs
-#   - git + ssh-client present so [LANGUAGE_PACKAGE_MANAGER] can pull
+#   - git + ssh-client present so cargo can pull
 #     private modules over the mounted, read-only ~/.ssh and ~/.gitconfig
-#   - [SHELL] as the interactive shell
+#   - zsh as the interactive shell
 #
-# Customize this file for your language:
-#   - Base image: Choose an appropriate base for your language/runtime
-#   - Install language runtime, package manager, and LSP/server tools
-#   - Install any system dependencies your project needs
-#   - Set up language-specific cache directories
+# Rust-specific:
+#   - Base image: rust:1.75-bookworm
+#   - System dependencies: pkg-config, libssl-dev (for many crates)
+#   - Rust tools: rustfmt, clippy, rust-analyzer, cargo-watch, cargo-nextest
+#   - Rust uses project-local target/, so no special cache volumes needed
 
-FROM [BASE_IMAGE]
+FROM rust:1.97-bookworm
 
 ARG USERNAME=dev
 ARG USER_UID=1000
 ARG USER_GID=${USER_UID}
 
-# Install system dependencies, language runtime, and tools
+# Install system dependencies (may need libs for specific crates)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -33,62 +33,60 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-client \
         less \
         vim \
-        [SHELL] \
-        [LANGUAGE_RUNTIME] \
-        [LANGUAGE_PACKAGE_MANAGER] \
-    && [INSTALL_LLM_CODING_AGENT] \
-    && apt-get clean \
+        zsh \
+        pkg-config \
+        libssl-dev
+
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash \
+    && . "$HOME/.nvm/nvm.sh" \
+    && nvm install 24.13.1 \
+    && nvm alias default 24.13.1 \
+    && npm install -g @qwen-code/qwen-code@latest \
+    && rm -rf "$HOME/.nvm/.cache"
+
+RUN apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install language-specific LSP/server tools for code intelligence
-RUN [INSTALL_LSP_TOOLS]
+# Install Rust tools
+RUN rustup component add rustfmt clippy rust-analyzer \
+    && cargo install cargo-watch cargo-nextest cargo-llvm-cov cargo-edit
 
-# Non-root user, UID/GID overridable at build time to match your host user
-# (run `id -u`/`id -g` and pass as DEV_UID/DEV_GID in .env) so files
-# created in the bind-mounted /workspace aren't owned by a foreign UID.
+# Non-root user setup
 RUN groupadd --gid ${USER_GID} ${USERNAME} \
-    && useradd --uid ${USER_UID} --gid ${USER_GID} -m -s /bin/[SHELL] ${USERNAME}
+    && useradd --uid ${USER_UID} --gid ${USER_GID} -m -s /bin/zsh ${USERNAME}
 
-# Pre-create the language cache dirs and /workspace, owned by the dev user.
-# When compose mounts empty named volumes over these paths, Docker copies
-# the existing ownership/content into the volume on first use.
-# Note: Some languages prefer project-local build directories (target/, node_modules/).
-# These don't need pre-created cache dirs but DO need to be in .gitignore.
-RUN mkdir -p \
-        [LANGUAGE_CACHE_DIR_1] \
-        [LANGUAGE_CACHE_DIR_2] \
-        /workspace \
-    && chown -R ${USERNAME}:${USERNAME} [LANGUAGE_CACHE_DIRS] /workspace
+# Create workspace (target/ is project-local, no special dirs needed)
+RUN mkdir -p /workspace \
+    && chown -R ${USERNAME}:${USERNAME} /workspace
 
-# The workspace is bind-mounted from the host, so its UID may not match
-# the container user even with matched UID/GID (e.g., different OSes).
-# Tell git to trust it regardless rather than failing with
-# "detected dubious ownership".
 RUN git config --system --add safe.directory /workspace
 
-# Don't let git hang waiting for interactive credential prompts inside
-# a non-interactive/sandboxed run - fail fast instead.
 ENV GIT_TERMINAL_PROMPT=0
 
-# A minimal system-wide [SHELL]rc. This lives on the image's (read-only at
+# A minimal system-wide zshrc. This lives on the image's (read-only at
 # runtime) root fs rather than under $HOME, because $HOME (/home/dev) is
 # a tmpfs/volume mount in compose.yaml.
-RUN cat <<'EOF' > /etc/[SHELL]/[SHELL]rc
+RUN cat <<'EOF' > /etc/zsh/zshrc
 HISTFILE="${HOME}/.history"
 HISTSIZE=5000
 SAVEHIST=5000
 setopt SHARE_HISTORY
 autoload -Uz compinit && compinit -C
 PROMPT='%F{cyan}llm-dev%f:%F{blue}%~%f %# '
+
+# nvm setup
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
 EOF
 
 # Runs as the dev user before exec-ing the real command. Its only job is
-# to make sure $HOME has the files [SHELL] expects, since tmpfs/volume
+# to make sure $HOME has the files zsh expects, since tmpfs/volume
 # gives us a fresh empty /home/dev on every container start.
 RUN cat <<'EOF' > /usr/local/bin/entrypoint.sh
 #!/bin/sh
 set -e
-touch "$HOME/.[SHELL]rc"
+touch "$HOME/.zshrc"
 exec "$@"
 EOF
 RUN chmod +x /usr/local/bin/entrypoint.sh
@@ -97,4 +95,4 @@ USER ${USERNAME}
 WORKDIR /workspace
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["/bin/[SHELL]"]
+CMD ["/bin/zsh"]

@@ -2,6 +2,7 @@
 
 A Rust-based DB/HTTP server application for tracking travel data.
 
+
 ## Tech Stack
 
 - **Language**: Rust (2021 edition)
@@ -51,7 +52,7 @@ A Rust-based DB/HTTP server application for tracking travel data.
 ```bash
 docker compose up -d llm
 docker compose exec llm zsh
-qwen  # Start the LLM coding agent
+QWEN_STREAM_IDLE_TIMEOUT_MS=7200000 qwen --experimental-lsp
 ```
 
 ### 2. Initialize Rust project (first time only)

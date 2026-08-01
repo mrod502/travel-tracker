@@ -14,9 +14,9 @@
 #   - zsh as the interactive shell
 #
 # Rust-specific:
-#   - Base image: rust:1.75-bookworm
+#   - Base image: rust:1.97-bookworm
 #   - System dependencies: pkg-config, libssl-dev (for many crates)
-#   - Rust tools: rustfmt, clippy, rust-analyzer, cargo-watch, cargo-nextest
+#   - Rust tools: rustfmt, clippy, rust-analyzer, cargo-watch
 #   - Rust uses project-local target/, so no special cache volumes needed
 
 FROM rust:1.97-bookworm
@@ -24,6 +24,11 @@ FROM rust:1.97-bookworm
 ARG USERNAME=dev
 ARG USER_UID=1000
 ARG USER_GID=${USER_UID}
+
+RUN apt-get update && apt-get install -y wget lsb-release gnupg && \
+    sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list' && \
+    wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - && \
+    apt-get update
 
 # Install system dependencies (may need libs for specific crates)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -35,21 +40,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         vim \
         zsh \
         pkg-config \
-        libssl-dev
+        libssl-dev \
+        postgresql-client-18
 
-RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash \
-    && . "$HOME/.nvm/nvm.sh" \
+# Install nvm in a system location (not under /home/dev which is a volume)
+ENV NVM_DIR=/opt/nvm
+
+RUN mkdir -p /home/dev/.cargo
+
+RUN mkdir -p $NVM_DIR \
+    && curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.5/install.sh | bash \
+    && . "$NVM_DIR/nvm.sh" \
     && nvm install 24.13.1 \
     && nvm alias default 24.13.1 \
     && npm install -g @qwen-code/qwen-code@latest \
-    && rm -rf "$HOME/.nvm/.cache"
+    && rm -rf "$NVM_DIR/.cache"
 
 RUN apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust tools
 RUN rustup component add rustfmt clippy rust-analyzer \
-    && cargo install cargo-watch cargo-nextest cargo-llvm-cov cargo-edit
+    && cargo install cargo-watch cargo-llvm-cov cargo-edit
 
 # Non-root user setup
 RUN groupadd --gid ${USER_GID} ${USERNAME} \
@@ -60,6 +72,7 @@ RUN mkdir -p /workspace \
     && chown -R ${USERNAME}:${USERNAME} /workspace
 
 RUN git config --system --add safe.directory /workspace
+RUN cargo install sqlx-cli
 
 ENV GIT_TERMINAL_PROMPT=0
 
@@ -74,8 +87,8 @@ setopt SHARE_HISTORY
 autoload -Uz compinit && compinit -C
 PROMPT='%F{cyan}llm-dev%f:%F{blue}%~%f %# '
 
-# nvm setup
-export NVM_DIR="$HOME/.nvm"
+# nvm setup  
+export NVM_DIR="/opt/nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"
 EOF
@@ -86,7 +99,13 @@ EOF
 RUN cat <<'EOF' > /usr/local/bin/entrypoint.sh
 #!/bin/sh
 set -e
-touch "$HOME/.zshrc"
+
+# Create .zshrc that sources the system-wide config
+cat > "$HOME/.zshrc" <<'ZSHRC'
+# Source system-wide zshrc
+source /etc/zsh/zshrc
+ZSHRC
+
 exec "$@"
 EOF
 RUN chmod +x /usr/local/bin/entrypoint.sh

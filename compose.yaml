@@ -19,7 +19,7 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
     ports:
-      - ${DB_PUBLIC_PORT:-5432}:5432
+      - ${DB_PUBLIC_PORT:-7789}:5432
   server:
     # Your application server service
     image: travel-tracker-server
@@ -90,6 +90,7 @@ services:
 
     environment:
       HOME: /home/dev
+      CARGO_HOME: /home/dev/.cargo
 
       # Rust environment variables
       RUST_LOG: debug

@@ -1,6 +1,6 @@
 # Build output (CRITICAL - don't commit!)
 target/
-
+/.sqlx
 # Generated documentation
 doc/
 

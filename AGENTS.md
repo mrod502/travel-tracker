@@ -1,3 +1,7 @@
+# Agent Environment
+
+**You are running inside an isolated Linux Docker container.** You are always in a Docker container — you are never on the host machine. All file operations, script execution, and commands run within this containerized environment. You are isolated from the host machine.
+
 # Agent Instructions
 
 **Setup Checklist**:

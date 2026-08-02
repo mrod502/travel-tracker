@@ -25,8 +25,9 @@ const MIGRATION_INIT: &str = "CREATE TABLE IF NOT EXISTS migrations (
 )";
 const MIGRATION_TIME_FMT: &str = "%Y%m%d%H%M";
 
-pub fn setup_log() -> Handle {
+pub fn setup_log(level: &str) -> Handle {
     let stdout = ConsoleAppender::builder().build();
+    let log_filter = level.parse::<log::LevelFilter>().unwrap_or(log::LevelFilter::Trace);
     let config = Config::builder()
         .appender(Appender::builder().build("stdout", Box::new(stdout)))
         //.logger(Logger::builder().build("app::backend::db", LevelFilter::Info))
@@ -39,7 +40,7 @@ pub fn setup_log() -> Handle {
         .build(
             Root::builder()
                 .appender("stdout")
-                .build(log::LevelFilter::Trace),
+                .build(log_filter),
         )
         .unwrap();
     log4rs::init_config(config).unwrap()
@@ -132,6 +133,8 @@ struct App {
     user: String,
     #[arg(long, default_value = "postgres", global = true)]
     db: String,
+    #[arg(long, default_value = "trace", global = true)]
+    log_level: String,
 
     #[command(subcommand)]
     command: Command,
@@ -186,9 +189,9 @@ impl Runner for App {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    setup_log();
     dotenv().ok();
     let mut app = App::parse();
+    setup_log(&app.log_level);
     let mut c: PgPool = PgPool::connect_lazy(&app.dsn()).unwrap();
     let conn = if app.command.requires_db() {
         c = app.conn().await?;

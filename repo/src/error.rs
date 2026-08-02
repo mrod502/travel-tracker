@@ -15,9 +15,6 @@ pub enum RepoError {
     #[error("UUID error: {0}")]
     Uuid(#[from] uuid::Error),
 
-    #[error("Decimal parsing error: {0}")]
-    Decimal(#[from] rust_decimal::Error),
-
     #[error("Chrono parsing error: {0}")]
     Chrono(#[from] chrono::ParseError),
 }

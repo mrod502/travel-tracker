@@ -1,6 +1,7 @@
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use sqlx::Executor;
+use uuid::Uuid;
 
 use crate::error::RepoError;
 use crate::models::BluetoothOccurrence;
@@ -56,10 +57,10 @@ impl BluetoothOccurrenceRepository {
             BluetoothOccurrence,
             r#"
             INSERT INTO bluetooth_occurrences (
-                occurrence_id, node_id, observed_at, observed_at_node_local,
+                id, node_id, observed_at, observed_at_node_local,
                 device_address, device_address_type, device_advertised_name, device_hash,
                 advertisement_type, rssi, tx_power, service_uuids,
-                manufacturer_company_id, manufacturer_payload_hex, raw_payload_hex,
+                manufacturer_company_id, manufacturer_payload, raw_payload,
                 location_lat, location_lon, location_alt_m, location_accuracy_m,
                 location_source, schema_version
             ) VALUES (
@@ -72,25 +73,25 @@ impl BluetoothOccurrenceRepository {
             )
             RETURNING *
             "#,
-            occurrence.occurrence_id,
+            occurrence.id,
             occurrence.node_id,
             occurrence.observed_at,
             occurrence.observed_at_node_local,
-            occurrence.device_address,
+            &occurrence.device_address,
             occurrence.device_address_type,
             occurrence.device_advertised_name,
-            occurrence.device_hash,
+            occurrence.device_hash.as_ref().map(|v| v.as_slice()),
             occurrence.advertisement_type,
             occurrence.rssi,
             occurrence.tx_power,
-            occurrence.service_uuids,
+            occurrence.service_uuids.as_deref(),
             occurrence.manufacturer_company_id,
-            occurrence.manufacturer_payload_hex,
-            occurrence.raw_payload_hex,
-            occurrence.location_lat,
-            occurrence.location_lon,
-            occurrence.location_alt_m,
-            occurrence.location_accuracy_m,
+            occurrence.manufacturer_payload.as_ref().map(|v| v.as_slice()),
+            occurrence.raw_payload.as_ref().map(|v| v.as_slice()),
+            occurrence.location_lat.as_ref(),
+            occurrence.location_lon.as_ref(),
+            occurrence.location_alt_m.as_ref(),
+            occurrence.location_accuracy_m.as_ref(),
             occurrence.location_source,
             occurrence.schema_version,
         )
@@ -110,14 +111,14 @@ impl BluetoothOccurrenceRepository {
     /// `Ok(Some(occurrence))` if found, `Ok(None)` if not found
     pub async fn find_by_id<'c, E>(
         executor: E,
-        id: &str,
+        id: &Uuid,
     ) -> Result<Option<BluetoothOccurrence>, RepoError>
     where
         E: Executor<'c, Database = sqlx::Postgres>,
     {
         let record = sqlx::query_as!(
             BluetoothOccurrence,
-            "SELECT * FROM bluetooth_occurrences WHERE occurrence_id = $1",
+            "SELECT * FROM bluetooth_occurrences WHERE id = $1",
             id
         )
         .fetch_optional(executor)
@@ -163,14 +164,14 @@ impl BluetoothOccurrenceRepository {
     ///
     /// # Arguments
     /// * `executor` - Any executor (PgPool or PgTransaction)
-    /// * `address` - BLE MAC address to search for
+    /// * `address` - BLE MAC address as 6-byte array
     /// * `limit` - Maximum number of records to return
     ///
     /// # Returns
     /// Vector of occurrences for the given device, ordered by observed_at DESC
     pub async fn find_by_device_address<'c, E>(
         executor: E,
-        address: &str,
+        address: &[u8],
         limit: i64,
     ) -> Result<Vec<BluetoothOccurrence>, RepoError>
     where
@@ -234,14 +235,14 @@ impl BluetoothOccurrenceRepository {
     ///
     /// # Arguments
     /// * `executor` - Any executor (PgPool or PgTransaction)
-    /// * `node_id` - ID of the observing node
+    /// * `node_id` - UUID of the observing node
     /// * `limit` - Maximum number of records to return
     ///
     /// # Returns
     /// Vector of occurrences from the given node, ordered by observed_at DESC
     pub async fn find_by_node_id<'c, E>(
         executor: E,
-        node_id: &str,
+        node_id: &Uuid,
         limit: i64,
     ) -> Result<Vec<BluetoothOccurrence>, RepoError>
     where
@@ -277,19 +278,19 @@ impl BluetoothOccurrenceRepository {
     /// Vector of occurrences within the bounding box, ordered by distance
     pub async fn find_by_location<'c, E>(
         executor: E,
-        center_lat: Decimal,
-        center_lon: Decimal,
-        radius_degrees: Decimal,
+        center_lat: BigDecimal,
+        center_lon: BigDecimal,
+        radius_degrees: BigDecimal,
         limit: i64,
     ) -> Result<Vec<BluetoothOccurrence>, RepoError>
     where
         E: Executor<'c, Database = sqlx::Postgres>,
     {
         // Convert radius to decimal for bounds
-        let lat_min = center_lat - radius_degrees;
-        let lat_max = center_lat + radius_degrees;
-        let lon_min = center_lon - radius_degrees;
-        let lon_max = center_lon + radius_degrees;
+        let lat_min = &center_lat - &radius_degrees;
+        let lat_max = &center_lat + &radius_degrees;
+        let lon_min = &center_lon - &radius_degrees;
+        let lon_max = &center_lon + &radius_degrees;
 
         let records = sqlx::query_as!(
             BluetoothOccurrence,
@@ -306,6 +307,40 @@ impl BluetoothOccurrenceRepository {
             lat_max,
             lon_min,
             lon_max,
+            limit
+        )
+        .fetch_all(executor)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Find occurrences by location source
+    ///
+    /// # Arguments
+    /// * `executor` - Any executor (PgPool or PgTransaction)
+    /// * `source` - Location source to filter by (e.g., "node_fixed", "node_gps", "interpolated")
+    /// * `limit` - Maximum number of records to return
+    ///
+    /// # Returns
+    /// Vector of occurrences with the given location source
+    pub async fn find_by_location_source<'c, E>(
+        executor: E,
+        source: &str,
+        limit: i64,
+    ) -> Result<Vec<BluetoothOccurrence>, RepoError>
+    where
+        E: Executor<'c, Database = sqlx::Postgres>,
+    {
+        let records = sqlx::query_as!(
+            BluetoothOccurrence,
+            r#"
+            SELECT * FROM bluetooth_occurrences
+            WHERE location_source = $1
+            ORDER BY observed_at DESC
+            LIMIT $2
+            "#,
+            source,
             limit
         )
         .fetch_all(executor)
@@ -338,6 +373,34 @@ impl BluetoothOccurrenceRepository {
             "#,
             start,
             end
+        )
+        .fetch_one(executor)
+        .await?;
+
+        Ok(record.count.unwrap_or(0))
+    }
+
+    /// Count occurrences by node
+    ///
+    /// # Arguments
+    /// * `executor` - Any executor (PgPool or PgTransaction)
+    /// * `node_id` - UUID of the observing node
+    ///
+    /// # Returns
+    /// Count of occurrences from the given node
+    pub async fn count_by_node_id<'c, E>(
+        executor: E,
+        node_id: &Uuid,
+    ) -> Result<i64, RepoError>
+    where
+        E: Executor<'c, Database = sqlx::Postgres>,
+    {
+        let record = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count FROM bluetooth_occurrences
+            WHERE node_id = $1
+            "#,
+            node_id
         )
         .fetch_one(executor)
         .await?;

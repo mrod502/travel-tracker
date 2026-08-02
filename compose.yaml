@@ -7,8 +7,9 @@ volumes:
   llm-home:
 services:
   database:
-    # Add your database service here if needed
-    image: postgres:18
+    build:
+      context: .
+      dockerfile: Dockerfile.database
     env_file: .env
     networks:
       - dev

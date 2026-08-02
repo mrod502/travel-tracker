@@ -62,6 +62,6 @@ pub mod repositories;
 
 // Re-export main types for convenience
 pub use error::RepoError;
-pub use models::{BluetoothOccurrence};
+pub use models::BluetoothOccurrence;
 pub use pool::Pool;
 pub use repositories::BluetoothOccurrenceRepository;

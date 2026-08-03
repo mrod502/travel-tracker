@@ -1,4 +1,4 @@
 [workspace]
-members = ["db", "repo"]
+members = ["app","bt_iden", "bt_mon","db", "repo"]
 
 resolver = "3"

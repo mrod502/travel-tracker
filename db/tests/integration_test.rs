@@ -125,9 +125,22 @@ fn test_file_attrs_reflexivity() {
 // Migration Statement Splitting Tests
 // ============================================================================
 
-/// Simulate the split_query function from UpArgs
+/// Simulate the split_query function from UpArgs (using sqlparser)
 fn split_query(q: &str) -> Vec<String> {
-    q.split(';').map(|v| v.to_string()).collect()
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+    
+    let dialect = PostgreSqlDialect {};
+    match Parser::parse_sql(&dialect, q) {
+        Ok(statements) => statements
+            .into_iter()
+            .map(|stmt| stmt.to_string())
+            .collect(),
+        Err(_) => {
+            // Fallback to simple split
+            q.split(';').map(|v| v.to_string()).collect()
+        }
+    }
 }
 
 #[test]
@@ -135,6 +148,7 @@ fn test_split_query_filters_empty_statements() {
     let query = "CREATE TABLE a (id INT); CREATE INDEX idx ON a(id); INSERT INTO a VALUES (1);";
     let statements = split_query(query);
 
+    // With sqlparser, statements are properly parsed without trailing empty ones
     let non_empty: Vec<&String> = statements.iter().filter(|s| !s.trim().is_empty()).collect();
 
     assert_eq!(non_empty.len(), 3);
@@ -148,19 +162,21 @@ fn test_split_query_handles_consecutive_semicolons() {
     let query = "SELECT 1;; SELECT 2;";
     let statements = split_query(query);
 
-    let non_empty: Vec<&String> = statements.iter().filter(|s| !s.trim().is_empty()).collect();
-
-    assert_eq!(non_empty.len(), 2);
+    // With sqlparser, empty statements between consecutive semicolons are filtered
+    assert_eq!(statements.len(), 2);
+    assert_eq!(statements[0], "SELECT 1");
+    assert_eq!(statements[1], "SELECT 2");
 }
 
 #[test]
-fn test_split_query_preserves_whitespace() {
+fn test_split_query_trims_whitespace() {
     let query = "  SELECT 1;  SELECT 2;  ";
     let statements = split_query(query);
 
-    assert_eq!(statements[0], "  SELECT 1");
-    assert_eq!(statements[1], "  SELECT 2");
-    assert_eq!(statements[2], "  ");
+    // sqlparser trims whitespace from statements
+    assert_eq!(statements.len(), 2);
+    assert_eq!(statements[0], "SELECT 1");
+    assert_eq!(statements[1], "SELECT 2");
 }
 
 // ============================================================================

@@ -254,7 +254,19 @@ impl UpArgs {
     }
 
     fn split_query(q: &str) -> Vec<String> {
-        q.split(";").map(|v| v.to_string()).collect()
+        let dialect = PostgreSqlDialect {};
+        match Parser::parse_sql(&dialect, q) {
+            Ok(statements) => statements
+                .into_iter()
+                .map(|stmt| stmt.to_string())
+                .collect(),
+            Err(e) => {
+                log::error!("Failed to parse SQL: {}", e);
+                // Fallback to simple split for compatibility with PostgreSQL extensions
+                // that may not be fully supported by sqlparser
+                q.split(';').map(|v| v.to_string()).collect()
+            }
+        }
     }
 
     fn read_file<'a, 'b>(&self, p: &'a PathBuf) -> Result<String, MigrationError> {
@@ -398,11 +410,10 @@ mod tests {
         let query = "SELECT 1; SELECT 2;";
         let result = UpArgs::split_query(query);
 
-        // split(";") on "SELECT 1; SELECT 2;" gives ["SELECT 1", " SELECT 2", ""]
-        assert_eq!(result.len(), 3);
+        // sqlparser correctly parses two statements
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0], "SELECT 1");
-        assert_eq!(result[1], " SELECT 2");
-        assert_eq!(result[2], "");
+        assert_eq!(result[1], "SELECT 2");
     }
 
     #[test]
@@ -410,12 +421,10 @@ mod tests {
         let query = "SELECT 1;; SELECT 2;";
         let result = UpArgs::split_query(query);
 
-        // split(";") on "SELECT 1;; SELECT 2;" gives ["SELECT 1", "", " SELECT 2", ""]
-        assert_eq!(result.len(), 4);
+        // sqlparser correctly ignores empty statements (consecutive semicolons)
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0], "SELECT 1");
-        assert_eq!(result[1], "");
-        assert_eq!(result[2], " SELECT 2");
-        assert_eq!(result[3], "");
+        assert_eq!(result[1], "SELECT 2");
     }
 
     #[test]
@@ -423,9 +432,8 @@ mod tests {
         let query = "";
         let result = UpArgs::split_query(query);
 
-        // split(";") on "" gives [""]
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], "");
+        // sqlparser returns empty vector for empty input
+        assert_eq!(result.len(), 0);
     }
 
     #[test]
@@ -442,9 +450,9 @@ mod tests {
         let query = "-- comment\nSELECT 1; -- another comment";
         let result = UpArgs::split_query(query);
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], "-- comment\nSELECT 1");
-        assert_eq!(result[1], " -- another comment");
+        // sqlparser correctly parses comments and ignores semicolons within them
+        assert_eq!(result.len(), 1);
+        assert!(result[0].contains("SELECT 1"));
     }
 
     #[test]
@@ -452,20 +460,46 @@ mod tests {
         let query = "INSERT INTO test VALUES ('a; b');";
         let result = UpArgs::split_query(query);
 
-        // Note: This is a simple split - it doesn't handle semicolons in strings
-        // This is a known limitation that would need a proper SQL parser to fix
-        // split(";") on "INSERT INTO test VALUES ('a; b');" gives ["INSERT INTO test VALUES ('a", " b', '')"]
-        // Actually: the string has 2 semicolons, so we get 3 parts
-        assert!(
-            result.len() >= 2,
-            "Simple split doesn't handle semicolons in strings"
-        );
-        assert!(result[0].starts_with("INSERT INTO test VALUES"));
+        // With sqlparser, semicolons inside strings are handled correctly
+        assert_eq!(result.len(), 1, "Should handle semicolons in string literals");
+        assert!(result[0].contains("INSERT INTO test VALUES"));
+        assert!(result[0].contains("a; b"));
+    }
+
+    #[test]
+    fn test_split_query_with_semicolon_in_comment() {
+        let query = "-- this is; a comment\nSELECT 1;";
+        let result = UpArgs::split_query(query);
+
+        // With sqlparser, semicolons inside comments are handled correctly
+        assert_eq!(result.len(), 1, "Should handle semicolons in line comments");
+        assert!(result[0].contains("SELECT 1"));
+    }
+
+    #[test]
+    fn test_split_query_with_semicolon_in_block_comment() {
+        let query = "/* this; is; a; comment */ SELECT 1;";
+        let result = UpArgs::split_query(query);
+
+        // With sqlparser, semicolons inside block comments are handled correctly
+        assert_eq!(result.len(), 1, "Should handle semicolons in block comments");
+        assert!(result[0].contains("SELECT 1"));
+    }
+
+    #[test]
+    fn test_split_query_dollar_quoted_strings() {
+        let query = r#"CREATE FUNCTION test() AS $$ SELECT 'a; b'; $$ LANGUAGE sql;"#;
+        let result = UpArgs::split_query(query);
+
+        // With sqlparser, dollar-quoted strings are handled correctly
+        assert_eq!(result.len(), 1, "Should handle dollar-quoted strings");
+        assert!(result[0].contains("CREATE FUNCTION"));
     }
 
     #[test]
     fn test_split_query_filters_empty_statements() {
-        // Verify that the migration runner correctly filters empty statements
+        // Verify that the migration runner correctly handles empty statements
+        // With sqlparser, empty statements are already filtered out
         let query = "SELECT 1;; SELECT 2;";
         let statements = UpArgs::split_query(query);
 
@@ -473,7 +507,7 @@ mod tests {
 
         assert_eq!(non_empty.len(), 2);
         assert_eq!(non_empty[0], "SELECT 1");
-        assert_eq!(non_empty[1], " SELECT 2");
+        assert_eq!(non_empty[1], "SELECT 2"); // sqlparser trims whitespace
     }
 
     // ========================================================================
@@ -584,6 +618,19 @@ INSERT INTO users VALUES (1);
         assert!(non_empty[0].contains("CREATE TABLE"));
         assert!(non_empty[1].contains("CREATE INDEX"));
         assert!(non_empty[2].contains("INSERT"));
+    }
+
+    #[test]
+    fn test_split_query_fallback_on_parse_error() {
+        // Test that fallback to simple split works when sqlparser fails
+        // This can happen with PostgreSQL extensions or non-standard syntax
+        let query = "SELECT * FROM h3_to_string(123);"; // H3 function - may not parse
+        
+        let result = UpArgs::split_query(query);
+        
+        // Should return at least something (either parsed or fallback)
+        assert!(!result.is_empty(), "Should always return some statements");
+        assert!(result.iter().any(|s| s.contains("SELECT")));
     }
 
     // ========================================================================

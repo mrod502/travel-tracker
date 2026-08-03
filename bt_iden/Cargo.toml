@@ -1,0 +1,28 @@
+[package]
+name = "bt_iden"
+version = "0.1.0"
+edition = "2024"
+description = "Probabilistic identity resolution for Bluetooth LE advertisement observations"
+license = "MIT"
+readme = "README.md"
+keywords = ["bluetooth", "ble", "identity", "tracking"]
+categories = ["database", "parsing"]
+
+[lib]
+name = "bt_iden"
+path = "src/lib.rs"
+
+[dependencies]
+tracing = "0.1"
+uuid = { version = "1.0", features = ["v4", "v7", "serde"] }
+ordered-float = "4.0"
+
+[dev-dependencies]
+proptest = "1.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1.0"
+
+[[bench]]
+name = "identity_resolution"
+harness = false

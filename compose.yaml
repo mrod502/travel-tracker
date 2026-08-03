@@ -87,7 +87,7 @@ services:
       - type: tmpfs
         target: /tmp
         tmpfs:
-          mode: 1777
+          mode: 01777
 
     environment:
       HOME: /home/dev

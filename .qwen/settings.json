@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(ls *)"
+      "Bash(ls *)",
+      "Bash(mkdir *)",
+      "Bash(cargo check)",
+      "Bash(cargo tree *)"
     ]
-  }
+  },
+  "$version": 4
 }

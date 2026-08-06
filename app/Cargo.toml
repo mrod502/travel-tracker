@@ -1,6 +1,25 @@
 [package]
 name = "app"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+# CLI
+clap = { version = "4.6.5", features = ["derive", "env"] }
+
+# Local crates
+bt_mon = { path = "../bt_mon" }
+repo = { path = "../repo" }
+
+# Async runtime
+tokio = { version = "1.50", features = ["full"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Utilities
+uuid = { version = "1.0", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+thiserror = "2.0"

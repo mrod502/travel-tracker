@@ -4,7 +4,7 @@ use bt_mon::{create_btleplug_monitor, DeviceEvent, DeviceMonitor};
 use bt_mon::monitor::events::UpdateField;
 use futures_util::stream::StreamExt;
 use log::{debug, error, info, warn};
-use repo::{mac_address_from_string, BluetoothOccurrence, BluetoothOccurrenceRepository, Pool};
+use repo::{mac_address_from_string, Occurrence, OccurrenceRepository, Pool, SignalType};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -150,43 +150,84 @@ impl App {
         let id = Uuid::now_v7();
         let observed_at = chrono::Utc::now();
 
-        // Build occurrence using builder pattern
-        let mut occurrence = BluetoothOccurrence::new(id, self.node_id, observed_at, &device_address)
-            .with_node_local_timestamp(observed_at)
-            .with_advertisement_type("ADV_IND"); // Default, could be more specific
+        // Generate device hash (SHA-256 of MAC address for stable pseudonymous ID)
+        let device_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&device_address);
+            hasher.finalize().to_vec()
+        };
 
-        // Add optional fields
-        if let Some(rssi) = device.rssi {
-            occurrence = occurrence.with_rssi(rssi);
-        }
+        // Build signal payload with Bluetooth-specific data
+        let mut ble_payload = serde_json::Map::new();
+        ble_payload.insert(
+            "address_type".to_string(),
+            serde_json::json!("public"), // Default, could be more specific
+        );
 
-        if let Some(name) = &device.name {
-            occurrence = occurrence.with_advertised_name(name);
-        }
-
-        // Handle manufacturer data (take first entry if multiple)
+        // Handle manufacturer data
         if let Some((company_id, payload)) = device.manufacturer_data.iter().next() {
-            occurrence = occurrence.with_manufacturer_data(*company_id as i32, payload);
+            ble_payload.insert(
+                "manufacturer_data".to_string(),
+                serde_json::json!({
+                    "company_id": company_id,
+                    "payload": hex::encode(payload)
+                }),
+            );
         }
 
-        // Handle service UUIDs (extract keys from service_data map)
+        // Handle service UUIDs
         if !device.service_data.is_empty() {
-            let uuids: Vec<Vec<u8>> = device
+            let uuids: Vec<String> = device
                 .service_data
                 .keys()
-                .map(|u| u.as_uuid().as_bytes().to_vec())
+                .map(|u| u.as_uuid().to_string())
                 .collect();
-            occurrence = occurrence.with_service_uuids(uuids);
+            ble_payload.insert("service_uuids".to_string(), serde_json::json!(uuids));
         }
 
-        // Store raw payload if configured
-        if self.config.store_raw_payload {
-            // We don't have full raw payload in bt_mon currently, but we could add it
-            // For now, skip this
+        // Add RSSI to payload if available
+        if let Some(rssi) = device.rssi {
+            ble_payload.insert("rssi".to_string(), serde_json::json!(rssi));
         }
+
+        // Add device name if available
+        if let Some(name) = &device.name {
+            ble_payload.insert("name".to_string(), serde_json::json!(name));
+        }
+
+        // Wrap in signal_type key
+        let mut signal_payload = serde_json::Map::new();
+        signal_payload.insert("ble".to_string(), serde_json::json!(ble_payload));
+
+        // Generate minimal signed payload (in production, this would be proper canonical CBOR)
+        let signed_payload = format!(
+            "{}:{}:{}",
+            id,
+            observed_at.timestamp(),
+            hex::encode(&device_address)
+        )
+        .into_bytes();
+
+        // Generate placeholder signature (in production, use real Ed25519 signing)
+        let signature = vec![0u8; 64];
+
+        // Build occurrence using builder pattern
+        let occurrence = Occurrence::builder()
+            .signal_type(SignalType::Bluetooth)
+            .origin_node_id(&self.node_id.to_bytes_le().to_vec())
+            .observed_at(observed_at)
+            .observed_at_node_local(observed_at)
+            .device_address(&device_address)
+            .device_hash(&device_hash)
+            .rssi(device.rssi.unwrap_or(0) as i16)
+            .signal_payload(serde_json::Value::Object(signal_payload))
+            .signed_payload(&signed_payload)
+            .signature(&signature)
+            .build();
 
         // Insert into database
-        match BluetoothOccurrenceRepository::create(self.pool.as_pool(), &occurrence).await {
+        match OccurrenceRepository::create(self.pool.as_pool(), &occurrence).await {
             Ok(_) => {
                 debug!("Stored occurrence for device: {}", device.id);
             }

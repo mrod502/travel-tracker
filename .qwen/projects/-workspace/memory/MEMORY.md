@@ -1,0 +1,2 @@
+- [Unified Occurrence schema architecture](schema-architecture.md) — Refactored from Bluetooth-specific to multi-signal unified model
+- [Project custom skills setup](feedback/project-skills.md) — Three custom skills for CBOR, H3 geospatial, and provenance verification

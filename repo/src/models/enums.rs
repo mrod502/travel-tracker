@@ -4,7 +4,6 @@
 //! interaction with the database via sqlx's Encode/Decode traits.
 
 use serde::{Deserialize, Serialize};
-use sqlx::Type;
 
 // ============================================================================
 // NODE ENUMS

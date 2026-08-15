@@ -1,3 +1,4 @@
-mod bluetooth_occurrence_repo;
+pub mod occurrence_repo;
 
-pub use bluetooth_occurrence_repo::BluetoothOccurrenceRepository;
+// Re-export for convenience
+pub use occurrence_repo::OccurrenceRepository;

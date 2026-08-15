@@ -1,4 +1,5 @@
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Repository error type covering all database operations
 #[derive(Debug, Error)]
@@ -11,6 +12,9 @@ pub enum RepoError {
 
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error("Duplicate record: {0}")]
+    Duplicate(Uuid),
 
     #[error("UUID error: {0}")]
     Uuid(#[from] uuid::Error),

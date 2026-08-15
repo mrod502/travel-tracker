@@ -166,7 +166,7 @@ impl BtleplugMonitor {
         let characteristics: Vec<GattCharacteristic> = service
             .characteristics
             .iter()
-            .map(|c| Self::btleplug_char_to_gatt(c))
+            .map(Self::btleplug_char_to_gatt)
             .collect();
         
         GattService {
@@ -400,7 +400,7 @@ impl GattClient for BtleplugMonitor {
         // Convert to our GattService type
         let gatt_services: Vec<GattService> = services
             .iter()
-            .map(|s| Self::btleplug_service_to_gatt(s))
+            .map(Self::btleplug_service_to_gatt)
             .collect();
         
         info!("Discovered {} services for device: {}", gatt_services.len(), device_id);
@@ -415,7 +415,7 @@ impl GattClient for BtleplugMonitor {
         let services = peripheral.services();
         let gatt_services: Vec<GattService> = services
             .iter()
-            .map(|s| Self::btleplug_service_to_gatt(s))
+            .map(Self::btleplug_service_to_gatt)
             .collect();
         
         Ok(gatt_services)
@@ -436,7 +436,7 @@ impl GattClient for BtleplugMonitor {
         
         // Find the characteristic
         let characteristic = Self::find_characteristic(&peripheral, uuid)
-            .ok_or_else(|| Error::CharacteristicNotFound(uuid.clone()))?;
+            .ok_or(Error::CharacteristicNotFound(*uuid))?;
         
         // Read the characteristic using the trait method
         let value = peripheral.read(&characteristic).await
@@ -470,7 +470,7 @@ impl GattClient for BtleplugMonitor {
         
         // Find the characteristic
         let characteristic = Self::find_characteristic(&peripheral, uuid)
-            .ok_or_else(|| Error::CharacteristicNotFound(uuid.clone()))?;
+            .ok_or(Error::CharacteristicNotFound(*uuid))?;
         
         // Determine write type
         let write_type = if response {
@@ -509,7 +509,7 @@ impl GattClient for BtleplugMonitor {
         
         // Find the characteristic
         let characteristic = Self::find_characteristic(&peripheral, uuid)
-            .ok_or_else(|| Error::CharacteristicNotFound(uuid.clone()))?;
+            .ok_or(Error::CharacteristicNotFound(*uuid))?;
         
         // Subscribe using the trait method
         peripheral.subscribe(&characteristic).await
@@ -541,7 +541,7 @@ impl GattClient for BtleplugMonitor {
         
         // Find the characteristic
         let characteristic = Self::find_characteristic(&peripheral, uuid)
-            .ok_or_else(|| Error::CharacteristicNotFound(uuid.clone()))?;
+            .ok_or(Error::CharacteristicNotFound(*uuid))?;
         
         // Unsubscribe using the trait method
         peripheral.unsubscribe(&characteristic).await

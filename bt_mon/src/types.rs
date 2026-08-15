@@ -2,16 +2,52 @@
 //!
 //! This module provides backend-agnostic data types for representing
 //! Bluetooth devices, services, characteristics, and notifications.
+//!
+//! # Types Overview
+//!
+//! - [`DeviceId`]: Unique identifier for a Bluetooth device
+//! - [`ServiceUuid`], [`CharacteristicUuid`]: UUID wrappers for GATT objects
+//! - [`BluetoothDevice`]: Represents a discovered Bluetooth device
+//! - [`GattService`], [`GattCharacteristic`]: GATT service and characteristic
+//! - [`CharacteristicProperties`]: Properties of a GATT characteristic
+//! - [`ValueNotification`]: Notification from a characteristic
+//! - [`UpdateField`]: Fields that can change in device updates
 
 use std::collections::HashMap;
 use std::fmt;
 
 /// Unique identifier for a Bluetooth device.
+///
+/// This is a backend-agnostic string wrapper that uniquely identifies
+/// a Bluetooth device. The format is platform-specific:
+///
+/// - On Linux/BlueZ: MAC address (e.g., "AA:BB:CC:DD:EE:FF")
+/// - On macOS: UUID string
+/// - On Windows: Platform-specific identifier
+///
+/// # Example
+///
+/// ```no_run
+/// use bt_mon::DeviceId;
+///
+/// let id = DeviceId::new("AA:BB:CC:DD:EE:FF");
+/// assert_eq!(id.as_str(), "AA:BB:CC:DD:EE:FF");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DeviceId(pub String);
 
 impl DeviceId {
     /// Create a new device ID from a string.
+    ///
+    /// The string format is platform-specific (MAC address on Linux,
+    /// UUID on macOS, etc.).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use bt_mon::DeviceId;
+    /// let id = DeviceId::new("AA:BB:CC:DD:EE:FF");
+    /// ```
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
@@ -29,6 +65,19 @@ impl fmt::Display for DeviceId {
 }
 
 /// UUID for a GATT service.
+///
+/// A type-safe wrapper around `uuid::Uuid` for GATT services.
+/// Use this to ensure you don't accidentally mix up service UUIDs
+/// with characteristic UUIDs.
+///
+/// # Example
+///
+/// ```no_run
+/// use bt_mon::ServiceUuid;
+///
+/// let uuid = ServiceUuid::parse_str("00001800-0000-1000-8000-00805f9b34fb").unwrap();
+/// println!("Service UUID: {}", uuid);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ServiceUuid(pub uuid::Uuid);
 
@@ -49,6 +98,7 @@ impl ServiceUuid {
     }
 
     /// Get the string representation of the UUID.
+    #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         self.0.to_string()
     }
@@ -61,6 +111,19 @@ impl fmt::Display for ServiceUuid {
 }
 
 /// UUID for a GATT characteristic.
+///
+/// A type-safe wrapper around `uuid::Uuid` for GATT characteristics.
+/// Use this to ensure you don't accidentally mix up characteristic UUIDs
+/// with service UUIDs.
+///
+/// # Example
+///
+/// ```no_run
+/// use bt_mon::CharacteristicUuid;
+///
+/// let uuid = CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
+/// println!("Characteristic UUID: {}", uuid);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CharacteristicUuid(pub uuid::Uuid);
 
@@ -81,6 +144,7 @@ impl CharacteristicUuid {
     }
 
     /// Get the string representation of the UUID.
+    #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         self.0.to_string()
     }
@@ -93,6 +157,24 @@ impl fmt::Display for CharacteristicUuid {
 }
 
 /// Represents a discovered Bluetooth device.
+///
+/// This struct contains all the information about a Bluetooth device
+/// that can be obtained through scanning or connection.
+///
+/// # Example
+///
+/// ```no_run
+/// use bt_mon::{BluetoothDevice, DeviceId};
+///
+/// let device = BluetoothDevice::new(
+///     DeviceId::new("AA:BB:CC:DD:EE:FF"),
+///     "AA:BB:CC:DD:EE:FF".to_string(),
+/// )
+/// .with_name("My Device")
+/// .with_rssi(-50);
+///
+/// assert_eq!(device.name, Some("My Device".to_string()));
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct BluetoothDevice {
     /// Unique identifier for the device.
@@ -115,6 +197,9 @@ pub struct BluetoothDevice {
 
 impl BluetoothDevice {
     /// Create a new Bluetooth device.
+    ///
+    /// Creates a device with the given ID and address, with all optional
+    /// fields initialized to empty/false values.
     pub fn new(id: DeviceId, address: String) -> Self {
         Self {
             id,
@@ -129,12 +214,17 @@ impl BluetoothDevice {
     }
 
     /// Set the device name.
+    ///
+    /// The name is typically obtained from the advertisement data.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
     /// Set the RSSI value.
+    ///
+    /// RSSI (Received Signal Strength Indicator) is measured in dBm.
+    /// Typical values range from -100 (very weak) to 0 (very strong).
     pub fn with_rssi(mut self, rssi: i32) -> Self {
         self.rssi = Some(rssi);
         self
@@ -147,12 +237,18 @@ impl BluetoothDevice {
     }
 
     /// Add manufacturer data.
+    ///
+    /// Manufacturer data is included in advertisement packets and
+    /// contains a company identifier and vendor-specific data.
     pub fn with_manufacturer_data(mut self, company_id: u16, data: Vec<u8>) -> Self {
         self.manufacturer_data.insert(company_id, data);
         self
     }
 
     /// Add service data.
+    ///
+    /// Service data is included in advertisement packets and
+    /// contains UUID-keyed service-specific data.
     pub fn with_service_data(mut self, uuid: ServiceUuid, data: Vec<u8>) -> Self {
         self.service_data.insert(uuid, data);
         self
@@ -160,6 +256,24 @@ impl BluetoothDevice {
 }
 
 /// Represents a GATT service.
+///
+/// A GATT service is a collection of related characteristics.
+/// Services can be primary (defined by the device) or secondary
+/// (added to extend functionality).
+///
+/// # Example
+///
+/// ```no_run
+/// use bt_mon::{GattService, ServiceUuid, GattCharacteristic, CharacteristicUuid, CharacteristicProperties};
+///
+/// let service_uuid = ServiceUuid::parse_str("00001800-0000-1000-8000-00805f9b34fb").unwrap();
+/// let char_uuid = CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
+///
+/// let service = GattService::new(service_uuid, true)
+///     .with_characteristic(GattCharacteristic::new(char_uuid, CharacteristicProperties::default()));
+///
+/// assert_eq!(service.characteristics.len(), 1);
+/// ```
 #[derive(Clone, Debug)]
 pub struct GattService {
     /// Service UUID.
@@ -172,6 +286,11 @@ pub struct GattService {
 
 impl GattService {
     /// Create a new GATT service.
+    ///
+    /// # Arguments
+    ///
+    /// * `uuid` - The UUID of the service
+    /// * `is_primary` - Whether this is a primary service
     pub fn new(uuid: ServiceUuid, is_primary: bool) -> Self {
         Self {
             uuid,
@@ -181,6 +300,16 @@ impl GattService {
     }
 
     /// Add a characteristic to this service.
+    ///
+    /// Uses the builder pattern to allow chaining:
+    ///
+    /// ```no_run
+    /// # use bt_mon::*;
+    /// # let service_uuid = ServiceUuid::parse_str("00001800-0000-1000-8000-00805f9b34fb").unwrap();
+    /// # let char_uuid = CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
+    /// let service = GattService::new(service_uuid, true)
+    ///     .with_characteristic(GattCharacteristic::new(char_uuid, CharacteristicProperties::default()));
+    /// ```
     pub fn with_characteristic(mut self, characteristic: GattCharacteristic) -> Self {
         self.characteristics.push(characteristic);
         self
@@ -188,6 +317,24 @@ impl GattService {
 }
 
 /// Represents a GATT characteristic.
+///
+/// A GATT characteristic holds the actual data that can be
+/// read, written, or subscribed to for notifications.
+///
+/// # Example
+///
+/// ```no_run
+/// use bt_mon::{CharacteristicUuid, GattCharacteristic, CharacteristicProperties};
+///
+/// let uuid = CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
+/// let props = CharacteristicProperties::default()
+///     .with_read(true)
+///     .with_notify(true);
+///
+/// let char = GattCharacteristic::new(uuid, props);
+/// assert!(char.can_read());
+/// assert!(char.can_notify());
+/// ```
 #[derive(Clone, Debug)]
 pub struct GattCharacteristic {
     /// Characteristic UUID.
@@ -200,6 +347,11 @@ pub struct GattCharacteristic {
 
 impl GattCharacteristic {
     /// Create a new GATT characteristic.
+    ///
+    /// # Arguments
+    ///
+    /// * `uuid` - The UUID of the characteristic
+    /// * `properties` - The properties of the characteristic
     pub fn new(uuid: CharacteristicUuid, properties: CharacteristicProperties) -> Self {
         Self {
             uuid,
@@ -209,6 +361,8 @@ impl GattCharacteristic {
     }
 
     /// Set the characteristic handle.
+    ///
+    /// Handles are backend-specific numeric identifiers.
     pub fn with_handle(mut self, handle: u16) -> Self {
         self.handle = Some(handle);
         self
@@ -220,17 +374,39 @@ impl GattCharacteristic {
     }
 
     /// Check if the characteristic supports writing.
+    ///
+    /// Returns true if either write-with-response or
+    /// write-without-response is supported.
     pub fn can_write(&self) -> bool {
         self.properties.write || self.properties.write_without_response
     }
 
     /// Check if the characteristic supports notifications.
+    ///
+    /// Returns true if either notify or indicate is supported.
     pub fn can_notify(&self) -> bool {
         self.properties.notify || self.properties.indicate
     }
 }
 
 /// Properties of a GATT characteristic.
+///
+/// These properties indicate what operations can be performed on
+/// a characteristic. They are read from the Characteristic Descriptor.
+///
+/// # Example
+///
+/// ```no_run
+/// use bt_mon::CharacteristicProperties;
+///
+/// let props = CharacteristicProperties::default()
+///     .with_read(true)
+///     .with_write(true)
+///     .with_notify(true);
+///
+/// assert!(props.read);
+/// assert!(props.notify);
+/// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CharacteristicProperties {
     /// Supports broadcast.
@@ -307,6 +483,20 @@ impl CharacteristicProperties {
 }
 
 /// A value notification from a characteristic.
+///
+/// This struct contains the data sent to a client when a characteristic
+/// value changes and the client has subscribed to notifications or indications.
+///
+/// # Example
+///
+/// ```no_run
+/// use bt_mon::{ValueNotification, CharacteristicUuid};
+///
+/// let uuid = CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
+/// let notification = ValueNotification::new(uuid, vec![0x48, 0x65, 0x6C, 0x6C, 0x6F]);
+///
+/// assert_eq!(notification.as_slice(), b"Hello");
+/// ```
 #[derive(Clone, Debug)]
 pub struct ValueNotification {
     /// The characteristic that sent the notification.
@@ -319,6 +509,8 @@ pub struct ValueNotification {
 
 impl ValueNotification {
     /// Create a new value notification.
+    ///
+    /// Automatically sets the timestamp to the current time.
     pub fn new(characteristic: CharacteristicUuid, value: Vec<u8>) -> Self {
         Self {
             characteristic,
@@ -328,6 +520,8 @@ impl ValueNotification {
     }
 
     /// Create a notification without a timestamp.
+    ///
+    /// Useful for testing or when the timestamp is not relevant.
     pub fn without_timestamp(characteristic: CharacteristicUuid, value: Vec<u8>) -> Self {
         Self {
             characteristic,

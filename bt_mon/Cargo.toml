@@ -1,0 +1,36 @@
+[package]
+name = "bt_mon"
+version = "0.1.0"
+edition = "2021"
+description = "Bluetooth device monitoring library with backend abstraction"
+license = "MIT"
+
+[dependencies]
+# Async runtime compatibility
+tokio = { version = "1.35", features = ["sync", "rt", "macros"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# UUID handling
+uuid = { version = "1.6", features = ["v4"] }
+
+# Data structures
+dashmap = "5.5"
+
+# Logging
+log = "0.4"
+
+# Core dependencies (feature-gated)
+btleplug = { version = "0.12", optional = true }
+bluer = { version = "0.17", optional = true, features = ["bluetoothd"] }
+
+[dev-dependencies]
+tokio = { version = "1.35", features = ["full"] }
+env_logger = "0.10"
+futures-util = "0.3"
+
+[features]
+default = ["btleplug"]
+btleplug = ["dep:btleplug"]
+bluer = ["dep:bluer"]
+full = ["btleplug", "bluer"]

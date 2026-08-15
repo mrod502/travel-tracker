@@ -79,64 +79,66 @@ pub mod backends;
 /// Create a new Bluetooth monitor using the btleplug backend (cross-platform).
 ///
 /// This function is only available when the `btleplug` feature is enabled.
-/// This is the default backend.
+/// This is the default backend and provides cross-platform support for macOS,
+/// Windows, and Linux.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - No Bluetooth adapter is found on the system
+/// - The adapter cannot be initialized
+/// - Bluetooth is not available on the system
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// use bt_mon::{DeviceMonitor, create_btleplug_monitor};
 ///
-/// # async fn example() -> Result<(), bt_mon::Error> {
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), bt_mon::Error> {
 /// let monitor = create_btleplug_monitor().await?;
 /// monitor.start_scan().await?;
+/// let devices = monitor.devices().await?;
+/// println!("Found {} devices", devices.len());
 /// # Ok(())
 /// # }
 /// ```
 #[cfg(feature = "btleplug")]
-pub async fn create_btleplug_monitor() -> Result<impl crate::monitor::DeviceMonitor + crate::monitor::GattClient> {
-    #[cfg(feature = "btleplug")]
-    {
-        crate::backends::BtleplugMonitor::new().await
-    }
-    #[cfg(not(feature = "btleplug"))]
-    {
-        Err(Error::BackendUnavailable {
-            required: BackendKind::Btleplug,
-            available: vec![],
-        })
-    }
+pub async fn create_btleplug_monitor() -> Result<impl crate::monitor::GattClient> {
+    crate::backends::btleplug::BtleplugMonitor::new().await
 }
 
-/// Create a new Bluetooth monitor using the bluer backend (Linux/BlueZ).
+/// Create a new Bluetooth monitor using the bluer backend (Linux/BlueZ only).
 ///
 /// This function is only available when the `bluer` feature is enabled.
-/// The bluer backend provides additional features like GATT server support
-/// and BLE advertising, but is Linux-only.
+/// The bluer backend provides Linux-specific features like GATT server support
+/// and BLE advertising, but requires BlueZ 5.43+ and is Linux-only.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Not running on Linux
+/// - No Bluetooth adapter is found
+/// - The adapter cannot be initialized
+/// - BlueZ is not available or too old
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// use bt_mon::{DeviceMonitor, create_bluer_monitor};
 ///
-/// # async fn example() -> Result<(), bt_mon::Error> {
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), bt_mon::Error> {
 /// let monitor = create_bluer_monitor().await?;
 /// monitor.start_scan().await?;
+/// let devices = monitor.devices().await?;
+/// println!("Found {} devices", devices.len());
 /// # Ok(())
 /// # }
 /// ```
 #[cfg(feature = "bluer")]
-pub async fn create_bluer_monitor() -> Result<impl crate::monitor::DeviceMonitor + crate::monitor::GattClient> {
-    #[cfg(feature = "bluer")]
-    {
-        crate::backends::BluerMonitor::new().await
-    }
-    #[cfg(not(feature = "bluer"))]
-    {
-        Err(Error::BackendUnavailable {
-            required: BackendKind::Bluer,
-            available: vec![],
-        })
-    }
+pub async fn create_bluer_monitor() -> Result<impl crate::monitor::GattClient> {
+    crate::backends::bluer::BluerMonitor::new().await
 }
 
 #[cfg(test)]

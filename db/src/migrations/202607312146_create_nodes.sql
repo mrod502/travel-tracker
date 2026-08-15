@@ -6,7 +6,7 @@
 -- ---------------------------------------------------------------------
 
 CREATE TABLE nodes (
-    node_id                TEXT PRIMARY KEY,          -- e.g. 'node-042'
+    node_id                BYTEA PRIMARY KEY,         -- SHA-256(signing_public_key), 32 bytes
     node_type              node_type NOT NULL,
 
     -- Transport identity (mTLS) -- used for network connections.
@@ -42,9 +42,10 @@ CREATE INDEX idx_node_type ON nodes (node_type);
 CREATE INDEX idx_node_owns_geo_cells ON nodes USING GIN (owns_geo_cells);
 CREATE INDEX idx_node_status ON nodes (status);
 
-COMMENT ON TABLE nodes IS
-    'signing_public_key + ca_credential together let any party verify any
-     occurrence''s origin offline: check ca_credential against the CA''s known
-     root key once, then verify the occurrence signature against signing_public_key.
-     Neither step requires a live CA call at verification time.';
+COMMENT ON TABLE nodes IS $$
+signing_public_key + ca_credential together let any party verify any
+occurrence's origin offline: check ca_credential against the CA's known
+root key once, then verify the occurrence signature against signing_public_key.
+Neither step requires a live CA call at verification time.
+$$;
 

@@ -6,7 +6,7 @@
 -- ---------------------------------------------------------------------
 
 CREATE TABLE sync_cursors (
-    peer_node_id            TEXT NOT NULL REFERENCES nodes(node_id),
+    peer_node_id            BYTEA NOT NULL REFERENCES nodes(node_id),
     last_synced_occurrence_id UUID,
     last_synced_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     direction               sync_direction NOT NULL,

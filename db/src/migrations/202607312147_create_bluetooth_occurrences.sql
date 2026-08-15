@@ -1,11 +1,13 @@
 -- =====================================================================
--- Distributed BLE Device Tracking - Initial Schema Migration
+-- Distributed Wireless Signal Tracking - Initial Schema Migration
 -- Creates core tables: nodes, occurrences (partitioned), and supporting indexes
+-- Supports: Bluetooth, WiFi, and future signal types (NFC, Zigbee, etc.)
 -- =====================================================================
 
 
 -- ---------------------------------------------------------------------
 -- OCCURRENCES  (append-only, immutable ground truth)
+-- Single unified table for all wireless signal types.
 -- Partitioned by time (RANGE on observed_at) for retention/compaction.
 -- Geo-sharding across nodes is enforced at the APPLICATION layer
 -- (a node only ingests/syncs occurrences whose geo_cell it owns) --
@@ -18,32 +20,34 @@ CREATE TABLE occurrences (
     -- or deterministic hash for aggregator-relayed reports
     occurrence_id           UUID NOT NULL DEFAULT uuidv7(),
 
-    -- Node identification
-    origin_node_id          TEXT NOT NULL REFERENCES nodes(node_id),
+    -- Signal type discriminator (allows unified table for Bluetooth, WiFi, etc.)
+    signal_type             signal_type NOT NULL,     -- bluetooth, wifi, nfc, zigbee, etc.
+
+    -- Node identification (origin only; relay tracking moved to occurrence_relays table)
+    origin_node_id          BYTEA NOT NULL REFERENCES nodes(node_id),
                                 -- the node that CAPTURED and SIGNED this
                                 -- observation (a signal node, if relayed)
-    reporting_node_id       TEXT NOT NULL REFERENCES nodes(node_id),
-                                -- the node that WROTE this row (equals
-                                -- origin_node_id for full-node captures
-                                -- the relaying aggregator otherwise)
+    -- NOTE: reporting_node_id was moved to occurrence_relays table
+    -- to separate occurrence data from relay provenance concerns.
 
     -- Timestamps
     observed_at             TIMESTAMPTZ NOT NULL,   -- sync-corrected UTC time
     observed_at_node_local  TIMESTAMPTZ NOT NULL,   -- raw, pre-correction, for drift auditing
 
-    -- Device information
-    device_address          TEXT,                    -- raw BLE MAC, nullable (may be withheld/hashed only)
-    address_type            ble_address_type NOT NULL,
+    -- Device information (common across signal types)
+    device_address          BYTEA,                   -- raw MAC/address (binary, nullable)
+    device_hash             BYTEA NOT NULL,          -- pseudonymous id (32-byte SHA-256 hash)
     advertised_name         TEXT,
-    device_hash             TEXT NOT NULL,          -- pseudonymous id derived from address. indexed heavily
 
-    -- Advertisement details
-    adv_type                adv_type NOT NULL,
+    -- Advertisement details (BLE-specific; null for other signal types)
+    adv_type                adv_type,                -- BLE only
     rssi                    SMALLINT NOT NULL,
     tx_power                SMALLINT,
-    service_uuids           JSONB,
-    manufacturer_data       JSONB,
-    raw_payload_hex         TEXT NOT NULL,
+
+    -- Flexible signal-specific payload (JSONB for extensibility)
+    -- Bluetooth: service_uuids, manufacturer_data, raw_payload_hex
+    -- WiFi: ssid, bssid, channel, capabilities, etc.
+    signal_payload          JSONB NOT NULL DEFAULT '{}',
 
     -- Location data (PostGIS geography type)
     location                GEOGRAPHY(POINT, 4326), -- PostGIS point (lon, lat)
@@ -55,10 +59,10 @@ CREATE TABLE occurrences (
     -- Resolution 9 for fine-grained occurrence indexing (~0.1 km^2 cells)
     -- h3-pg v4+ accepts geometry/geography/point types
     geo_cell_fine           H3INDEX GENERATED ALWAYS AS
-                                (h3_lat_lng_to_cell(ST_Force2D(location::geometry), 9)) STORED,
+                                (h3_latlng_to_cell(ST_Force2D(location::geometry), 9)) STORED,
     -- Resolution 6 for macro-level node ownership (~36 km^2 cells)
     geo_cell_macro          H3INDEX GENERATED ALWAYS AS
-                                (h3_cell_to_parent(h3_lat_lng_to_cell(ST_Force2D(location::geometry), 9), 6)) STORED,
+                                (h3_cell_to_parent(h3_latlng_to_cell(ST_Force2D(location::geometry), 9), 6)) STORED,
 
     -- PROVENANCE: every occurrence is independently verifiable, regardless
     -- of who relayed it. signed_payload is the canonical byte sequence the
@@ -79,6 +83,35 @@ CREATE TABLE occurrences (
     PRIMARY KEY (occurrence_id, observed_at)   -- observed_at included: required by Postgres
                                                  -- for PK on a partitioned table
 ) PARTITION BY RANGE (observed_at);
+
+-- ---------------------------------------------------------------------
+-- OCCURRENCE_RELAYS - Relay provenance tracking (MVP deferred)
+-- Separated from occurrences to distinguish:
+-- 1. What was observed (occurrences - the core data)
+-- 2. Who reported it on behalf of whom (occurrence_relays - relay metadata)
+--
+-- This table tracks WHEN an occurrence was relayed by which node,
+-- allowing attribution of relay behavior without polluting the core
+-- occurrence record. Critical for multi-hop relay scenarios in Phase 4+,
+-- not required for MVP (single-hop aggregator relays).
+-- ---------------------------------------------------------------------
+
+CREATE TABLE occurrence_relays (
+    occurrence_id    UUID NOT NULL REFERENCES occurrences(occurrence_id),
+    observed_at      TIMESTAMPTZ NOT NULL,              -- Must match occurrence timestamp
+    geo_cell_macro   H3INDEX NOT NULL,                  -- Must match occurrence geo_cell_macro
+    reporting_node_id BYTEA NOT NULL REFERENCES nodes(node_id),
+    ingested_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (occurrence_id, observed_at, geo_cell_macro, reporting_node_id)
+);
+
+COMMENT ON TABLE occurrence_relays IS
+    'Tracks which node(s) relayed an occurrence on behalf of the origin node.
+     Used when a full node reports an occurrence from a signal node it aggregates.
+     The core occurrences table stores origin_node_id (who captured/signed);
+     this table stores reporting_node_id (who wrote it to this database).
+     MVP (Phase 0-3) does not require this table; critical for Phase 4+ (signal nodes).
+     See: .knowledge/architecture/data-model.md for occurrence vs relay separation.';
 
 -- Example monthly partitions -- automate creation via cron/pg_partman in practice
 CREATE TABLE occurrences_2026_07 PARTITION OF occurrences

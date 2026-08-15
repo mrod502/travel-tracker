@@ -3,6 +3,9 @@
 -- Defined upfront so tables can reference them
 -- ====================================================================
 
+-- Signal type enum (supports multiple wireless technologies)
+CREATE TYPE signal_type AS ENUM ('bluetooth', 'wifi', 'nfc', 'zigbee', 'lorawan');
+
 -- Node type enum
 CREATE TYPE node_type AS ENUM ('full', 'light', 'aggregator', 'signal');
 

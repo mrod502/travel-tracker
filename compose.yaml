@@ -35,6 +35,13 @@ services:
       DOCKER: true
     ports:
       - ${LISTEN_PORT:-8080}:8080
+    # --- Bluetooth access ---
+    # bluer/btleplug on Linux talk to bluetoothd over D-Bus, not raw HCI
+    # sockets, so no extra capabilities are needed here — bluetoothd on
+    # the host does the privileged adapter work as root.
+    volumes:
+      - /var/run/dbus:/var/run/dbus
+      - /run/dbus:/run/dbus
   llm:
     # LLM coding agent container (e.g., qwen, claude-code)
     build:
@@ -88,6 +95,14 @@ services:
         target: /tmp
         tmpfs:
           mode: 01777
+
+      # --- Bluetooth access ---
+      # Shares the host's D-Bus socket so bluer/btleplug can reach the
+      # host's bluetoothd. Both talk BlueZ's D-Bus API on Linux, not raw
+      # HCI sockets, so no added capabilities are needed — the host's
+      # bluetoothd (running as root there) does the privileged work.
+      - /var/run/dbus:/var/run/dbus
+      - /run/dbus:/run/dbus
 
     environment:
       HOME: /home/dev

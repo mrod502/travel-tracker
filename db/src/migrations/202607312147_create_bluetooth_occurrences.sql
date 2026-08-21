@@ -57,12 +57,13 @@ CREATE TABLE occurrences (
 
     -- H3 geo-indexing (generated columns)
     -- Resolution 9 for fine-grained occurrence indexing (~0.1 km^2 cells)
-    -- h3-pg v4+ accepts geometry/geography/point types
+    -- h3-pg v4+ expects point(lat, lng) - note: lat first, then lng
+    -- location is GEOGRAPHY(POINT, 4326), so we extract Y (lat) and X (lng)
     geo_cell_fine           H3INDEX GENERATED ALWAYS AS
-                                (h3_latlng_to_cell(ST_Force2D(location::geometry), 9)) STORED,
+                                (h3_latlng_to_cell(point(ST_Y(location::geometry), ST_X(location::geometry)), 9)) STORED,
     -- Resolution 6 for macro-level node ownership (~36 km^2 cells)
     geo_cell_macro          H3INDEX GENERATED ALWAYS AS
-                                (h3_cell_to_parent(h3_latlng_to_cell(ST_Force2D(location::geometry), 9), 6)) STORED,
+                                (h3_cell_to_parent(h3_latlng_to_cell(point(ST_Y(location::geometry), ST_X(location::geometry)), 9), 6)) STORED,
 
     -- PROVENANCE: every occurrence is independently verifiable, regardless
     -- of who relayed it. signed_payload is the canonical byte sequence the
@@ -97,12 +98,16 @@ CREATE TABLE occurrences (
 -- ---------------------------------------------------------------------
 
 CREATE TABLE occurrence_relays (
-    occurrence_id    UUID NOT NULL REFERENCES occurrences(occurrence_id),
-    observed_at      TIMESTAMPTZ NOT NULL,              -- Must match occurrence timestamp
-    geo_cell_macro   H3INDEX NOT NULL,                  -- Must match occurrence geo_cell_macro
+    occurrence_id    UUID NOT NULL,                     -- Must match occurrence_id in occurrences
+    observed_at      TIMESTAMPTZ NOT NULL,              -- Must match occurrence timestamp (part of PK)
+    geo_cell_macro   H3INDEX NOT NULL,                  -- Must match occurrence geo_cell_macro (part of PK)
     reporting_node_id BYTEA NOT NULL REFERENCES nodes(node_id),
     ingested_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (occurrence_id, observed_at, geo_cell_macro, reporting_node_id)
+    PRIMARY KEY (occurrence_id, observed_at, geo_cell_macro, reporting_node_id),
+    -- Foreign key to occurrences must include all PK columns of the partitioned table
+    CONSTRAINT fk_occurrence_relays_occurrence 
+        FOREIGN KEY (occurrence_id, observed_at) 
+        REFERENCES occurrences(occurrence_id, observed_at)
 );
 
 COMMENT ON TABLE occurrence_relays IS

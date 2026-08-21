@@ -1,0 +1,28 @@
+# btmon Configuration File Example
+# Copy this file to config.toml and modify as needed
+
+# Database configuration
+[database]
+url = "postgres://postgres:devpassword@localhost:7789/postgres"
+# Alternatively, use individual connection parameters:
+# host = "localhost"
+# port = 5432
+# database = "travel"
+# user = "btmon"
+# password = "btmon"
+
+# Logging configuration
+[log]
+level = "info" # Options: debug, info, warn, error
+
+# Node configuration
+[node]
+id = "49bb4b0d-2645-452d-bd81-e76b65901f08" # Your node UUID
+
+# Bluetooth configuration
+[bluetooth]
+scan_interval_ms = 1000             # Scan interval in milliseconds
+store_raw_payload = true            # Store raw advertisement data
+data_dir = "~/.btmon/data"          # Directory for node identity and state
+rate_limit_ms = 15000               # Rate limit threshold in milliseconds (15s default)
+fixed_location = "40.6892,-74.0445" # Optional: fixed location "lat,lon"

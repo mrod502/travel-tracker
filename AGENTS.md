@@ -188,6 +188,21 @@ serde = { version = "1.0", features = ["derive"] }
    - Use `Box<T>` for heap allocation
    - Avoid unnecessary cloning with references
 
+## Custom Project Skills
+
+This project has specialized skills that should be invoked automatically for relevant tasks:
+
+### `canonical-cbor` (CBOR encoding, signing, provenance)
+**When to use**: When working with cryptographic signing of occurrence data, CBOR serialization, or signature verification. Triggers on: "signing", "CBOR", "provenance", "signature verification", "canonical encoding".
+
+### `h3-geospatial-indexing` (H3 geospatial, spatial queries)
+**When to use**: When working with location data, H3 cells, spatial indexing, or geographic queries. Triggers on: "H3", "geospatial", "location", "spatial query", "geo cell", "hex grid".
+
+### `provenance-verification` (Node identity, occurrence authenticity)
+**When to use**: When verifying occurrence origins, working with node identities, or implementing signature verification. Triggers on: "provenance", "node identity", "signature verification", "origin_node_id", "reporting_node_id", "CA credential".
+
+**How skills are invoked**: Skills are automatically considered when their keywords appear in your request. For explicit invocation, use `/skill canonical-cbor`, `/skill h3-geospatial-indexing`, or `/skill provenance-verification`.
+
 ## Security Best Practices
 
 1. **Dependency Security**

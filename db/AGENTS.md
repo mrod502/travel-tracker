@@ -80,6 +80,25 @@ cargo run --bin db -- --host database --port 5432 --user <user> --db <dbname> up
 cargo run --bin db -- --host database --port 5432 --user ${DB_USER} --db ${DB_NAME} up --migrations-path ./db/src/migrations
 ```
 
+### Reset Database (Drop and Re-apply All Migrations)
+**Warning**: This will drop all user-defined tables, custom types (enums, composite types, ranges), and the `migrations` table, then re-apply all migrations from scratch. All data will be lost!
+
+The reset process:
+1. Drops all custom types (ENUMs, composite types, RANGEs) in the public schema (excluding extension-owned types)
+2. Drops all tables in the public schema (excluding extension-owned tables like `spatial_ref_sys`)
+3. Recreates the `migrations` table
+4. Re-applies all migrations from scratch
+
+**Note**: PostgreSQL extensions (pgcrypto, postgis, h3, etc.) are preserved because migrations use `CREATE EXTENSION IF NOT EXISTS` which is idempotent.
+
+```bash
+# From workspace root
+cargo run --bin db -- --host database --port 5432 --user <user> --db <dbname> reset --migrations-path ./db/src/migrations
+
+# From inside the llm container (after sourcing .env)
+cargo run --bin db -- --host database --port 5432 --user ${DB_USER} --db ${DB_NAME} reset --migrations-path ./db/src/migrations
+```
+
 ### Create New Migration
 ```bash
 cargo run --bin db -- new-migration --name <description>
@@ -91,6 +110,7 @@ cargo run --bin db -- new-migration --name <description>
 * [main](./src/main.rs) - CLI utility for applying migrations
 * [runner](./src/runner.rs) - Database migration runner logic
 * [up](./src/up.rs) - Migration up functionality (discovers and applies pending migrations)
+* [down](./src/down.rs) - Migration reset functionality (drops custom types, tables, and re-applies migrations)
 * [new](./src/new.rs) - Migration creation utility
 * [file_attrs](./src/file_attrs.rs) - File attribute parsing for migration ordering
 
@@ -145,6 +165,7 @@ The migration system has comprehensive tests covering:
 * **Migrations are append-only**: The `occurrence` table and related data are never updated after insertion.
 * **Partition management**: Monthly partitions are created manually or via automation (pg_partman recommended for production).
 * **H3 function signatures**: The `h3-pg` extension function names have varied across versions. Verify against your installed version before writing migrations that use H3 functions.
+* **SQL parsing**: The migration system uses `sqlparser` (v0.51) to parse SQL statements. For PostgreSQL-specific syntax that sqlparser may not fully support (e.g., `uuidv7()`, custom extensions, complex generated columns), the system falls back to simple semicolon-based splitting. This ensures migrations with advanced PostgreSQL features still work correctly.
 
 ## Troubleshooting
 
@@ -156,3 +177,9 @@ Check if the migration was partially applied. If so, you may need to manually cl
 
 ### H3 function not found
 Verify the `h3-pg` version and check its documentation for the correct function signatures. The API has changed between versions.
+
+### SQL parser warnings or fallback activation
+The migration system may log messages about sqlparser failing or using fallback splitting. This is expected for PostgreSQL-specific syntax like `uuidv7()`, custom extension functions, or complex generated columns. The fallback mechanism ensures these migrations still execute correctly.
+
+### Long migration files fail to parse
+If a migration file is very large or contains complex nested SQL, sqlparser may hit internal limits. The system automatically falls back to semicolon-based splitting in such cases. If issues persist, consider splitting the migration into smaller, logically separated files.

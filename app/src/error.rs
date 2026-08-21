@@ -36,6 +36,26 @@ pub enum AppError {
     /// Validation error.
     #[error("Validation error: {0}")]
     Validation(String),
+
+    /// IO error.
+    #[error("IO error: {0}")]
+    Io(String),
+
+    /// Node identity error.
+    #[error("Node identity error: {0}")]
+    NodeIdentity(String),
+
+    /// Provenance/signing error.
+    #[error("Provenance error: {0}")]
+    Provenance(String),
+
+    /// Rate limiter error.
+    #[error("Rate limiter error: {0}")]
+    RateLimiter(String),
+
+    /// FullNode initialization error.
+    #[error("FullNode error: {0}")]
+    FullNode(String),
 }
 
 impl From<String> for AppError {

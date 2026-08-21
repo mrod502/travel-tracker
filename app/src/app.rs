@@ -1,24 +1,29 @@
 //! Main application state and event loop.
+//!
+//! This module provides the `App` struct which integrates the FullNode
+//! with the application lifecycle.
 
-use bt_mon::{create_btleplug_monitor, DeviceEvent, DeviceMonitor};
-use bt_mon::monitor::events::UpdateField;
-use futures_util::stream::StreamExt;
-use log::{debug, error, info, warn};
-use repo::{mac_address_from_string, Occurrence, OccurrenceRepository, Pool, SignalType};
-use uuid::Uuid;
+use bt_mon::{create_btleplug_monitor, DeviceMonitor};
+use log::{error, info};
+use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
+use crate::node::full::{FullNode, FullNodeConfig};
 
 /// Main application state.
+///
+/// This struct wraps the FullNode and manages the application lifecycle.
 pub struct App {
-    config: Config,
-    pool: Pool,
-    node_id: Uuid,
+    node: FullNode,
+    data_dir: PathBuf,
 }
 
 impl App {
     /// Create a new application instance.
+    ///
+    /// This initializes the FullNode with the provided configuration,
+    /// including database connection, node identity, and rate limiting.
     pub async fn new(config: Config) -> Result<Self> {
         // Validate configuration
         config.validate()?;
@@ -26,34 +31,51 @@ impl App {
         // Build database URL from config (either DSN or components)
         let database_url = config.database_url().map_err(AppError::from)?;
 
-        // Connect to database
         info!("Connecting to database...");
-        let pool = Pool::connect(&database_url)
+        let pool = repo::Pool::connect(&database_url)
             .await
             .map_err(AppError::Database)?;
         info!("Connected to database");
 
-        // Parse node_id
-        let node_id = config.node_id().map_err(AppError::from)?;
-        info!("Node ID: {}", node_id);
+        // Get data directory
+        let data_dir = config.data_dir().map_err(AppError::from)?;
+        info!("Data directory: {:?}", data_dir);
 
-        Ok(Self {
-            config,
+        // Create data directory if it doesn't exist
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| AppError::Io(format!("Failed to create data directory: {}", e)))?;
+
+        // Parse fixed location if provided
+        let fixed_location = match config.fixed_location() {
+            Some(Ok((lat, lon))) => Some((lat, lon)),
+            Some(Err(e)) => return Err(AppError::Config(e)),
+            None => None,
+        };
+
+        // Build FullNode configuration
+        let fullnode_config = FullNodeConfig {
             pool,
-            node_id,
-        })
+            data_dir: data_dir.clone(),
+            rate_limit_threshold_ms: config.rate_limit_ms,
+            rate_limit_max_cache_size: None, // Could be configurable
+            fixed_location,
+        };
+
+        // Create FullNode instance
+        info!("Initializing FullNode...");
+        let node = FullNode::new(fullnode_config).await?;
+        info!("FullNode initialized with node ID: {}", hex::encode(node.node_id()));
+
+        Ok(Self { node, data_dir })
     }
 
     /// Run the main event loop.
+    ///
+    /// This creates a Bluetooth monitor and delegates to the FullNode's
+    /// run() method which handles Bluetooth monitoring, occurrence signing,
+    /// and storage.
     pub async fn run(&mut self) -> Result<()> {
-        // Initialize logging
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or(&self.config.log_level)
-        )
-        .init();
-
-        info!("Starting Bluetooth monitoring application");
-        info!("Scan interval: {} ms", self.config.scan_interval_ms);
+        info!("Starting Bluetooth monitoring...");
 
         // Create Bluetooth monitor
         info!("Creating Bluetooth monitor...");
@@ -68,7 +90,7 @@ impl App {
             .await
             .map_err(AppError::Bluetooth)?;
         if !powered {
-            warn!("Bluetooth adapter is not powered on. Some functionality may be limited.");
+            info!("Bluetooth adapter is not powered on. Device discovery may be limited.");
         } else {
             info!("Bluetooth adapter is powered on");
 
@@ -78,173 +100,39 @@ impl App {
             }
         }
 
-        // Start scanning
-        info!("Starting scan...");
-        monitor
-            .start_scan()
-            .await
-            .map_err(AppError::Bluetooth)?;
-        info!("Scan started");
-
-        // Get event stream
-        let mut events = monitor
-            .device_events()
-            .await
-            .map_err(AppError::Bluetooth)?;
-
-        info!("Listening for Bluetooth events (press Ctrl+C to stop)...");
-
-        // Main event loop
-        while let Some(event) = events.next().await {
-            match event {
-                DeviceEvent::DeviceAdded { device } => {
-                    info!("Discovered device: {}", device.id);
-                    if let Err(e) = self.handle_device_added(&device).await {
-                        error!("Error handling device added: {}", e);
-                    }
-                }
-
-                DeviceEvent::DeviceRemoved { id } => {
-                    debug!("Device removed: {}", id);
-                    // For now, just log. We could track device presence.
-                }
-
-                DeviceEvent::DeviceUpdated {
-                    device,
-                    changed_fields,
-                } => {
-                    debug!(
-                        "Device updated: {} (changed: {:?})",
-                        device.id, changed_fields
-                    );
-
-                    // Handle RSSI updates - store as new occurrence
-                    if changed_fields.contains(&UpdateField::Rssi) {
-                        if let Err(e) = self.handle_device_updated(&device).await {
-                            error!("Error handling device updated: {}", e);
-                        }
-                    }
-                }
-            }
+        // Run the FullNode event loop
+        // This will monitor Bluetooth devices, sign occurrences, and store them
+        if let Err(e) = self.node.run(monitor).await {
+            error!("FullNode error: {}", e);
+            return Err(AppError::FullNode(e.to_string()));
         }
 
-        info!("Event stream closed");
-
-        // Stop scanning
-        monitor
-            .stop_scan()
-            .await
-            .map_err(AppError::Bluetooth)?;
-        info!("Scan stopped");
-
+        info!("Application completed");
         Ok(())
     }
 
-    /// Handle a device added event.
-    async fn handle_device_added(&self, device: &bt_mon::BluetoothDevice) -> Result<()> {
-        // Parse MAC address
-        let device_address = mac_address_from_string(device.id.as_str())
-            .map_err(|e| AppError::InvalidMacAddress(e.to_string()))?;
-
-        // Generate occurrence ID and timestamp
-        let id = Uuid::now_v7();
-        let observed_at = chrono::Utc::now();
-
-        // Generate device hash (SHA-256 of MAC address for stable pseudonymous ID)
-        let device_hash = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&device_address);
-            hasher.finalize().to_vec()
-        };
-
-        // Build signal payload with Bluetooth-specific data
-        let mut ble_payload = serde_json::Map::new();
-        ble_payload.insert(
-            "address_type".to_string(),
-            serde_json::json!("public"), // Default, could be more specific
-        );
-
-        // Handle manufacturer data
-        if let Some((company_id, payload)) = device.manufacturer_data.iter().next() {
-            ble_payload.insert(
-                "manufacturer_data".to_string(),
-                serde_json::json!({
-                    "company_id": company_id,
-                    "payload": hex::encode(payload)
-                }),
-            );
-        }
-
-        // Handle service UUIDs
-        if !device.service_data.is_empty() {
-            let uuids: Vec<String> = device
-                .service_data
-                .keys()
-                .map(|u| u.as_uuid().to_string())
-                .collect();
-            ble_payload.insert("service_uuids".to_string(), serde_json::json!(uuids));
-        }
-
-        // Add RSSI to payload if available
-        if let Some(rssi) = device.rssi {
-            ble_payload.insert("rssi".to_string(), serde_json::json!(rssi));
-        }
-
-        // Add device name if available
-        if let Some(name) = &device.name {
-            ble_payload.insert("name".to_string(), serde_json::json!(name));
-        }
-
-        // Wrap in signal_type key
-        let mut signal_payload = serde_json::Map::new();
-        signal_payload.insert("ble".to_string(), serde_json::json!(ble_payload));
-
-        // Generate minimal signed payload (in production, this would be proper canonical CBOR)
-        let signed_payload = format!(
-            "{}:{}:{}",
-            id,
-            observed_at.timestamp(),
-            hex::encode(&device_address)
-        )
-        .into_bytes();
-
-        // Generate placeholder signature (in production, use real Ed25519 signing)
-        let signature = vec![0u8; 64];
-
-        // Build occurrence using builder pattern
-        let occurrence = Occurrence::builder()
-            .signal_type(SignalType::Bluetooth)
-            .origin_node_id(&self.node_id.to_bytes_le().to_vec())
-            .observed_at(observed_at)
-            .observed_at_node_local(observed_at)
-            .device_address(&device_address)
-            .device_hash(&device_hash)
-            .rssi(device.rssi.unwrap_or(0) as i16)
-            .signal_payload(serde_json::Value::Object(signal_payload))
-            .signed_payload(&signed_payload)
-            .signature(&signature)
-            .build();
-
-        // Insert into database
-        match OccurrenceRepository::create(self.pool.as_pool(), &occurrence).await {
-            Ok(_) => {
-                debug!("Stored occurrence for device: {}", device.id);
-            }
-            Err(e) => {
-                // Don't fail the whole app on a single DB error
-                error!("Failed to store occurrence: {}", e);
-            }
-        }
-
-        Ok(())
+    /// Get a reference to the underlying FullNode.
+    ///
+    /// This can be used for testing or direct access to node functionality.
+    pub fn node(&self) -> &FullNode {
+        &self.node
     }
 
-    /// Handle a device updated event.
-    async fn handle_device_updated(&self, device: &bt_mon::BluetoothDevice) -> Result<()> {
-        // For now, treat updates similar to additions
-        // In the future, we might want different handling
-        self.handle_device_added(device).await
+    /// Get the node ID.
+    pub fn node_id(&self) -> &[u8] {
+        self.node.node_id()
+    }
+
+    /// Get the data directory.
+    pub fn data_dir(&self) -> &PathBuf {
+        &self.data_dir
+    }
+
+    /// Print current statistics.
+    pub fn print_stats(&self) {
+        let stats = self.node.stats();
+        info!("=== FullNode Statistics ===");
+        info!("{:?}", stats);
     }
 }
 
@@ -252,15 +140,27 @@ impl App {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_mac_address_parsing() {
-        // Test valid MAC
-        let mac = mac_address_from_string("AA:BB:CC:DD:EE:FF");
-        assert!(mac.is_ok());
-        assert_eq!(mac.unwrap(), vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+    #[tokio::test]
+    async fn test_app_creation_without_db() {
+        // This test verifies that app creation fails gracefully without a database
+        let config = Config {
+            database_url: None,
+            pg_host: Some("localhost".to_string()),
+            pg_port: Some(5432),
+            pg_database: None, // Missing
+            pg_user: Some("testuser".to_string()),
+            pg_password: None,
+            log_level: "info".to_string(),
+            node_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
+            scan_interval_ms: 1000,
+            store_raw_payload: true,
+            adapter_id: None,
+            data_dir: None,
+            rate_limit_ms: 15000,
+            fixed_location: None,
+        };
 
-        // Test invalid MAC
-        let invalid = mac_address_from_string("AA:BB:CC:DD:EE");
-        assert!(invalid.is_err());
+        let result = App::new(config).await;
+        assert!(result.is_err());
     }
 }

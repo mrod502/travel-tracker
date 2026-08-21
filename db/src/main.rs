@@ -1,10 +1,12 @@
+mod down;
 mod file_attrs;
 mod new;
 mod runner;
 mod up;
 use async_trait::async_trait;
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use dotenv::dotenv;
+use down::DownArgs;
 use log4rs::{
     Config, Handle,
     append::console::ConsoleAppender,
@@ -15,7 +17,7 @@ use sqlx::{Executor, PgPool, Pool, Postgres, postgres::PgPoolOptions};
 use std::{env, error::Error, fmt::Display};
 use up::UpArgs;
 
-use crate::{runner::Runner, up::MigrationError};
+use crate::runner::Runner;
 
 const MIGRATION_INIT: &str = "CREATE TABLE IF NOT EXISTS migrations (
     id BIGSERIAL PRIMARY KEY NOT NULL,
@@ -63,22 +65,13 @@ pub trait Dsn {
     }
 }
 
-#[async_trait]
-impl Runner for DownArgs {
-    type RunError = MigrationError;
-    async fn run(&self, _conn: Option<&Pool<Postgres>>) -> Result<String, Self::RunError> {
-        Ok("".into())
-    }
-}
-
-#[derive(Args, Debug, Clone)]
-struct DownArgs {}
 
 #[derive(Subcommand, Debug)]
 enum Command {
     NewMigration(NewMigrationArgs),
     Up(UpArgs),
     Down(DownArgs),
+    Reset(DownArgs),
 }
 
 impl Command {
@@ -87,6 +80,7 @@ impl Command {
             Command::NewMigration(_) => false,
             Command::Up(_) => true,
             Command::Down(_) => true,
+            Command::Reset(_) => true,
         }
     }
 }
@@ -201,11 +195,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
-    match &app.command {
-        Command::NewMigration(new_args) => new_args.run(conn),
-        Command::Up(up_args) => up_args.run(conn),
-        Command::Down(down_args) => down_args.run(conn),
-    }
-    .await?;
+    let result = match &app.command {
+        Command::NewMigration(new_args) => new_args.run(conn).await.map_err(|e| Box::new(e) as Box<dyn Error>),
+        Command::Up(up_args) => up_args.run(conn).await.map_err(|e| Box::new(e) as Box<dyn Error>),
+        Command::Down(down_args) => down_args.run(conn).await.map_err(|e| Box::new(e) as Box<dyn Error>),
+        Command::Reset(reset_args) => reset_args.run(conn).await.map_err(|e| Box::new(e) as Box<dyn Error>),
+    };
+    result?;
     Ok(())
 }

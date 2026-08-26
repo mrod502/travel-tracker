@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 # Async runtime compatibility
-tokio = { version = "1.35", features = ["sync", "rt", "macros"] }
+tokio = { version = "1.35", features = ["sync", "rt", "macros", "time"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -24,6 +24,8 @@ log = "0.4"
 btleplug = { version = "0.12", optional = true }
 bluer = { version = "0.17", optional = true, features = ["bluetoothd"] }
 
+# Mock backend (no additional dependencies beyond core)
+
 [dev-dependencies]
 tokio = { version = "1.35", features = ["full"] }
 env_logger = "0.10"
@@ -33,4 +35,5 @@ futures-util = "0.3"
 default = ["btleplug"]
 btleplug = ["dep:btleplug"]
 bluer = ["dep:bluer"]
-full = ["btleplug", "bluer"]
+mock = []
+full = ["btleplug", "bluer", "mock"]

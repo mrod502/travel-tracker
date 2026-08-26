@@ -12,6 +12,8 @@ pub enum BackendKind {
     Bluer,
     /// btleplug backend (cross-platform)
     Btleplug,
+    /// mock backend (testing/development)
+    Mock,
 }
 
 impl fmt::Display for BackendKind {
@@ -19,6 +21,7 @@ impl fmt::Display for BackendKind {
         match self {
             BackendKind::Bluer => write!(f, "bluer"),
             BackendKind::Btleplug => write!(f, "btleplug"),
+            BackendKind::Mock => write!(f, "mock"),
         }
     }
 }

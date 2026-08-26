@@ -26,7 +26,11 @@
 //! [dependencies]
 //! bt_mon = { version = "0.1.0", default-features = false, features = ["bluer"] }
 //!
-//! # Use both backends
+//! # Use mock backend (testing/development)
+//! [dependencies]
+//! bt_mon = { version = "0.1.0", default-features = false, features = ["mock"] }
+//!
+//! # Use all backends including mock
 //! [dependencies]
 //! bt_mon = { version = "0.1.0", features = ["full"] }
 //! ```
@@ -139,6 +143,45 @@ pub async fn create_btleplug_monitor() -> Result<impl crate::monitor::GattClient
 #[cfg(feature = "bluer")]
 pub async fn create_bluer_monitor() -> Result<impl crate::monitor::GattClient> {
     crate::backends::bluer::BluerMonitor::new().await
+}
+
+/// Create a new Bluetooth monitor using the mock backend (testing/development).
+///
+/// This function is only available when the `mock` feature is enabled.
+/// The mock backend provides a fully configurable simulated Bluetooth environment
+/// for testing and development purposes, without requiring physical Bluetooth hardware.
+///
+/// # Features
+///
+/// - Simulated device discovery and connection
+/// - Configurable error responses for testing error handling
+/// - Simulated GATT services and characteristics
+/// - Configurable delays to simulate network/Bluetooth latency
+///
+/// # Example
+///
+/// ```
+/// use bt_mon::{DeviceMonitor, GattClient, create_mock_monitor, DeviceId};
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), bt_mon::Error> {
+/// let monitor = create_mock_monitor().await?;
+///
+/// // Add simulated devices
+/// let device_id = DeviceId::new("00:11:22:33:44:55");
+/// monitor.add_device(device_id.clone()).await?;
+///
+/// // Start scanning (simulated)
+/// monitor.start_scan().await?;
+///
+/// let devices = monitor.devices().await?;
+/// println!("Found {} simulated devices", devices.len());
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "mock")]
+pub async fn create_mock_monitor() -> Result<impl crate::monitor::GattClient> {
+    Ok(crate::backends::mock::MockMonitor::new())
 }
 
 #[cfg(test)]

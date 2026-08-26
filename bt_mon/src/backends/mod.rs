@@ -9,8 +9,14 @@ pub mod btleplug;
 #[cfg(feature = "bluer")]
 pub mod bluer;
 
+#[cfg(feature = "mock")]
+pub mod mock;
+
 #[cfg(feature = "btleplug")]
 pub use btleplug::BtleplugMonitor;
 
 #[cfg(feature = "bluer")]
 pub use bluer::BluerMonitor;
+
+#[cfg(feature = "mock")]
+pub use mock::MockMonitor;

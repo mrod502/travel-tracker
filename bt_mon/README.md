@@ -196,6 +196,63 @@ You can enable both backends and choose at runtime:
 bt_mon = { version = "0.1.0", features = ["full"] }
 ```
 
+### Mock (Testing/Development)
+
+The `mock` backend provides a fully configurable simulated Bluetooth environment for testing and development without requiring physical hardware.
+
+```toml
+[dependencies]
+bt_mon = { version = "0.1.0", default-features = false, features = ["mock"] }
+tokio = { version = "1.35", features = ["full"] }
+env_logger = "0.10"
+```
+
+**Usage:**
+```rust
+use bt_mon::{DeviceMonitor, GattClient, DeviceId, CharacteristicUuid};
+use bt_mon::backends::mock::{MockConfig, MockMonitor};
+
+#[tokio::main]
+async fn main() -> Result<(), bt_mon::Error> {
+    // Create a mock monitor with default configuration
+    let monitor = MockMonitor::new();
+
+    // Add simulated devices
+    let device_id = DeviceId::new("AA:BB:CC:DD:EE:FF");
+    monitor.add_device(device_id.clone()).await?;
+
+    // Configure custom services
+    // ... (see examples/mock_backend_demo.rs for details)
+
+    // Start scanning (simulated)
+    monitor.start_scan().await?;
+
+    let devices = monitor.devices().await?;
+    println!("Found {} simulated devices", devices.len());
+
+    Ok(())
+}
+```
+
+**Features:**
+
+- **Configurable responses**: All trait members can be configured
+- **Simulated device discovery**: Add/remove devices programmatically
+- **Simulated GATT services**: Define custom services and characteristics
+- **Error simulation**: Configure error responses for testing error handling
+- **Configurable delays**: Simulate network/Bluetooth latency
+- **No hardware required**: Works in environments without Bluetooth interfaces
+
+**Use Cases:**
+
+- Unit testing without requiring physical hardware
+- CI/CD pipeline testing
+- Development in headless environments
+- Testing error handling scenarios
+- Prototyping and demonstration
+
+See `examples/mock_backend_demo.rs` for comprehensive examples.
+
 ## Examples
 
 Run the included examples:

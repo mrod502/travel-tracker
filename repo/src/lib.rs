@@ -71,7 +71,7 @@ pub mod types;
 
 // Re-export main types for convenience
 pub use error::RepoError;
-pub use models::{mac_address_from_string, Occurrence, OccurrenceBuilder, OccurrenceRelay, SignalType};
+pub use models::{mac_address_from_string, Node, Occurrence, OccurrenceBuilder, OccurrenceRelay, RevokedNode, SignalType};
 pub use pool::Pool;
 pub use types::PostgisPoint;
-pub use repositories::OccurrenceRepository;
+pub use repositories::{NodeRepository, OccurrenceRepository, RevocationRepository};

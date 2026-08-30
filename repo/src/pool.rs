@@ -93,4 +93,12 @@ impl Pool {
     pub fn is_closed(&self) -> bool {
         self.inner.is_closed()
     }
+
+    /// Create a Pool wrapper from an existing PgPool
+    ///
+    /// This is useful when you already have a PgPool instance and need
+    /// to use it with repository APIs that expect a repo::Pool.
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { inner: pool }
+    }
 }

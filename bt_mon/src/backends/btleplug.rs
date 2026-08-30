@@ -3,7 +3,9 @@
 //! This module provides the cross-platform implementation using the `btleplug` crate.
 
 use async_trait::async_trait;
-use btleplug::api::{Central as _, Manager as _, Peripheral as _, ScanFilter, WriteType};
+use btleplug::api::{
+    Central as _, CentralEvent, CentralState, Manager as _, Peripheral as _, ScanFilter, WriteType,
+};
 use dashmap::DashMap;
 use futures::stream::{self, StreamExt};
 use log::{debug, info, warn};
@@ -14,7 +16,10 @@ use tokio::sync::Mutex;
 use tokio::time;
 
 use crate::error::{BackendKind, Error, Result};
-use crate::monitor::events::{DeviceEvent, DeviceEventStream, NotificationStream};
+use crate::monitor::events::{
+    DeviceEvent, DeviceEventStream, NotificationStream, UpdateField,
+    DEVICE_EVENT_CHANNEL_CAPACITY,
+};
 use crate::monitor::{DeviceMonitor, GattClient};
 use crate::types::ValueNotification;
 use crate::types::{
@@ -79,15 +84,28 @@ impl BtleplugMonitor {
     }
 
     /// Convert btleplug peripheral ID to our DeviceId format.
+    ///
+    /// On BlueZ (Linux) peripheral IDs are D-Bus object path segments of the
+    /// form `hci0:AA:BB:CC:DD:EE:FF`. The adapter prefix is stripped so IDs
+    /// are bare MAC addresses, consistent with the other backends and with
+    /// the app's MAC parsing.
     fn peripheral_id_to_device_id(id: &btleplug::platform::PeripheralId) -> DeviceId {
-        // btleplug peripheral IDs are platform-specific
-        format!("{}", id).into()
+        let raw = format!("{}", id);
+        let mac = raw.split_once(':').and_then(|(prefix, rest)| {
+            if prefix.starts_with("hci") && prefix["hci".len()..].chars().all(|c| c.is_ascii_digit())
+            {
+                Some(rest)
+            } else {
+                None
+            }
+        });
+        mac.unwrap_or(&raw).to_string().into()
     }
 
     /// Convert btleplug peripheral to our BluetoothDevice type.
     async fn peripheral_to_device(peripheral: &btleplug::platform::Peripheral) -> Result<BluetoothDevice> {
         let id = Self::peripheral_id_to_device_id(&peripheral.id());
-        let address = peripheral.address().to_string();
+        let address = id.0.clone();
         
         // Get properties from the peripheral
         let props = peripheral.properties().await
@@ -304,13 +322,270 @@ impl DeviceMonitor for BtleplugMonitor {
     }
 
     async fn device_events(&self) -> Result<DeviceEventStream> {
-        let stream = stream::empty::<DeviceEvent>();
-        Ok(Box::pin(stream))
+        // The btleplug central event stream ends when the adapter's event
+        // source goes away (D-Bus disconnect, bluetoothd restart, adapter
+        // reset). Each call to this method yields one fresh stream; consumers
+        // (see FullNode::run) are expected to reopen it after a delay when it
+        // closes. On BlueZ, opening the stream also synthesizes
+        // DeviceDiscovered events for devices already known to the daemon.
+        let adapter = self.adapter.lock().await.clone();
+        let devices = self.devices.clone();
+        let (tx, rx) = futures::channel::mpsc::channel(DEVICE_EVENT_CHANNEL_CAPACITY);
+
+        tokio::spawn(Self::event_pump(adapter, devices, tx));
+
+        Ok(Box::pin(rx))
     }
 
     async fn is_scanning(&self) -> Result<bool> {
         let scanning = self.scanning.lock().await;
         Ok(*scanning)
+    }
+}
+
+impl BtleplugMonitor {
+    /// Consume the btleplug central event stream, mapping each [`CentralEvent`]
+    /// to [`DeviceEvent`]s and forwarding them over `tx`.
+    ///
+    /// The task exits when the central event stream ends (the returned
+    /// stream then completes) or when the receiver is dropped.
+    async fn event_pump(
+        adapter: btleplug::platform::Adapter,
+        devices: Arc<DashMap<DeviceId, DiscoveredDevice>>,
+        mut tx: futures::channel::mpsc::Sender<DeviceEvent>,
+    ) {
+        let central_events = match adapter.events().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!("Failed to open btleplug central event stream: {}", e);
+                return;
+            }
+        };
+        futures::pin_mut!(central_events);
+
+        while let Some(event) = central_events.next().await {
+            for mapped in Self::map_central_event(&adapter, &devices, event).await {
+                if let Err(err) = tx.try_send(mapped) {
+                    if err.is_disconnected() {
+                        return;
+                    }
+                    debug!("Device event channel full; dropping event");
+                }
+            }
+        }
+        debug!("btleplug central event stream ended");
+    }
+
+    /// Map a btleplug [`CentralEvent`] to zero or more [`DeviceEvent`]s,
+    /// keeping the device cache current along the way.
+    async fn map_central_event(
+        adapter: &btleplug::platform::Adapter,
+        devices: &DashMap<DeviceId, DiscoveredDevice>,
+        event: CentralEvent,
+    ) -> Vec<DeviceEvent> {
+        match event {
+            // A discovery means the app should record an occurrence for the
+            // device. The consumer rate-limits duplicates, so emitting
+            // DeviceAdded even for already-cached devices (BlueZ synthesizes
+            // initial discoveries when the stream opens) is intentional.
+            CentralEvent::DeviceDiscovered(id) => {
+                match Self::fetch_and_cache_device(adapter, devices, &id).await {
+                    Some(device) => vec![DeviceEvent::DeviceAdded { device }],
+                    None => Vec::new(),
+                }
+            }
+
+            CentralEvent::DeviceUpdated(id) => {
+                let device_id = Self::peripheral_id_to_device_id(&id);
+                let old = devices.get(&device_id).map(|e| e.value().device.clone());
+                match Self::fetch_and_cache_device(adapter, devices, &id).await {
+                    Some(device) => match old {
+                        None => vec![DeviceEvent::DeviceAdded { device }],
+                        Some(old) => Self::diff_events(old, device),
+                    },
+                    None => {
+                        // The device is no longer known to the adapter
+                        // (e.g. the Bluetooth stack was reset).
+                        devices.remove(&device_id);
+                        vec![DeviceEvent::DeviceRemoved { id: device_id }]
+                    }
+                }
+            }
+
+            CentralEvent::RssiUpdate { id, rssi } => {
+                let rssi = Some(rssi as i32);
+                let device_id = Self::peripheral_id_to_device_id(&id);
+                match devices.get(&device_id).map(|e| e.value().device.clone()) {
+                    Some(device) if device.rssi == rssi => Vec::new(),
+                    Some(mut device) => {
+                        device.rssi = rssi;
+                        if let Some(mut entry) = devices.get_mut(&device_id) {
+                            entry.value_mut().device.rssi = rssi;
+                        }
+                        vec![DeviceEvent::DeviceUpdated {
+                            device,
+                            changed_fields: vec![UpdateField::Rssi],
+                        }]
+                    }
+                    // RSSI update for an unknown device: fetch full info so
+                    // the discovery is not lost.
+                    None => match Self::fetch_and_cache_device(adapter, devices, &id).await {
+                        Some(device) => vec![DeviceEvent::DeviceAdded { device }],
+                        None => Vec::new(),
+                    },
+                }
+            }
+
+            CentralEvent::DeviceConnected(id) => Self::update_connected(devices, id, true),
+            CentralEvent::DeviceDisconnected(id) => Self::update_connected(devices, id, false),
+
+            CentralEvent::ManufacturerDataAdvertisement { id, manufacturer_data } => {
+                let device_id = Self::peripheral_id_to_device_id(&id);
+                if let Some(mut entry) = devices.get_mut(&device_id) {
+                    entry.value_mut().device.manufacturer_data = manufacturer_data;
+                }
+                debug!("Manufacturer data advertisement from {}", device_id);
+                Vec::new()
+            }
+
+            CentralEvent::ServiceDataAdvertisement { id, service_data } => {
+                let device_id = Self::peripheral_id_to_device_id(&id);
+                if let Some(mut entry) = devices.get_mut(&device_id) {
+                    entry.value_mut().device.service_data = service_data
+                        .into_iter()
+                        .map(|(uuid, data)| (ServiceUuid(uuid), data))
+                        .collect();
+                }
+                debug!("Service data advertisement from {}", device_id);
+                Vec::new()
+            }
+
+            CentralEvent::ServicesAdvertisement { id, .. } => {
+                let device_id = Self::peripheral_id_to_device_id(&id);
+                debug!("Services advertisement from {}", device_id);
+                Vec::new()
+            }
+
+            CentralEvent::DeviceServicesModified(id) => {
+                let device_id = Self::peripheral_id_to_device_id(&id);
+                debug!("Device services modified: {}", device_id);
+                Vec::new()
+            }
+
+            CentralEvent::StateUpdate(state) => {
+                match state {
+                    CentralState::PoweredOn => {
+                        info!("Bluetooth adapter powered on");
+                    }
+                    CentralState::PoweredOff => {
+                        warn!(
+                            "Bluetooth adapter powered off; device events will pause \
+                             until it powers back on"
+                        );
+                    }
+                    CentralState::Unknown => {
+                        debug!("Bluetooth adapter state unknown");
+                    }
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Update the cached connection state of a device, emitting a
+    /// [`DeviceEvent::DeviceUpdated`] when it changes.
+    fn update_connected(
+        devices: &DashMap<DeviceId, DiscoveredDevice>,
+        id: btleplug::platform::PeripheralId,
+        connected: bool,
+    ) -> Vec<DeviceEvent> {
+        let device_id = Self::peripheral_id_to_device_id(&id);
+        let mut emitted = Vec::new();
+        if let Some(mut entry) = devices.get_mut(&device_id) {
+            if entry.value_mut().device.is_connected != connected {
+                entry.value_mut().device.is_connected = connected;
+                let device = entry.value().device.clone();
+                emitted.push(DeviceEvent::DeviceUpdated {
+                    device,
+                    changed_fields: vec![UpdateField::Connected],
+                });
+            }
+        }
+        emitted
+    }
+
+    /// Look up a peripheral (cache first, then the adapter), convert it to a
+    /// [`BluetoothDevice`], and refresh the cache entry.
+    async fn fetch_and_cache_device(
+        adapter: &btleplug::platform::Adapter,
+        devices: &DashMap<DeviceId, DiscoveredDevice>,
+        id: &btleplug::platform::PeripheralId,
+    ) -> Option<BluetoothDevice> {
+        let device_id = Self::peripheral_id_to_device_id(id);
+        let peripheral = match devices.get(&device_id) {
+            Some(entry) => {
+                let peripheral = entry.value().peripheral.clone();
+                drop(entry);
+                peripheral
+            }
+            None => match adapter.peripheral(id).await {
+                Ok(peripheral) => peripheral,
+                Err(e) => {
+                    debug!("Failed to get peripheral {}: {}", device_id, e);
+                    return None;
+                }
+            },
+        };
+
+        let device = match Self::peripheral_to_device(&peripheral).await {
+            Ok(device) => device,
+            Err(e) => {
+                debug!("Failed to read properties for {}: {}", device_id, e);
+                return None;
+            }
+        };
+
+        let id = device.id.clone();
+        devices.insert(
+            id.clone(),
+            DiscoveredDevice {
+                device: device.clone(),
+                peripheral,
+            },
+        );
+        Some(device)
+    }
+
+    /// Build a [`DeviceEvent::DeviceUpdated`] for the fields that changed
+    /// between `old` and `new`, or an empty vec when nothing changed.
+    fn diff_events(old: BluetoothDevice, new: BluetoothDevice) -> Vec<DeviceEvent> {
+        let changed_fields = Self::changed_fields(&old, &new);
+        if changed_fields.is_empty() {
+            Vec::new()
+        } else {
+            vec![DeviceEvent::DeviceUpdated {
+                device: new,
+                changed_fields,
+            }]
+        }
+    }
+
+    /// Compute which tracked fields changed between two snapshots.
+    fn changed_fields(old: &BluetoothDevice, new: &BluetoothDevice) -> Vec<UpdateField> {
+        let mut changed = Vec::new();
+        if old.name != new.name {
+            changed.push(UpdateField::Name);
+        }
+        if old.rssi != new.rssi {
+            changed.push(UpdateField::Rssi);
+        }
+        if old.services_resolved != new.services_resolved {
+            changed.push(UpdateField::ServicesResolved);
+        }
+        if old.is_connected != new.is_connected {
+            changed.push(UpdateField::Connected);
+        }
+        changed
     }
 }
 

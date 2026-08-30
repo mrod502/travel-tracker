@@ -59,16 +59,19 @@
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use futures::stream;
 use log::{debug, info};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time;
 
 use crate::error::{Error, Result};
-use crate::monitor::events::{DeviceEvent, DeviceEventStream, NotificationEvent, NotificationStream};
+use crate::monitor::events::{
+    DeviceEvent, DeviceEventStream, NotificationEvent, NotificationStream,
+    DEVICE_EVENT_CHANNEL_CAPACITY,
+};
 use crate::monitor::{DeviceMonitor, GattClient};
 use crate::types::{
     BluetoothDevice, CharacteristicProperties, CharacteristicUuid, DeviceId, GattCharacteristic,
@@ -424,6 +427,8 @@ pub struct MockMonitor {
     devices: Arc<DashMap<DeviceId, SimulatedDevice>>,
     scanning: Arc<Mutex<bool>>,
     notification_senders: Arc<DashMap<DeviceId, tokio::sync::mpsc::Sender<NotificationEvent>>>,
+    event_senders: Arc<DashMap<u64, futures::channel::mpsc::Sender<DeviceEvent>>>,
+    next_event_sender_id: Arc<AtomicU64>,
 }
 
 impl MockMonitor {
@@ -472,6 +477,8 @@ impl MockMonitor {
             devices: Arc::new(DashMap::new()),
             scanning: Arc::new(Mutex::new(false)),
             notification_senders: Arc::new(DashMap::new()),
+            event_senders: Arc::new(DashMap::new()),
+            next_event_sender_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -506,7 +513,7 @@ impl MockMonitor {
             .with_name(format!("Mock Device {}", id))
             .with_rssi(self.config.default_rssi);
 
-        let mut simulated_device = SimulatedDevice::new(device);
+        let mut simulated_device = SimulatedDevice::new(device.clone());
 
         // Add default services if configured
         for service_config in &self.config.default_services {
@@ -517,6 +524,7 @@ impl MockMonitor {
         let id_clone = id.clone();
         self.devices.insert(id_clone, simulated_device);
         info!("Added simulated device: {}", id);
+        self.broadcast_event(&DeviceEvent::DeviceAdded { device });
         Ok(())
     }
 
@@ -566,7 +574,7 @@ impl MockMonitor {
             .with_name(name)
             .with_rssi(self.config.default_rssi);
 
-        let mut simulated_device = SimulatedDevice::new(device);
+        let mut simulated_device = SimulatedDevice::new(device.clone());
 
         for service_config in &services {
             let service = self.service_from_config(service_config);
@@ -576,6 +584,7 @@ impl MockMonitor {
         let id_clone = id.clone();
         self.devices.insert(id_clone, simulated_device);
         info!("Added simulated device with {} services: {}", services.len(), id);
+        self.broadcast_event(&DeviceEvent::DeviceAdded { device });
         Ok(())
     }
 
@@ -606,8 +615,13 @@ impl MockMonitor {
     /// ```
     pub async fn remove_device(&self, id: &DeviceId) -> bool {
         debug!("Removing simulated device: {}", id);
-        self.devices.remove(id);
-        true
+        match self.devices.remove(id) {
+            Some(_) => {
+                self.broadcast_event(&DeviceEvent::DeviceRemoved { id: id.clone() });
+                true
+            }
+            None => false,
+        }
     }
 
     /// Clear all devices from the monitor.
@@ -634,7 +648,11 @@ impl MockMonitor {
     /// ```
     pub async fn clear_devices(&self) {
         debug!("Clearing all devices");
+        let removed: Vec<DeviceId> = self.devices.iter().map(|e| e.key().clone()).collect();
         self.devices.clear();
+        for id in removed {
+            self.broadcast_event(&DeviceEvent::DeviceRemoved { id });
+        }
     }
 
     /// Set simulated services for a device.
@@ -724,6 +742,25 @@ impl MockMonitor {
         self.notification_senders.insert(id.clone(), tx);
         rx
     }
+
+    /// Broadcast an event to all open device event streams.
+    ///
+    /// Senders whose receivers were dropped are removed from the registry.
+    fn broadcast_event(&self, event: &DeviceEvent) {
+        let mut dead = Vec::new();
+        for mut entry in self.event_senders.iter_mut() {
+            if let Err(err) = entry.value_mut().try_send(event.clone()) {
+                if err.is_disconnected() {
+                    dead.push(*entry.key());
+                } else {
+                    debug!("Mock device event channel full; dropping event");
+                }
+            }
+        }
+        for id in dead {
+            self.event_senders.remove(&id);
+        }
+    }
 }
 
 impl Default for MockMonitor {
@@ -789,8 +826,30 @@ impl DeviceMonitor for MockMonitor {
     }
 
     async fn device_events(&self) -> Result<DeviceEventStream> {
-        // For mock backend, we return an empty stream since events are simulated
-        Ok(Box::pin(stream::empty::<DeviceEvent>()))
+        let (mut tx, rx) = futures::channel::mpsc::channel(DEVICE_EVENT_CHANNEL_CAPACITY);
+
+        // Replay the current devices so late subscribers see the existing
+        // state (mirrors btleplug, which synthesizes initial DeviceDiscovered
+        // events when the stream opens).
+        let mut replay = Vec::new();
+        for entry in self.devices.iter() {
+            replay.push(DeviceEvent::DeviceAdded {
+                device: entry.value().device.clone(),
+            });
+        }
+        for event in replay {
+            if tx.try_send(event).is_err() {
+                // The receiver was already dropped; nothing else to do.
+                return Ok(Box::pin(rx));
+            }
+        }
+
+        let id = self.next_event_sender_id.fetch_add(1, Ordering::SeqCst);
+        self.event_senders.insert(id, tx);
+
+        // The stream stays open for the lifetime of the monitor; it only
+        // completes when the monitor (and all its senders) are dropped.
+        Ok(Box::pin(rx))
     }
 
     async fn is_scanning(&self) -> Result<bool> {
@@ -1025,6 +1084,8 @@ impl GattClient for MockMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{Stream, StreamExt};
+    use std::pin::Pin;
 
     #[tokio::test]
     async fn test_mock_monitor_creation() {
@@ -1336,5 +1397,69 @@ mod tests {
         let monitor = MockMonitor::with_config(config);
 
         assert!(!monitor.is_powered().await.unwrap());
+    }
+
+    async fn next_event(
+        stream: &mut Pin<Box<dyn Stream<Item = DeviceEvent> + Send>>,
+        timeout: Duration,
+    ) -> Option<DeviceEvent> {
+        tokio::time::timeout(timeout, stream.next()).await.ok().flatten()
+    }
+
+    #[tokio::test]
+    async fn test_device_events_replays_existing_devices() {
+        let monitor = MockMonitor::new();
+        monitor.add_device(DeviceId::new("00:11:22:33:44:55")).await.unwrap();
+        monitor.add_device(DeviceId::new("11:22:33:44:55:66")).await.unwrap();
+
+        let mut events = monitor.device_events().await.unwrap();
+
+        let first = next_event(&mut events, Duration::from_secs(2))
+            .await
+            .expect("expected replayed DeviceAdded");
+        assert!(matches!(first, DeviceEvent::DeviceAdded { .. }));
+
+        let second = next_event(&mut events, Duration::from_secs(2))
+            .await
+            .expect("expected replayed DeviceAdded");
+        assert!(matches!(second, DeviceEvent::DeviceAdded { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_device_events_broadcasts_add_and_remove() {
+        let monitor = MockMonitor::new();
+        let mut events = monitor.device_events().await.unwrap();
+
+        let device_id = DeviceId::new("00:11:22:33:44:55");
+        monitor.add_device(device_id.clone()).await.unwrap();
+
+        let event = next_event(&mut events, Duration::from_secs(2))
+            .await
+            .expect("expected DeviceAdded");
+        match event {
+            DeviceEvent::DeviceAdded { device } => assert_eq!(device.id, device_id),
+            _ => panic!("expected DeviceAdded"),
+        }
+
+        monitor.remove_device(&device_id).await;
+
+        let event = next_event(&mut events, Duration::from_secs(2))
+            .await
+            .expect("expected DeviceRemoved");
+        match event {
+            DeviceEvent::DeviceRemoved { id } => assert_eq!(id, device_id),
+            _ => panic!("expected DeviceRemoved"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_device_events_stays_open_while_monitor_lives() {
+        let monitor = MockMonitor::new();
+        let mut events = monitor.device_events().await.unwrap();
+
+        // No devices means no replay, so a bounded wait should time out
+        // rather than the stream completing.
+        let result = tokio::time::timeout(Duration::from_millis(200), events.next()).await;
+        assert!(result.is_err(), "stream completed while monitor is alive");
     }
 }

@@ -63,6 +63,10 @@ pub type DeviceEventStream = std::pin::Pin<
     Box<dyn futures::stream::Stream<Item = DeviceEvent> + Send + 'static>,
 >;
 
+/// Default capacity for the channel bridging a backend's event source and
+/// consumers of [`DeviceEventStream`].
+pub const DEVICE_EVENT_CHANNEL_CAPACITY: usize = 256;
+
 /// Type alias for notification streams.
 pub type NotificationStream = std::pin::Pin<
     Box<dyn futures::stream::Stream<Item = ValueNotification> + Send + 'static>,

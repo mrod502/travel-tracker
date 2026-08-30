@@ -45,7 +45,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         postgresql-client-18 \
         bluez \
         bluetooth \
-        libbluetooth-dev
+        libbluetooth-dev \
+        poppler-utils
 
 # Install nvm in a system location (not under /home/dev which is a volume)
 ENV NVM_DIR=/opt/nvm

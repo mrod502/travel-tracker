@@ -4,9 +4,11 @@
 //! known peers in the network along with their credentials.
 
 use chrono::{DateTime, Utc};
+use h3o::CellIndex;
 use sqlx::FromRow;
 
 use crate::models::enums::{NodeStatus, NodeType};
+use crate::types::H3Index;
 
 /// A node in the BTMon network.
 ///
@@ -40,7 +42,11 @@ pub struct Node {
     pub fixed_lon: Option<f64>,
 
     /// H3 geo-cells owned by this node (for full nodes).
-    pub owns_geo_cells: Vec<sqlx::postgres::types::Oid>,
+    ///
+    /// Res 6 cells, matching [`crate::geo`]. `None` is the database's NULL: no
+    /// claim has been made, which is the state of a mobile node and of every node
+    /// until ownership is granted out-of-band.
+    pub owns_geo_cells: Option<Vec<H3Index>>,
 
     /// When the node was registered.
     pub registered_at: DateTime<Utc>,
@@ -90,7 +96,7 @@ pub struct NodeBuilder {
     ca_credential: Option<Vec<u8>>,
     fixed_lat: Option<f64>,
     fixed_lon: Option<f64>,
-    owns_geo_cells: Option<Vec<sqlx::postgres::types::Oid>>,
+    owns_geo_cells: Option<Vec<H3Index>>,
     registered_at: Option<DateTime<Utc>>,
     last_seen_at: Option<DateTime<Utc>>,
     status: Option<NodeStatus>,
@@ -141,8 +147,16 @@ impl NodeBuilder {
     }
 
     /// Set the owned geo-cells.
-    pub fn owns_geo_cells(mut self, cells: Vec<sqlx::postgres::types::Oid>) -> Self {
-        self.owns_geo_cells = Some(cells);
+    ///
+    /// An empty list is the same as making no claim, which is what the column
+    /// stores as NULL — see [`Node::owns_geo_cells`].
+    pub fn owns_geo_cells(mut self, cells: Vec<CellIndex>) -> Self {
+        self.owns_geo_cells = (!cells.is_empty()).then(|| {
+            cells
+                .into_iter()
+                .map(H3Index::from)
+                .collect::<Vec<H3Index>>()
+        });
         self
     }
 
@@ -170,12 +184,16 @@ impl NodeBuilder {
             node_id: self.node_id.expect("node_id is required"),
             node_type: self.node_type.expect("node_type is required"),
             mtls_cert_fingerprint: self.mtls_cert_fingerprint,
-            signing_public_key: self.signing_public_key.expect("signing_public_key is required"),
-            signing_key_algo: self.signing_key_algo.unwrap_or_else(|| "ed25519".to_string()),
+            signing_public_key: self
+                .signing_public_key
+                .expect("signing_public_key is required"),
+            signing_key_algo: self
+                .signing_key_algo
+                .unwrap_or_else(|| "ed25519".to_string()),
             ca_credential: self.ca_credential.expect("ca_credential is required"),
             fixed_lat: self.fixed_lat,
             fixed_lon: self.fixed_lon,
-            owns_geo_cells: self.owns_geo_cells.unwrap_or_default(),
+            owns_geo_cells: self.owns_geo_cells,
             registered_at: self.registered_at.unwrap_or_else(Utc::now),
             last_seen_at: self.last_seen_at,
             status: self.status.unwrap_or(NodeStatus::Active),

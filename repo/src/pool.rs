@@ -24,10 +24,11 @@ impl Pool {
     /// ```no_run
     /// use repo::Pool;
     ///
-    /// # tokio_test::block_on(async {
-    /// let pool = Pool::connect("postgres://user:pass@localhost:5432/dbname").await?;
-    /// # Ok::<(), repo::RepoError>(())
-    /// # })
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), repo::RepoError> {
+    ///     let pool = Pool::connect("postgres://user:pass@localhost:5432/dbname").await?;
+    ///     Ok(())
+    /// }
     /// ```
     pub async fn connect(dsn: &str) -> Result<Self, RepoError> {
         let options = PgConnectOptions::from_str(dsn)?;
@@ -50,14 +51,15 @@ impl Pool {
     /// use repo::Pool;
     /// use std::time::Duration;
     ///
-    /// # tokio_test::block_on(async {
-    /// let pool = Pool::connect_with_options(
-    ///     "postgres://user:pass@localhost:5432/dbname",
-    ///     10,
-    ///     Duration::from_secs(30),
-    /// ).await?;
-    /// # Ok::<(), repo::RepoError>(())
-    /// # })
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), repo::RepoError> {
+    ///     let pool = Pool::connect_with_options(
+    ///         "postgres://user:pass@localhost:5432/dbname",
+    ///         10,
+    ///         Duration::from_secs(30),
+    ///     ).await?;
+    ///     Ok(())
+    /// }
     /// ```
     pub async fn connect_with_options(
         dsn: &str,

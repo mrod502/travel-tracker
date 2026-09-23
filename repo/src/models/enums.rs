@@ -22,7 +22,12 @@ pub enum NodeType {
 impl NodeType {
     /// Returns all possible node types
     pub fn all() -> &'static [NodeType] {
-        &[NodeType::Full, NodeType::Light, NodeType::Aggregator, NodeType::Signal]
+        &[
+            NodeType::Full,
+            NodeType::Light,
+            NodeType::Aggregator,
+            NodeType::Signal,
+        ]
     }
 }
 
@@ -39,7 +44,12 @@ pub enum NodeStatus {
 impl NodeStatus {
     /// Returns all possible node statuses
     pub fn all() -> &'static [NodeStatus] {
-        &[NodeStatus::Active, NodeStatus::Suspected, NodeStatus::Down, NodeStatus::Revoked]
+        &[
+            NodeStatus::Active,
+            NodeStatus::Suspected,
+            NodeStatus::Down,
+            NodeStatus::Revoked,
+        ]
     }
 
     /// Returns true if this status indicates the node is operational
@@ -80,7 +90,12 @@ impl BleAddressType {
 
     /// Returns true if this is a random address type
     pub fn is_random(&self) -> bool {
-        matches!(self, BleAddressType::RandomStatic | BleAddressType::RandomResolvable | BleAddressType::RandomNonresolvable)
+        matches!(
+            self,
+            BleAddressType::RandomStatic
+                | BleAddressType::RandomResolvable
+                | BleAddressType::RandomNonresolvable
+        )
     }
 }
 
@@ -97,7 +112,31 @@ pub enum AdvType {
 impl AdvType {
     /// Returns all possible advertisement types
     pub fn all() -> &'static [AdvType] {
-        &[AdvType::ConnectableAdv, AdvType::ScannableAdv, AdvType::BroadcastAdv, AdvType::ExtendedAdv]
+        &[
+            AdvType::ConnectableAdv,
+            AdvType::ScannableAdv,
+            AdvType::BroadcastAdv,
+            AdvType::ExtendedAdv,
+        ]
+    }
+
+    /// The label the `adv_type` column holds for this variant.
+    ///
+    /// This is the spelling PostgreSQL stores and prints — not the Rust variant
+    /// name, which serde would render `ConnectableAdv` where the column says
+    /// `connectable_adv`. Signed payload v2 carries an integer code for the same
+    /// variant rather than this string, and `app/src/provenance/payload.rs` is where a
+    /// code is turned back into it; that mapping is only usable if this is the column's
+    /// own spelling, so `repo/tests/wire_types.rs` checks these labels against
+    /// `pg_enum` and against the column's `::text` output, and the two cannot drift
+    /// apart unnoticed.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AdvType::ConnectableAdv => "connectable_adv",
+            AdvType::ScannableAdv => "scannable_adv",
+            AdvType::BroadcastAdv => "broadcast_adv",
+            AdvType::ExtendedAdv => "extended_adv",
+        }
     }
 
     /// Returns true if this advertisement type allows connection requests
@@ -124,12 +163,34 @@ pub enum LocationSource {
 impl LocationSource {
     /// Returns all possible location sources
     pub fn all() -> &'static [LocationSource] {
-        &[LocationSource::NodeFixed, LocationSource::NodeGps, LocationSource::Interpolated, LocationSource::AggregatorFixed]
+        &[
+            LocationSource::NodeFixed,
+            LocationSource::NodeGps,
+            LocationSource::Interpolated,
+            LocationSource::AggregatorFixed,
+        ]
+    }
+
+    /// The label the `location_source` column holds for this variant.
+    ///
+    /// Same arrangement as [`AdvType::as_str`]: the column's spelling is what the
+    /// payload's code table names for this variant, so an attestation and the stored
+    /// value stay comparable even though the wire carries a number rather than text.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LocationSource::NodeFixed => "node_fixed",
+            LocationSource::NodeGps => "node_gps",
+            LocationSource::Interpolated => "interpolated",
+            LocationSource::AggregatorFixed => "aggregator_fixed",
+        }
     }
 
     /// Returns true if this source indicates a fixed/stationary location
     pub fn is_fixed(&self) -> bool {
-        matches!(self, LocationSource::NodeFixed | LocationSource::AggregatorFixed)
+        matches!(
+            self,
+            LocationSource::NodeFixed | LocationSource::AggregatorFixed
+        )
     }
 
     /// Returns true if this source indicates GPS-derived location
@@ -168,8 +229,8 @@ impl SyncDirection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::Type;
     use sqlx::postgres::Postgres;
+    use sqlx::Type;
 
     // ========================================================================
     // NodeType tests

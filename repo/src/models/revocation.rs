@@ -135,9 +135,13 @@ impl RevokedNodeBuilder {
             revoked_at: self.revoked_at.unwrap_or_else(Utc::now),
             revoked_by: self.revoked_by.expect("revoked_by is required"),
             reason: self.reason.expect("reason is required"),
-            signing_public_key: self.signing_public_key.expect("signing_public_key is required"),
+            signing_public_key: self
+                .signing_public_key
+                .expect("signing_public_key is required"),
             ca_credential: self.ca_credential.expect("ca_credential is required"),
-            rsl_sequence_number: self.rsl_sequence_number.expect("rsl_sequence_number is required"),
+            rsl_sequence_number: self
+                .rsl_sequence_number
+                .expect("rsl_sequence_number is required"),
             notes: self.notes,
         }
     }

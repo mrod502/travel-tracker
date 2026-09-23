@@ -54,16 +54,24 @@
 //!
 //! # Transaction Support
 //!
-//! All repository methods accept any type implementing `Executor`, allowing them
+//! Repository methods accept any type implementing `Executor`, allowing them
 //! to work within transactions:
 //!
 //! ```ignore
 //! let mut tx = pool.begin().await?;
-//! OccurrenceRepository::create(&mut tx, &occurrence).await?;
+//! OccurrenceRepository::insert_once(&mut tx, &occurrence).await?;
 //! tx.commit().await?;
 //! ```
+//!
+//! The one exception is [`OccurrenceRepository::create`], which needs its
+//! executor twice — once for the INSERT, once to create a missing monthly
+//! partition before retrying — so it takes a pool rather than a transaction.
+//! Inside a transaction use `insert_once`, having called `ensure_partition`
+//! first if `observed_at` could fall outside the months the schema has
+//! provisioned.
 
 pub mod error;
+pub mod geo;
 pub mod models;
 pub mod pool;
 pub mod repositories;
@@ -71,7 +79,14 @@ pub mod types;
 
 // Re-export main types for convenience
 pub use error::RepoError;
-pub use models::{mac_address_from_string, Node, Occurrence, OccurrenceBuilder, OccurrenceRelay, RevokedNode, SignalType};
+/// The H3 types the workspace speaks, re-exported so `h3o` stays a dependency of
+/// this crate alone: one version pinned in one place, one spelling of "an H3
+/// cell" everywhere else.
+pub use h3o::{CellIndex, Resolution};
+pub use models::{
+    mac_address_from_string, Node, Occurrence, OccurrenceBuilder, OccurrenceRelay, RevokedNode,
+    SignalType,
+};
 pub use pool::Pool;
-pub use types::PostgisPoint;
 pub use repositories::{NodeRepository, OccurrenceRepository, RevocationRepository};
+pub use types::{H3Index, PostgisPoint};

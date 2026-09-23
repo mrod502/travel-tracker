@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::types::PostgisPoint;
+use crate::types::{H3Index, PostgisPoint};
 
 use super::enums::{AdvType, BleAddressType, LocationSource};
 
@@ -24,7 +24,13 @@ pub enum SignalType {
 impl SignalType {
     /// Returns all possible signal types
     pub fn all() -> &'static [SignalType] {
-        &[SignalType::Bluetooth, SignalType::Wifi, SignalType::Nfc, SignalType::Zigbee, SignalType::Lorawan]
+        &[
+            SignalType::Bluetooth,
+            SignalType::Wifi,
+            SignalType::Nfc,
+            SignalType::Zigbee,
+            SignalType::Lorawan,
+        ]
     }
 }
 
@@ -95,11 +101,11 @@ pub struct Occurrence {
     // --- Generated H3 Geo-Cells (from location) ---
     /// Fine-grained H3 cell (Resolution 9, ~0.1 km²)
     /// Note: These are generated columns in the database, not explicitly inserted
-    pub geo_cell_fine: Option<i64>,
+    pub geo_cell_fine: Option<H3Index>,
 
     /// Macro H3 cell (Resolution 6, ~36 km²)
     /// Note: These are generated columns in the database, not explicitly inserted
-    pub geo_cell_macro: Option<i64>,
+    pub geo_cell_macro: Option<H3Index>,
 
     // --- Provenance ---
     /// Canonical bytes that were signed (see canonical-cbor-spec.md)
@@ -249,6 +255,17 @@ impl OccurrenceBuilder {
         self
     }
 
+    /// Set the location source explicitly.
+    ///
+    /// [`Self::with_location`] sets it along with the coordinates; this exists for
+    /// the case that has to be stated rather than inherited from the default — a
+    /// node recording a row with no position still writes a `NOT NULL` label, and
+    /// since the v2 signature attests to whatever is stored, the writer names it.
+    pub fn location_source(mut self, source: LocationSource) -> Self {
+        self.inner.location_source = source;
+        self
+    }
+
     // ==================== Convenience Methods ====================
 
     /// Set location data
@@ -311,7 +328,10 @@ impl OccurrenceBuilder {
         if let Some(data) = manufacturer_data {
             ble_payload.insert("manufacturer_data".to_string(), serde_json::json!(data));
         }
-        ble_payload.insert("raw_payload_hex".to_string(), serde_json::json!(raw_payload_hex));
+        ble_payload.insert(
+            "raw_payload_hex".to_string(),
+            serde_json::json!(raw_payload_hex),
+        );
 
         // Wrap in signal_type key
         let mut payload = serde_json::Map::new();
@@ -350,7 +370,7 @@ pub struct OccurrenceRelay {
     pub observed_at: DateTime<Utc>,
 
     /// Must match occurrence geo_cell_macro
-    pub geo_cell_macro: u64,
+    pub geo_cell_macro: H3Index,
 
     /// Node that wrote this relay record (32-byte SHA-256 hash)
     pub reporting_node_id: Vec<u8>,
@@ -364,7 +384,7 @@ impl OccurrenceRelay {
     pub fn new(
         occurrence_id: Uuid,
         observed_at: DateTime<Utc>,
-        geo_cell_macro: u64,
+        geo_cell_macro: H3Index,
         reporting_node_id: &[u8],
     ) -> Self {
         Self {
@@ -499,7 +519,13 @@ mod tests {
             .signal_payload(serde_json::json!({}))
             .signed_payload(&signed_payload)
             .signature(&signature)
-            .with_location(40.6892, -74.0445, Some(10.0), Some(5.0), LocationSource::NodeGps)
+            .with_location(
+                40.6892,
+                -74.0445,
+                Some(10.0),
+                Some(5.0),
+                LocationSource::NodeGps,
+            )
             .build();
 
         assert!(occurrence.location.is_some());
@@ -514,17 +540,19 @@ mod tests {
     fn test_occurrence_relay_new() {
         let occurrence_id = Uuid::now_v7();
         let node_id = vec![0u8; 32];
+        let liberty_macro = crate::geo::macro_cell(40.6892, -74.0445).unwrap();
 
         let relay = OccurrenceRelay::new(
             occurrence_id,
             Utc::now(),
-            0x8a2a100000000000, // Example H3 cell
+            // The res 6 cell the builder's location falls in, as the relay table stores it.
+            H3Index::from(liberty_macro),
             &node_id,
         );
 
         assert_eq!(relay.occurrence_id, occurrence_id);
         assert_eq!(relay.reporting_node_id, node_id);
-        assert_eq!(relay.geo_cell_macro, 0x8a2a100000000000);
+        assert_eq!(relay.geo_cell_macro.cell(), liberty_macro);
     }
 
     #[test]

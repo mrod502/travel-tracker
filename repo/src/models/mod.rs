@@ -4,10 +4,10 @@ pub mod occurrence;
 pub mod revocation;
 
 // Unified occurrence model (supports Bluetooth, WiFi, and future signal types)
-pub use occurrence::{Occurrence, OccurrenceBuilder, OccurrenceRelay, SignalType};
-pub use node::Node;
-pub use revocation::RevokedNode;
 pub use enums::*;
+pub use node::Node;
+pub use occurrence::{Occurrence, OccurrenceBuilder, OccurrenceRelay, SignalType};
+pub use revocation::RevokedNode;
 
 /// Helper function to convert MAC address string to bytes
 pub fn mac_address_from_string(s: &str) -> Result<Vec<u8>, std::num::ParseIntError> {

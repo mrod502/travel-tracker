@@ -1,0 +1,11 @@
+-- Revert 202609142142_create_revocation_status_lists.sql
+--
+-- Dropping this table drops the record of which RSL sequence numbers a CA
+-- has already used. Re-applying the migration afterwards restarts every
+-- issuer's counter at 1, which means a list held back from before the drop
+-- becomes publishable again — so this revert is only safe on a deployment
+-- that has never issued an RSL, or one being torn down entirely.
+--
+-- node_revocations is left alone: it is the revocation ledger, created by
+-- its own migration, and outlives the lists generated from it.
+DROP TABLE IF EXISTS revocation_status_lists RESTRICT;

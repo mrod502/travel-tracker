@@ -1,35 +1,31 @@
 mod down;
 mod file_attrs;
 mod new;
+mod registry;
 mod runner;
 mod up;
-use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use dotenv::dotenv;
-use down::DownArgs;
+use down::{DownArgs, ResetArgs, destruction_guard};
 use log4rs::{
     Config, Handle,
     append::console::ConsoleAppender,
     config::{Appender, Root},
 };
 use new::NewMigrationArgs;
-use sqlx::{Executor, PgPool, Pool, Postgres, postgres::PgPoolOptions};
+use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
 use std::{env, error::Error, fmt::Display};
 use up::UpArgs;
 
 use crate::runner::Runner;
 
-const MIGRATION_INIT: &str = "CREATE TABLE IF NOT EXISTS migrations (
-    id BIGSERIAL PRIMARY KEY NOT NULL,
-    name TEXT NOT NULL UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL,
-    executed_at TIMESTAMPTZ NOT NULL default now()
-)";
 const MIGRATION_TIME_FMT: &str = "%Y%m%d%H%M";
 
 pub fn setup_log(level: &str) -> Handle {
     let stdout = ConsoleAppender::builder().build();
-    let log_filter = level.parse::<log::LevelFilter>().unwrap_or(log::LevelFilter::Trace);
+    let log_filter = level
+        .parse::<log::LevelFilter>()
+        .unwrap_or(log::LevelFilter::Trace);
     let config = Config::builder()
         .appender(Appender::builder().build("stdout", Box::new(stdout)))
         //.logger(Logger::builder().build("app::backend::db", LevelFilter::Info))
@@ -39,11 +35,7 @@ pub fn setup_log(level: &str) -> Handle {
         //        .additive(false)
         //        .build("app::requests", LevelFilter::Info),
         //)
-        .build(
-            Root::builder()
-                .appender("stdout")
-                .build(log_filter),
-        )
+        .build(Root::builder().appender("stdout").build(log_filter))
         .unwrap();
     log4rs::init_config(config).unwrap()
 }
@@ -65,13 +57,12 @@ pub trait Dsn {
     }
 }
 
-
 #[derive(Subcommand, Debug)]
 enum Command {
     NewMigration(NewMigrationArgs),
     Up(UpArgs),
     Down(DownArgs),
-    Reset(DownArgs),
+    Reset(ResetArgs),
 }
 
 impl Command {
@@ -81,6 +72,22 @@ impl Command {
             Command::Up(_) => true,
             Command::Down(_) => true,
             Command::Reset(_) => true,
+        }
+    }
+
+    /// What a command would destroy, so the target can be checked before
+    /// anything connects: `(description, is a dry run, operator acknowledged)`.
+    fn destruction(&self) -> Option<(&'static str, bool, bool)> {
+        match self {
+            Command::NewMigration(_) | Command::Up(_) => None,
+            Command::Down(args) => {
+                Some(("revert migrations", args.dry_run, args.allow_destructive))
+            }
+            Command::Reset(args) => Some((
+                "drop and re-apply the schema",
+                args.dry_run,
+                args.allow_destructive,
+            )),
         }
     }
 }
@@ -157,28 +164,6 @@ impl App {
             .map_err(|e| AppError::new("Failed to connect to database", e))?;
         Ok(pool)
     }
-
-    async fn migration_init(&self, conn: &Pool<Postgres>) -> Result<(), AppError> {
-        conn.execute(MIGRATION_INIT)
-            .await
-            .map_err(|e| AppError::new("Failed to initialize migrations table", e))?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl Runner for App {
-    type RunError = AppError;
-    async fn run(&self, conn: Option<&Pool<Postgres>>) -> Result<String, Self::RunError> {
-        log::info!("running");
-        if let Some(pool) = conn {
-            if self.command.requires_db() {
-                log::info!("running migrations");
-                self.migration_init(pool).await?;
-            }
-        }
-        Ok("".into())
-    }
 }
 
 #[tokio::main]
@@ -186,21 +171,40 @@ async fn main() -> Result<(), Box<dyn Error>> {
     dotenv().ok();
     let mut app = App::parse();
     setup_log(&app.log_level);
-    let mut c: PgPool = PgPool::connect_lazy(&app.dsn()).unwrap();
+
+    // Checked before connecting: a destructive command pointed at somebody
+    // else's database should fail on the spot, not halfway through a drop.
+    if let Some((verb, dry_run, acknowledged)) = app.command.destruction() {
+        destruction_guard(verb, &app.host, app.port, &app.db, dry_run, acknowledged)
+            .map_err(|e| Box::new(e) as Box<dyn Error>)?;
+    }
+
     let conn = if app.command.requires_db() {
-        c = app.conn().await?;
-        app.migration_init(&c).await?;
-        Some(&c)
+        Some(app.conn().await?)
     } else {
         None
     };
 
-    let result = match &app.command {
-        Command::NewMigration(new_args) => new_args.run(conn).await.map_err(|e| Box::new(e) as Box<dyn Error>),
-        Command::Up(up_args) => up_args.run(conn).await.map_err(|e| Box::new(e) as Box<dyn Error>),
-        Command::Down(down_args) => down_args.run(conn).await.map_err(|e| Box::new(e) as Box<dyn Error>),
-        Command::Reset(reset_args) => reset_args.run(conn).await.map_err(|e| Box::new(e) as Box<dyn Error>),
+    let summary = match &app.command {
+        Command::NewMigration(new_args) => new_args
+            .run(conn.as_ref())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error>)?,
+        Command::Up(up_args) => up_args
+            .run(conn.as_ref())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error>)?,
+        Command::Down(down_args) => down_args
+            .run(conn.as_ref())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error>)?,
+        Command::Reset(reset_args) => reset_args
+            .run(conn.as_ref())
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error>)?,
     };
-    result?;
+    if !summary.is_empty() {
+        println!("{}", summary);
+    }
     Ok(())
 }

@@ -1,0 +1,11 @@
+-- Revert 202609021200_partition_occurrences_forward.sql
+--
+-- Drops the maintenance function only. The monthly partitions it created stay
+-- attached to occurrences: they may hold rows, and deleting a partition is
+-- deleting the observations inside it. The partitions belong to occurrences
+-- and go with it when 202607312147_create_bluetooth_occurrences is reverted.
+--
+-- Consequence of reverting this alone: nothing creates next month's partition,
+-- which is the state the migration exists to prevent. Re-applying it restores
+-- the horizon immediately, because the function is idempotent.
+DROP FUNCTION IF EXISTS ensure_occurrence_partitions(integer) RESTRICT;

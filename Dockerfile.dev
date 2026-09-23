@@ -65,7 +65,6 @@ RUN mkdir -p $NVM_DIR \
 RUN apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Rust tools
 RUN rustup component add rustfmt clippy rust-analyzer \
     && cargo install cargo-watch cargo-llvm-cov cargo-edit
 

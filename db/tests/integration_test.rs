@@ -129,7 +129,7 @@ fn test_file_attrs_reflexivity() {
 fn split_query(q: &str) -> Vec<String> {
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
-    
+
     let dialect = PostgreSqlDialect {};
     match Parser::parse_sql(&dialect, q) {
         Ok(statements) => statements

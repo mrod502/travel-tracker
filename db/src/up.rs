@@ -1,12 +1,125 @@
-use crate::{MIGRATION_TIME_FMT, file_attrs::FileAttrs, runner::Runner};
+use crate::{MIGRATION_TIME_FMT, file_attrs::FileAttrs, registry, runner::Runner};
 use async_trait::async_trait;
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
+use chrono::{Local, NaiveDateTime};
 use clap::Args;
-use sqlparser::parser::Parser;
 use sqlparser::dialect::PostgreSqlDialect;
-use sqlx::{AssertSqlSafe, Executor, PgPool, Pool, Postgres, Row, Transaction};
-use std::{error::Error, fmt::Display, fs::File, io::Read, path::PathBuf, usize};
+use sqlparser::parser::Parser;
+use sqlx::{AssertSqlSafe, PgPool, Pool, Postgres};
+use std::{error::Error, fmt::Display, fs::File, io::Read, path::Path};
 use walkdir::WalkDir;
+
+/// How far ahead the splitter looks for the closing `$` of a dollar-quote tag.
+/// Tags are short; anything longer is not a tag, and scanning the whole file
+/// for a stray `$` would make splitting quadratic.
+const DOLLAR_TAG_LOOKAHEAD: usize = 64;
+
+/// Months of `occurrences` partitions `db up` keeps provisioned beyond the
+/// current month. Matches the horizon the partition migration itself opens with.
+const PARTITION_HORIZON_MONTHS: i32 = 15;
+
+/// Suffix marking a migration's revert script (`<migration>.down.sql`).
+pub(crate) const DOWN_SUFFIX: &str = ".down.sql";
+
+/// Is this a revert script rather than a migration to apply?
+pub(crate) fn is_down_script(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| s.ends_with(DOWN_SUFFIX))
+}
+
+/// Locations `db` tries when `--migrations-path` is not given, relative to the
+/// process working directory: crate root, then workspace root.
+const MIGRATION_PATH_CANDIDATES: [&str; 2] = ["src/migrations", "db/src/migrations"];
+
+/// Resolve the directory that holds the migration files, either the operator's
+/// `--migrations-path` or the first candidate that exists.
+pub(crate) fn resolve_migrations_path(explicit: &str) -> Result<String, MigrationError> {
+    if !explicit.is_empty() {
+        log::info!("using explicit migrations path: {explicit}");
+        return Ok(explicit.to_string());
+    }
+
+    let cwd = std::env::current_dir()
+        .map_err(|e| MigrationError::new_from("failed to get current directory", e))?;
+    for candidate in MIGRATION_PATH_CANDIDATES {
+        let path = cwd.join(candidate);
+        log::debug!("checking candidate: {path:?}");
+        if path.is_dir() {
+            log::info!("found migrations at: {candidate}");
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Err(MigrationError::new(format!(
+        "could not find migrations directory. Tried: {}. \
+         Run with --migrations-path to specify explicitly.",
+        MIGRATION_PATH_CANDIDATES.join(", ")
+    )))
+}
+
+/// Read a migration or revert script off disk.
+pub(crate) fn read_migration_file(path: &Path) -> Result<String, MigrationError> {
+    let mut f = File::open(path)
+        .map_err(|e| MigrationError::new_from(&format!("failed to open {}", path.display()), e))?;
+    let mut out = String::new();
+    f.read_to_string(&mut out)
+        .map_err(|e| MigrationError::new_from(&format!("failed to read {}", path.display()), e))?;
+    Ok(out)
+}
+
+/// Parse `YYYYMMDDHHMM_<name>.sql` into its name, timestamp, and path.
+///
+/// The timestamp is the migration's identity for ordering and for the
+/// registry, so both `db up` and `db down` derive it the same way.
+pub(crate) fn parse_file_name(pth: &Path) -> Result<FileAttrs, MigrationError> {
+    let Some(os_name) = pth.file_name() else {
+        return Err(MigrationError::new("no filename"));
+    };
+    let Some(full_name) = os_name.to_str() else {
+        return Err(MigrationError::new("failed conversion to str"));
+    };
+    let Some((date_str, rest)) = full_name.split_once("_") else {
+        return Err(MigrationError::new(full_name));
+    };
+
+    let created_at = match NaiveDateTime::parse_from_str(date_str, MIGRATION_TIME_FMT) {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(MigrationError::new_from("failed to parse timestamp", e));
+        }
+    }
+    .and_local_timezone(Local)
+    .unwrap();
+
+    let Some((name, sql)) = rest.split_once(".") else {
+        return Err(MigrationError::new("no extension"));
+    };
+    if sql != "sql" {
+        return Err(MigrationError::new(format!(
+            "invalid file extension: {}",
+            sql
+        )));
+    }
+    let attrs: FileAttrs = FileAttrs {
+        name: name.into(),
+        created_at,
+        full_path: pth.to_path_buf(),
+    };
+    Ok(attrs)
+}
+
+/// The pending migrations to apply, oldest first, capped at `number` — `0`
+/// means "all of them", which is what an uncapped `db up` has always done.
+///
+/// Sorting happens here rather than at the call site: applying a migration
+/// out of timestamp order means applying it against a schema it assumes
+/// already exists, and a truncated list taken from an unsorted walk would do
+/// exactly that.
+fn select_pending(mut pending: Vec<FileAttrs>, number: usize) -> Vec<FileAttrs> {
+    pending.sort();
+    if number > 0 {
+        pending.truncate(number);
+    }
+    pending
+}
 
 #[derive(Debug, Default)]
 pub struct MigrationError {
@@ -51,8 +164,12 @@ impl Display for MigrationError {
 
 #[derive(Args, Debug, Clone)]
 pub struct UpArgs {
+    /// Apply at most this many pending migrations. 0 means all of them.
     #[arg(long, short, default_value_t = 0)]
     pub number: usize,
+    /// Print what would be applied and change nothing.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
     #[arg(long, default_value = "localhost")]
     pub host: String,
     #[arg(long, default_value_t = 5432)]
@@ -74,20 +191,14 @@ impl Runner for UpArgs {
             None => return Err(MigrationError::new("no conn provided")),
         };
         log::info!("running:{:?}", self);
-        let latest_migration = self.get_latest_applied_migration(conn).await?;
+
+        let migrations_path = resolve_migrations_path(&self.migrations_path)?;
+        registry::ensure_registry(conn, &migrations_path).await?;
+
+        let latest_migration = registry::latest_applied(conn).await?;
         log::trace!("latest migration:{}", latest_migration.to_rfc3339());
 
-        // Resolve migrations path: if empty, auto-detect based on current directory
-        let migrations_path = if self.migrations_path.is_empty() {
-            let detected = self.detect_migrations_path()?;
-            log::info!("auto-detected migrations path: {}", detected);
-            detected
-        } else {
-            log::info!("using explicit migrations path: {}", self.migrations_path);
-            self.migrations_path.clone()
-        };
-
-        let mut migrations_to_run: Vec<FileAttrs> = WalkDir::new(&migrations_path)
+        let pending: Vec<FileAttrs> = WalkDir::new(&migrations_path)
             .into_iter()
             .filter_map(|v| -> Option<FileAttrs> {
                 let de = match v {
@@ -101,11 +212,11 @@ impl Runner for UpArgs {
                 let Some(ext_str) = ext.to_str() else {
                     return None;
                 };
-                if ext_str != "sql" {
+                if ext_str != "sql" || is_down_script(&pth) {
                     return None;
                 }
 
-                let Ok(file_attrs) = Self::parse_file_name(&pth) else {
+                let Ok(file_attrs) = parse_file_name(&pth) else {
                     return None;
                 };
                 if file_attrs.created_at <= latest_migration {
@@ -115,84 +226,75 @@ impl Runner for UpArgs {
                 Some(file_attrs)
             })
             .collect();
-        migrations_to_run.sort();
-        for mig in migrations_to_run {
-            self.apply_migration(mig, conn).await?;
+
+        let migrations_to_run = select_pending(pending, self.number);
+        if migrations_to_run.is_empty() {
+            log::info!("no pending migrations within --number {}", self.number);
+        }
+        if self.dry_run {
+            for mig in &migrations_to_run {
+                println!("would apply {}", mig.full_path.display());
+            }
+            log::info!(
+                "dry run: {} migration(s) would be applied, nothing changed",
+                migrations_to_run.len()
+            );
+            return Ok(format!("dry run: {} pending", migrations_to_run.len()));
         }
 
-        Ok("".into())
+        for mig in &migrations_to_run {
+            self.apply_migration(mig.clone(), conn).await?;
+        }
+
+        self.ensure_occurrence_partitions(conn).await?;
+
+        Ok(format!("applied {} migration(s)", migrations_to_run.len()))
     }
 }
 
 impl UpArgs {
-    /// Auto-detect the migrations directory by checking common locations
-    fn detect_migrations_path(&self) -> Result<String, MigrationError> {
-        let cwd = std::env::current_dir()
-            .map_err(|e| MigrationError::new_from("failed to get current directory", e))?;
-        log::info!("current directory: {:?}", cwd);
+    /// Extend the `occurrences` partition coverage on every `db up`.
+    ///
+    /// The function is created by
+    /// `202609021200_partition_occurrences_forward.sql`; it is looked up rather
+    /// than assumed so a database that predates that migration (or a run that
+    /// is about to apply it, where this call happens after) still behaves.
+    ///
+    /// This call is the reason partitions do not silently run out again. With
+    /// no caller at all, the horizon set by the migration expires and every
+    /// insert fails at the partition boundary — which is precisely how the
+    /// write path died in September 2026. An install that goes longer than the
+    /// horizon without a redeploy still needs a scheduler; see the function's
+    /// own COMMENT.
+    async fn ensure_occurrence_partitions(&self, conn: &PgPool) -> Result<(), MigrationError> {
+        let present: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure('ensure_occurrence_partitions(integer)') IS NOT NULL",
+        )
+        .fetch_one(conn)
+        .await
+        .map_err(|e| MigrationError::new_from("failed to look up partition maintenance", e))?;
 
-        // Common locations to check (in order of preference)
-        let candidates = vec![
-            "src/migrations".to_string(),    // Running from crate root (db/)
-            "db/src/migrations".to_string(), // Running from workspace root
-        ];
-
-        for candidate in &candidates {
-            let path = cwd.join(candidate);
+        if !present {
             log::info!(
-                "checking candidate: {:?} (exists: {}, is_dir: {})",
-                path,
-                path.exists(),
-                path.is_dir()
+                "ensure_occurrence_partitions() not present yet; skipping partition extension"
             );
-            if path.exists() && path.is_dir() {
-                log::info!("found migrations at: {}", candidate);
-                return Ok(candidate.clone());
-            }
+            return Ok(());
         }
 
-        Err(MigrationError::new(
-            "could not find migrations directory. Tried: src/migrations, db/src/migrations. \
-             Run with --migrations-path to specify explicitly.",
-        ))
+        let created: i32 = sqlx::query_scalar("SELECT ensure_occurrence_partitions($1)")
+            .bind(PARTITION_HORIZON_MONTHS)
+            .fetch_one(conn)
+            .await
+            .map_err(|e| MigrationError::new_from("failed to extend occurrence partitions", e))?;
+
+        log::info!(
+            "occurrence partitions ensured {} months ahead ({} created)",
+            PARTITION_HORIZON_MONTHS,
+            created
+        );
+        Ok(())
     }
 
-    fn parse_file_name<'b>(pth: &'b PathBuf) -> Result<FileAttrs, MigrationError> {
-        let Some(os_name) = pth.file_name() else {
-            return Err(MigrationError::new("no filename"));
-        };
-        let Some(full_name) = os_name.to_str() else {
-            return Err(MigrationError::new("failed conversion to str"));
-        };
-        let Some((date_str, rest)) = full_name.split_once("_") else {
-            return Err(MigrationError::new(full_name));
-        };
-
-        let created_at = match NaiveDateTime::parse_from_str(date_str, MIGRATION_TIME_FMT) {
-            Ok(f) => f,
-            Err(e) => {
-                return Err(MigrationError::new_from("failed to parse timestamp", e));
-            }
-        }
-        .and_local_timezone(Local)
-        .unwrap();
-
-        let Some((name, sql)) = rest.split_once(".") else {
-            return Err(MigrationError::new("no extension"));
-        };
-        if sql != "sql" {
-            return Err(MigrationError::new(format!(
-                "invalid file extension: {}",
-                sql
-            )));
-        }
-        let attrs: FileAttrs = FileAttrs {
-            name: name.into(),
-            created_at,
-            full_path: pth.clone(),
-        };
-        Ok(attrs)
-    }
     async fn apply_migration(
         &self,
         attrs: FileAttrs,
@@ -205,10 +307,10 @@ impl UpArgs {
         };
 
         // Read file outside of transaction (file I/O doesn't need transaction)
-        let migration = self.read_file(&attrs.full_path)?;
+        let migration = read_migration_file(&attrs.full_path)?;
 
         // Register migration in the transaction
-        let reg_result = self.add_migration_to_registry(&mut tx, &attrs).await;
+        let reg_result = registry::record_applied(&mut tx, &attrs.name, attrs.created_at).await;
         if reg_result.is_err() {
             let _ = tx.rollback().await;
             return Err(MigrationError::new("failed to register migration"));
@@ -238,22 +340,7 @@ impl UpArgs {
             .await
             .map_err(|e| MigrationError::new_from("failed to commit migration", e))
     }
-    async fn add_migration_to_registry(
-        &self,
-        tx: &mut Transaction<'_, Postgres>,
-        attrs: &FileAttrs,
-    ) -> Result<(), MigrationError> {
-        let q = sqlx::query("INSERT INTO migrations (name, created_at) VALUES ($1,$2)")
-            .bind(attrs.name.clone())
-            .bind(attrs.created_at);
-
-        match tx.execute(q).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(MigrationError::new_from("failed to register migration", e)),
-        }
-    }
-
-    fn split_query(q: &str) -> Vec<String> {
+    pub(crate) fn split_query(q: &str) -> Vec<String> {
         let dialect = PostgreSqlDialect {};
         match Parser::parse_sql(&dialect, q) {
             Ok(statements) => {
@@ -262,10 +349,16 @@ impl UpArgs {
                 // complex PostgreSQL syntax, etc.
                 // Note: sqlparser normalizes output (removes comments, standardizes formatting)
                 // but this is fine for execution - the semantics are preserved.
-                statements.into_iter().map(|stmt| stmt.to_string()).collect()
-            },
+                statements
+                    .into_iter()
+                    .map(|stmt| stmt.to_string())
+                    .collect()
+            }
             Err(e) => {
-                log::info!("sqlparser failed (expected for some PostgreSQL syntax): {}, using fallback", e);
+                log::info!(
+                    "sqlparser failed (expected for some PostgreSQL syntax): {}, using fallback",
+                    e
+                );
                 // Fallback to smart split that handles comments and string literals
                 Self::smart_split_queries(q)
             }
@@ -282,8 +375,8 @@ impl UpArgs {
         let mut in_block_comment = false;
         let mut in_single_quote = false;
         let mut in_dollar_quote = false;
-        let mut dollar_tag = String::new();
-        
+        let mut dollar_delim = String::new();
+
         while let Some(c) = chars.next() {
             // Handle state transitions
             if in_line_comment {
@@ -293,7 +386,7 @@ impl UpArgs {
                 }
                 continue;
             }
-            
+
             if in_block_comment {
                 current.push(c);
                 if c == '*' && chars.peek() == Some(&'/') {
@@ -303,23 +396,26 @@ impl UpArgs {
                 }
                 continue;
             }
-            
+
             if in_dollar_quote {
                 current.push(c);
-                // Check for end of dollar-quoted string
-                if c == '$' && !dollar_tag.is_empty() {
-                    // Check if we have the closing tag
-                    let rest: String = chars.clone().take(dollar_tag.len()).collect();
-                    if rest == dollar_tag {
-                        let close_tag: String = chars.by_ref().take(dollar_tag.len()).collect();
+                // The opening delimiter is already in `current`, so the body
+                // ends where a '$' is followed by the rest of that same
+                // delimiter (`$` for `$$`, `fn$` for `$fn$`).
+                if c == '$' && !dollar_delim.is_empty() {
+                    let tail = &dollar_delim[1..];
+                    let tail_len = tail.chars().count();
+                    let rest: String = chars.clone().take(tail_len).collect();
+                    if rest == tail {
+                        let close_tag: String = chars.by_ref().take(tail_len).collect();
                         current.push_str(&close_tag);
                         in_dollar_quote = false;
-                        dollar_tag.clear();
+                        dollar_delim.clear();
                     }
                 }
                 continue;
             }
-            
+
             if in_single_quote {
                 current.push(c);
                 if c == '\'' {
@@ -332,7 +428,7 @@ impl UpArgs {
                 }
                 continue;
             }
-            
+
             // Normal mode - check for special sequences
             match c {
                 '-' if chars.peek() == Some(&'-') => {
@@ -346,28 +442,18 @@ impl UpArgs {
                     current.push(chars.next().unwrap()); // consume '*'
                 }
                 '$' => {
-                    // Check for dollar-quoted string
-                    let rest: String = chars.clone().take(20).collect();
-                    if rest.starts_with('$') || rest.starts_with("$$") {
-                        // Find the dollar tag
-                        if rest.starts_with("$$") {
-                            dollar_tag = "$$".to_string();
-                        } else {
-                            // $tag$ format
-                            if let Some(end_idx) = rest.find('$') {
-                                dollar_tag = rest[..=end_idx].to_string();
-                            }
-                        }
-                        if !dollar_tag.is_empty() {
-                            in_dollar_quote = true;
-                            current.push(c);
-                            if dollar_tag.len() > 1 {
-                                for ch in dollar_tag[1..].chars() {
-                                    current.push(chars.next().unwrap());
-                                }
-                            }
-                            continue;
-                        }
+                    // The leading '$' is consumed; the lookahead decides
+                    // whether this opens a quoted body or is just a '$' (a
+                    // positional parameter such as `$1` never opens one).
+                    let lookahead: String = chars.clone().take(DOLLAR_TAG_LOOKAHEAD).collect();
+                    if let Some(delim) = Self::opening_dollar_delimiter(&lookahead) {
+                        let rest_len = delim.chars().count() - 1;
+                        let rest: String = chars.by_ref().take(rest_len).collect();
+                        current.push(c);
+                        current.push_str(&rest);
+                        dollar_delim = delim;
+                        in_dollar_quote = true;
+                        continue;
                     }
                     current.push(c);
                 }
@@ -387,80 +473,38 @@ impl UpArgs {
                 }
             }
         }
-        
+
         // Don't forget the last statement
         if !current.trim().is_empty() {
             statements.push(current);
         }
-        
+
         statements
     }
 
-    fn read_file<'a, 'b>(&self, p: &'a PathBuf) -> Result<String, MigrationError> {
-        let mut f = match File::open(p) {
-            Ok(v) => v,
-            Err(e) => return Err(MigrationError::new_from("failed to open file", e)),
-        };
-        let mut out = String::new();
-        let _ = match f.read_to_string(&mut out) {
-            Ok(v) => v,
-            Err(e) => return Err(MigrationError::new_from("failed to read file", e)),
-        };
-        Ok(out)
-    }
+    /// The full `$…$` delimiter of an opening dollar quote, given the text
+    /// immediately after the leading `$` (which the caller already consumed).
+    ///
+    /// PostgreSQL tags are empty or `[A-Za-z_][A-Za-z0-9_]*`. A tag that starts
+    /// with a digit is not a tag, which is exactly what distinguishes the body
+    /// of `AS $fn$ … $fn$` from the positional parameter `$1`.
+    fn opening_dollar_delimiter(lookahead: &str) -> Option<String> {
+        let bytes = lookahead.as_bytes();
+        if bytes.first().is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
 
-    async fn get_latest_applied_migration(
-        &self,
-        conn: &Pool<Postgres>,
-    ) -> Result<DateTime<Local>, MigrationError> {
-        // First check if the migrations table exists
-        let table_exists: Result<Option<bool>, sqlx::Error> = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'migrations')"
-        )
-        .fetch_optional(conn)
-        .await;
-
-        match table_exists {
-            Ok(Some(true)) => {
-                // Table exists, query for latest migration
-                let v: Result<Option<DateTime<Local>>, sqlx::Error> = match conn
-                    .fetch_one("SELECT MAX(created_at) FROM migrations")
-                    .await
-                {
-                    Ok(v) => v.try_get(0),
-                    Err(e) => {
-                        return Err(MigrationError::new_from(
-                            "failed to fetch latest migration",
-                            e,
-                        ));
-                    }
-                };
-
-                let maybe_dt = match v {
-                    Ok(maybe_dt) => maybe_dt,
-                    Err(e) => {
-                        return Err(MigrationError::new_from(
-                            "failed to get created_at from result",
-                            e,
-                        ));
-                    }
-                };
-                match maybe_dt {
-                    Some(dt) => Ok(dt.into()),
-                    None => Ok(Local.with_ymd_and_hms(0, 1, 1, 0, 0, 0).unwrap()),
-                }
-            }
-            Ok(Some(false)) | Ok(None) => {
-                // Table doesn't exist or query failed silently, return epoch
-                Ok(Local.with_ymd_and_hms(0, 1, 1, 0, 0, 0).unwrap())
-            }
-            Err(e) => {
-                Err(MigrationError::new_from(
-                    "failed to check if migrations table exists",
-                    e,
-                ))
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'$' => return Some(format!("${}", &lookahead[..=i])),
+                b'A'..=b'Z' | b'a'..=b'z' | b'_' => i += 1,
+                b'0'..=b'9' if i > 0 => i += 1,
+                _ => return None,
             }
         }
+
+        None
     }
 }
 
@@ -468,6 +512,7 @@ impl UpArgs {
 mod tests {
     use super::*;
     use chrono::{Local, TimeZone};
+    use std::path::PathBuf;
 
     // ========================================================================
     // Filename parsing tests
@@ -478,7 +523,7 @@ mod tests {
         let mut pb = PathBuf::new();
         pb.push("202603081008_create_users.sql");
 
-        let result = UpArgs::parse_file_name(&pb);
+        let result = parse_file_name(&pb);
         assert!(result.is_ok(), "Expected Ok, got {:?}", result);
 
         let attrs = result.unwrap();
@@ -494,7 +539,7 @@ mod tests {
         let mut pb = PathBuf::new();
         pb.push("202607312147_create_bluetooth_occurrences.sql");
 
-        let result = UpArgs::parse_file_name(&pb);
+        let result = parse_file_name(&pb);
         assert!(result.is_ok(), "Expected Ok, got {:?}", result);
 
         let attrs = result.unwrap();
@@ -509,7 +554,7 @@ mod tests {
     fn test_parse_file_name_no_extension() {
         let pb = PathBuf::from("202603081008_no_extension");
 
-        let result = UpArgs::parse_file_name(&pb);
+        let result = parse_file_name(&pb);
         assert!(result.is_err(), "Expected error for file without extension");
     }
 
@@ -517,7 +562,7 @@ mod tests {
     fn test_parse_file_name_invalid_extension() {
         let pb = PathBuf::from("202603081008_wrong_extension.txt");
 
-        let result = UpArgs::parse_file_name(&pb);
+        let result = parse_file_name(&pb);
         assert!(result.is_err(), "Expected error for non-SQL extension");
     }
 
@@ -525,7 +570,7 @@ mod tests {
     fn test_parse_file_name_invalid_timestamp() {
         let pb = PathBuf::from("invalid_timestamp_create_users.sql");
 
-        let result = UpArgs::parse_file_name(&pb);
+        let result = parse_file_name(&pb);
         assert!(
             result.is_err(),
             "Expected error for invalid timestamp format"
@@ -536,7 +581,7 @@ mod tests {
     fn test_parse_file_name_timestamp_too_short() {
         let pb = PathBuf::from("20260308_create_users.sql"); // 8 digits instead of 12
 
-        let result = UpArgs::parse_file_name(&pb);
+        let result = parse_file_name(&pb);
         assert!(result.is_err(), "Expected error for incomplete timestamp");
     }
 
@@ -544,7 +589,7 @@ mod tests {
     fn test_parse_file_name_timestamp_too_long() {
         let pb = PathBuf::from("2026030810081234_extra.sql");
 
-        let result = UpArgs::parse_file_name(&pb);
+        let result = parse_file_name(&pb);
         // The parser expects exactly 14 digits for timestamp
         // Any extra digits cause parse failure since "0810081234_extra" isn't valid
         assert!(result.is_err(), "Should fail due to malformed timestamp");
@@ -610,7 +655,11 @@ mod tests {
         let result = UpArgs::split_query(query);
 
         // With sqlparser, semicolons inside strings are handled correctly
-        assert_eq!(result.len(), 1, "Should handle semicolons in string literals");
+        assert_eq!(
+            result.len(),
+            1,
+            "Should handle semicolons in string literals"
+        );
         assert!(result[0].contains("INSERT INTO test VALUES"));
         assert!(result[0].contains("a; b"));
     }
@@ -621,7 +670,11 @@ mod tests {
         let result = UpArgs::split_query(query);
 
         // sqlparser strips comments but correctly handles semicolons in them
-        assert_eq!(result.len(), 1, "Semicolons in comments should not split statements");
+        assert_eq!(
+            result.len(),
+            1,
+            "Semicolons in comments should not split statements"
+        );
         assert!(result[0].contains("SELECT 1"));
     }
 
@@ -631,7 +684,11 @@ mod tests {
         let result = UpArgs::split_query(query);
 
         // sqlparser strips comments but correctly handles semicolons in them
-        assert_eq!(result.len(), 1, "Semicolons in block comments should not split statements");
+        assert_eq!(
+            result.len(),
+            1,
+            "Semicolons in block comments should not split statements"
+        );
         assert!(result[0].contains("SELECT 1"));
     }
 
@@ -643,6 +700,84 @@ mod tests {
         // With sqlparser, dollar-quoted strings are handled correctly
         assert_eq!(result.len(), 1, "Should handle dollar-quoted strings");
         assert!(result[0].contains("CREATE FUNCTION"));
+    }
+
+    /// The fallback splitter is the one that actually runs on plpgsql bodies —
+    /// sqlparser rejects them — so it has to keep a tagged body in one piece.
+    /// It previously recognised `$$` but not `$fn$`, and split the body on its
+    /// inner semicolons, producing "unterminated dollar-quoted string".
+    #[test]
+    fn fallback_splitter_keeps_a_tagged_dollar_body_in_one_statement() {
+        let query = r#"
+CREATE OR REPLACE FUNCTION make_months(n integer) RETURNS integer LANGUAGE plpgsql AS $fn$
+DECLARE
+    i integer;
+    total integer := 0;
+BEGIN
+    FOR i IN 0..n LOOP
+        total := total + i;
+    END LOOP;
+    RETURN total;
+END;
+$fn$;
+
+SELECT make_months(3);
+"#;
+        let statements = UpArgs::smart_split_queries(query);
+
+        // The splitter drops the terminating `;`, so compare against the body.
+        assert_eq!(statements.len(), 2, "body must not split: {statements:#?}");
+        assert!(statements[0].trim_end().ends_with("$fn$"));
+        assert!(statements[0].contains("RETURN total;"));
+        assert_eq!(statements[1].trim(), "SELECT make_months(3)");
+    }
+
+    #[test]
+    fn fallback_splitter_closes_an_untagged_dollar_body() {
+        let query = "COMMENT ON TABLE nodes IS $$who\nsigned it; nobody$$;\nSELECT 1;";
+        let statements = UpArgs::smart_split_queries(query);
+
+        assert_eq!(
+            statements.len(),
+            2,
+            "body must not swallow the next statement: {statements:#?}"
+        );
+        assert!(statements[0].trim_end().ends_with("$$"));
+        assert_eq!(statements[1].trim(), "SELECT 1");
+    }
+
+    /// `$1` looks like the start of a tag and is not one: treating it as one
+    /// would glue every following statement into a phantom quoted body.
+    #[test]
+    fn fallback_splitter_does_not_open_a_dollar_body_on_a_parameter() {
+        let query = "INSERT INTO t (a, b) VALUES ($1, $2);\nSELECT a FROM t;";
+        let statements = UpArgs::smart_split_queries(query);
+
+        assert_eq!(statements.len(), 2, "{statements:#?}");
+    }
+
+    #[test]
+    fn fallback_splitter_keeps_the_partition_migration_whole() {
+        let sql = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/migrations/202609021200_partition_occurrences_forward.sql"
+        ))
+        .expect("partition migration should be readable");
+
+        let statements = UpArgs::smart_split_queries(&sql)
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>();
+
+        assert_eq!(statements.len(), 3, "{statements:#?}");
+        assert!(statements[0].contains("CREATE OR REPLACE FUNCTION ensure_occurrence_partitions"));
+        assert!(statements[0].trim_end().ends_with("$fn$"));
+        assert!(
+            statements[1]
+                .trim_start()
+                .starts_with("COMMENT ON FUNCTION")
+        );
+        assert!(statements[2].contains("SELECT ensure_occurrence_partitions(15)"));
     }
 
     #[test]
@@ -660,7 +795,11 @@ CREATE TABLE test (
 
         // Should produce exactly 1 statement, not split on the semicolon in the comment
         let non_empty: Vec<&String> = result.iter().filter(|s| !s.trim().is_empty()).collect();
-        assert_eq!(non_empty.len(), 1, "Should not split on semicolon in comment");
+        assert_eq!(
+            non_empty.len(),
+            1,
+            "Should not split on semicolon in comment"
+        );
         assert!(non_empty[0].contains("CREATE TABLE"));
         assert!(non_empty[0].contains("name TEXT"));
     }
@@ -673,7 +812,11 @@ CREATE TABLE test (
 
         // Should produce exactly 1 statement
         let non_empty: Vec<&String> = result.iter().filter(|s| !s.trim().is_empty()).collect();
-        assert_eq!(non_empty.len(), 1, "Semicolon in line comment should not split");
+        assert_eq!(
+            non_empty.len(),
+            1,
+            "Semicolon in line comment should not split"
+        );
         assert!(non_empty[0].contains("SELECT 1"));
     }
 
@@ -696,25 +839,107 @@ CREATE TABLE test (
     // Note: These tests use test-specific file paths that don't require temp dirs
     // ========================================================================
 
-    fn create_test_up_args() -> UpArgs {
-        UpArgs {
-            number: 0,
-            host: "localhost".to_string(),
-            port: 5432,
-            user: "postgres".to_string(),
-            db: "postgres".to_string(),
-            migrations_path: "".to_string(), // Empty means auto-detect
-        }
+    #[test]
+    fn test_read_file_not_found() {
+        let file_path = PathBuf::from("/nonexistent/path/file.sql");
+
+        let result = read_migration_file(&file_path);
+
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // --number selection tests
+    // ========================================================================
+
+    fn pending_migrations(names: &[&str]) -> Vec<FileAttrs> {
+        let base = Local.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| FileAttrs {
+                name: name.to_string(),
+                full_path: PathBuf::from(format!("{name}.sql")),
+                created_at: base + chrono::Duration::days(i as i64),
+            })
+            .collect()
+    }
+
+    /// `--number 0` is "everything pending", which is what `db up` has always
+    /// done, so an unchanged invocation keeps its behaviour.
+    #[test]
+    fn number_zero_applies_every_pending_migration() {
+        let selected = select_pending(pending_migrations(&["a", "b", "c"]), 0);
+        assert_eq!(
+            selected.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    /// The defect this closes: `--number N` used to be parsed, printed at
+    /// startup, and then ignored, so an operator limiting the run to one
+    /// migration actually applied all of them.
+    #[test]
+    fn number_limits_the_pending_migrations_in_order() {
+        let pending = pending_migrations(&["a", "b", "c"]);
+
+        let one = select_pending(pending.clone(), 1);
+        assert_eq!(one.len(), 1, "must not apply every pending migration");
+        assert_eq!(one[0].name, "a", "oldest pending goes first");
+
+        let two = select_pending(pending.clone(), 2);
+        assert_eq!(
+            two.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    /// Asking for more than is pending is not an error — there is simply
+    /// nothing more to do.
+    #[test]
+    fn number_larger_than_the_pending_set_applies_what_exists() {
+        let selected = select_pending(pending_migrations(&["a"]), 5);
+        assert_eq!(selected.len(), 1);
+    }
+
+    /// The cap is only meaningful if the list was sorted first: taking the
+    /// first N of a raw directory walk would apply migrations in whatever
+    /// order the filesystem returned them, against a schema that assumes
+    /// otherwise.
+    #[test]
+    fn number_selects_the_oldest_migrations_however_they_arrive() {
+        let base = Local.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let at = |name: &str, days: i64| FileAttrs {
+            name: name.to_string(),
+            full_path: PathBuf::from(format!("{name}.sql")),
+            created_at: base + chrono::Duration::days(days),
+        };
+        let walk_order = vec![at("latest", 30), at("middle", 10), at("first", 1)];
+
+        let selected = select_pending(walk_order, 2);
+        assert_eq!(
+            selected.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["first", "middle"],
+            "must apply oldest-first regardless of discovery order"
+        );
     }
 
     #[test]
-    fn test_read_file_not_found() {
-        let up_args = create_test_up_args();
-        let file_path = PathBuf::from("/nonexistent/path/file.sql");
+    fn empty_pending_set_stays_empty_whatever_number_says() {
+        assert!(select_pending(vec![], 3).is_empty());
+        assert!(select_pending(vec![], 0).is_empty());
+    }
 
-        let result = up_args.read_file(&file_path);
+    // ========================================================================
+    // Revert-script discovery tests
+    // ========================================================================
 
-        assert!(result.is_err());
+    #[test]
+    fn down_scripts_are_not_migrations() {
+        assert!(is_down_script(Path::new(
+            "202607312146_create_nodes.down.sql"
+        )));
+        assert!(!is_down_script(Path::new("202607312146_create_nodes.sql")));
     }
 
     // ========================================================================
@@ -834,7 +1059,7 @@ INSERT INTO test_table (data) VALUES ('{"key": "value"}');
 
         // Should return at least something (either parsed or fallback)
         assert!(!result.is_empty(), "Should always return some statements");
-        
+
         // Filter empty statements for counting
         let non_empty: Vec<&String> = result.iter().filter(|s| !s.trim().is_empty()).collect();
         assert_eq!(non_empty.len(), 3, "Should have 3 statements");
@@ -871,9 +1096,13 @@ COMMENT ON TABLE occurrences IS 'Append-only occurrence data';
 
         // Should handle this successfully (either via sqlparser or fallback)
         assert!(!result.is_empty(), "Should always return some statements");
-        
+
         let non_empty: Vec<&String> = result.iter().filter(|s| !s.trim().is_empty()).collect();
-        assert!(non_empty.len() >= 5, "Should have at least 5 statements, got {}", non_empty.len());
+        assert!(
+            non_empty.len() >= 5,
+            "Should have at least 5 statements, got {}",
+            non_empty.len()
+        );
     }
 
     #[test]
@@ -892,9 +1121,13 @@ CREATE TABLE test_occurrences (
         // sqlparser may fail on uuidv7() or GENERATED ALWAYS AS with function calls
         // In that case, fallback to simple split should work
         assert!(!result.is_empty(), "Should always return some statements");
-        
+
         let non_empty: Vec<&String> = result.iter().filter(|s| !s.trim().is_empty()).collect();
-        assert_eq!(non_empty.len(), 1, "Should have exactly 1 CREATE TABLE statement");
+        assert_eq!(
+            non_empty.len(),
+            1,
+            "Should have exactly 1 CREATE TABLE statement"
+        );
         assert!(non_empty[0].contains("CREATE TABLE"));
     }
 
@@ -902,38 +1135,42 @@ CREATE TABLE test_occurrences (
     fn test_split_query_actual_migration_file() {
         // Test parsing the actual create_bluetooth_occurrences.sql migration
         // This validates that the SQL parser handles real-world migration files
-        let migration_path = PathBuf::from("src/migrations/202607312147_create_bluetooth_occurrences.sql");
-        
+        let migration_path =
+            PathBuf::from("src/migrations/202607312147_create_bluetooth_occurrences.sql");
+
         // Skip test if migration file doesn't exist (e.g., running from different directory)
         if !migration_path.exists() {
             return;
         }
 
-        let up_args = UpArgs {
-            number: 0,
-            host: "localhost".to_string(),
-            port: 5432,
-            user: "postgres".to_string(),
-            db: "postgres".to_string(),
-            migrations_path: "".to_string(),
-        };
-
-        let sql_content = up_args.read_file(&migration_path).expect("Failed to read migration file");
+        let sql_content =
+            read_migration_file(&migration_path).expect("Failed to read migration file");
         let statements = UpArgs::split_query(&sql_content);
 
         // Should always return some statements (either via sqlparser or fallback)
-        assert!(!statements.is_empty(), "Should always return some statements");
-        
+        assert!(
+            !statements.is_empty(),
+            "Should always return some statements"
+        );
+
         // Filter empty statements
         let non_empty: Vec<&String> = statements.iter().filter(|s| !s.trim().is_empty()).collect();
-        
+
         // The migration file has at least: CREATE TABLE occurrences, CREATE TABLE occurrence_relays,
         // CREATE TABLE partitions (2), CREATE INDEXes, COMMENTs = ~10+ statements
-        assert!(non_empty.len() >= 5, "Should have at least 5 statements, got {}", non_empty.len());
-        
+        assert!(
+            non_empty.len() >= 5,
+            "Should have at least 5 statements, got {}",
+            non_empty.len()
+        );
+
         // Verify we got the main CREATE TABLE statement
-        assert!(non_empty.iter().any(|s| s.contains("CREATE TABLE occurrences")), 
-                "Should contain CREATE TABLE occurrences");
+        assert!(
+            non_empty
+                .iter()
+                .any(|s| s.contains("CREATE TABLE occurrences")),
+            "Should contain CREATE TABLE occurrences"
+        );
     }
 
     // ========================================================================

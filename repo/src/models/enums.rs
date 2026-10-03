@@ -226,6 +226,63 @@ impl SyncDirection {
     }
 }
 
+// ============================================================================
+// IDENTITY ENUMS
+// ============================================================================
+
+/// How a device identifier came to belong to an identity.
+///
+/// The declaration order is the reliability order the identity design uses: an exact
+/// address identifies a device, the rest infer it, from strongest inference to
+/// weakest.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, sqlx::Type,
+)]
+#[sqlx(type_name = "identity_resolution_method", rename_all = "snake_case")]
+pub enum IdentityResolutionMethod {
+    ExactAddress,
+    Fingerprint,
+    TemporalAdjacency,
+    Name,
+    Irk,
+}
+
+impl IdentityResolutionMethod {
+    /// Returns all resolution methods, strongest first.
+    pub fn all() -> &'static [IdentityResolutionMethod] {
+        &[
+            IdentityResolutionMethod::ExactAddress,
+            IdentityResolutionMethod::Fingerprint,
+            IdentityResolutionMethod::TemporalAdjacency,
+            IdentityResolutionMethod::Name,
+            IdentityResolutionMethod::Irk,
+        ]
+    }
+
+    /// Whether the method identifies the device rather than inferring it.
+    ///
+    /// The distinction is what lets the resolver merge on a thin feed: an address it
+    /// has already seen needs no corroborating features, whereas every other method
+    /// does and is judged against the evidence floor.
+    pub fn is_identification(&self) -> bool {
+        matches!(self, IdentityResolutionMethod::ExactAddress)
+    }
+
+    /// The label the `identity_resolution_method` column holds.
+    ///
+    /// `repo/tests/device_identity.rs` checks these against `pg_enum`, for the same
+    /// reason `AdvType::as_str()` is checked in `wire_types.rs`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IdentityResolutionMethod::ExactAddress => "exact_address",
+            IdentityResolutionMethod::Fingerprint => "fingerprint",
+            IdentityResolutionMethod::TemporalAdjacency => "temporal_adjacency",
+            IdentityResolutionMethod::Name => "name",
+            IdentityResolutionMethod::Irk => "irk",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +434,31 @@ mod tests {
     }
 
     // ========================================================================
+    // IdentityResolutionMethod tests
+    // ========================================================================
+
+    #[test]
+    fn test_identity_resolution_method_all_is_strongest_first() {
+        let methods = IdentityResolutionMethod::all();
+        assert_eq!(methods.len(), 5);
+        assert_eq!(methods[0], IdentityResolutionMethod::ExactAddress);
+        assert_eq!(methods[4], IdentityResolutionMethod::Irk);
+        // Declaration order is the reliability order, so the derive on Ord agrees
+        // with it rather than being an accident of variant naming.
+        assert!(IdentityResolutionMethod::Fingerprint < IdentityResolutionMethod::Name);
+    }
+
+    #[test]
+    fn test_identity_resolution_method_is_identification() {
+        assert!(IdentityResolutionMethod::ExactAddress.is_identification());
+        for method in IdentityResolutionMethod::all() {
+            if !method.is_identification() {
+                assert_ne!(*method, IdentityResolutionMethod::ExactAddress);
+            }
+        }
+    }
+
+    // ========================================================================
     // SQLX type mapping tests (compile-time only - verifies Type trait impl)
     // ========================================================================
 
@@ -392,5 +474,6 @@ mod tests {
         assert_type::<AdvType>();
         assert_type::<LocationSource>();
         assert_type::<SyncDirection>();
+        assert_type::<IdentityResolutionMethod>();
     }
 }

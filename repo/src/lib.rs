@@ -84,9 +84,13 @@ pub use error::RepoError;
 /// cell" everywhere else.
 pub use h3o::{CellIndex, Resolution};
 pub use models::{
-    mac_address_from_string, Node, Occurrence, OccurrenceBuilder, OccurrenceRelay, RevokedNode,
-    SignalType,
+    canonical_pair, mac_address_from_string, AssociationAggregate, AssociationEdge,
+    CoOccurrenceEvent, DeviceAddressLink, DeviceIdentity, DeviceIdentityBuilder, Node, Occurrence,
+    OccurrenceBuilder, OccurrenceRelay, RevokedNode, SignalType,
 };
 pub use pool::Pool;
-pub use repositories::{NodeRepository, OccurrenceRepository, RevocationRepository};
+pub use repositories::{
+    AssociationRepository, CoOccurrenceRepository, DeviceIdentityRepository, NodeRepository,
+    OccurrenceRepository, RevocationRepository,
+};
 pub use types::{H3Index, PostgisPoint};

@@ -571,19 +571,11 @@ impl ValueNotification {
     }
 }
 
-/// Fields that can be updated in a device event.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UpdateField {
-    /// Device name changed.
-    Name,
-    /// RSSI value changed.
-    Rssi,
-    /// Services resolved state changed.
-    ServicesResolved,
-    /// Connection state changed.
-    Connected,
-}
-
+/// Fields that can be updated in a device event live in
+/// [`crate::monitor::events::UpdateField`]; this module deliberately does not
+/// define its own copy. It used to, and the two enums with the same name were
+/// distinct types, so a consumer holding `bt_mon::UpdateField` could not match a
+/// value that arrived on `bt_mon::monitor::events::UpdateField`.
 #[cfg(test)]
 mod tests {
     use super::*;

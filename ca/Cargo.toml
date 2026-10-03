@@ -25,7 +25,17 @@ thiserror = "2.0"
 async-trait = "0.1"
 
 # Database (optional, for RSL manager)
-sqlx = { version = "0.9", features = ["runtime-tokio", "postgres"], optional = true }
+# `chrono` is required because revocation timestamps cross the wire as
+# `TIMESTAMPTZ` and decode into `chrono::DateTime<Utc>`. `json` carries the
+# published list into and out of the `revocation_status_lists` JSONB column;
+# `macros` is for the `#[sqlx::test]` suites that run against a live server.
+sqlx = { version = "0.9", features = [
+    "runtime-tokio",
+    "postgres",
+    "chrono",
+    "json",
+    "macros",
+], optional = true }
 
 # Tokio for async tests
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"], optional = true }
@@ -37,3 +47,9 @@ database = ["sqlx"]
 [dev-dependencies]
 tempfile = "3.0"
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+# `rsl_persistence` builds its throwaway schema from `db`'s migration corpus
+# through `db::SQLX_FORWARD_MIGRATOR` — the `up` statements only. Pointing sqlx at
+# the directory instead would run every `--migrate:down` block on the way up,
+# because sqlx reads whole files and does not know what `--migrate:` means.
+# See db/src/forward.rs.
+db = { path = "../db" }

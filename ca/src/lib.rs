@@ -61,13 +61,13 @@ pub use credential::Credential;
 pub use error::CaError;
 pub use revocation::{
     CheckContext, CheckLocation, ConnectionPolicy, DataRecordingPolicy, Decision,
-    InMemoryRslChecker, RevokedNode, RevocationChecker, RevocationPolicy,
-    RevocationReason, RevocationStatus, RevocationStatusList, RslBuilder,
+    InMemoryRslChecker, RevocationChecker, RevocationPolicy, RevocationReason, RevocationStatus,
+    RevocationStatusList, RevokedNode, RslBuilder,
 };
 pub use root::CaRoot;
-pub use rsl_manager::InMemoryRslManager;
 #[cfg(feature = "database")]
 pub use rsl_manager::DatabaseRslManager;
+pub use rsl_manager::InMemoryRslManager;
 pub use rsl_manager::RslManager;
 pub use signing::sign_credential;
 

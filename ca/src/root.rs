@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::credential::Credential;
 use crate::error::{CaError, Result};
-use crate::revocation::{RevokedNode, RevocationReason, RevocationStatusList};
+use crate::revocation::{RevocationReason, RevocationStatusList, RevokedNode};
 use crate::signing::sign_credential;
 
 /// CA root keypair and associated operations.
@@ -167,17 +167,11 @@ impl CaRoot {
         validity_days: Option<u64>,
     ) -> Result<Credential> {
         let issued_at = chrono::Utc::now();
-        let expires_at = validity_days.map(|days| {
-            issued_at + chrono::Duration::days(days as i64)
-        });
+        let expires_at = validity_days.map(|days| issued_at + chrono::Duration::days(days as i64));
 
         // Sign the credential
-        let ca_signature = sign_credential(
-            &self.signing_key,
-            signing_public_key,
-            issued_at,
-            expires_at,
-        )?;
+        let ca_signature =
+            sign_credential(&self.signing_key, signing_public_key, issued_at, expires_at)?;
 
         Credential::new(
             signing_public_key.to_vec(),
@@ -293,12 +287,8 @@ impl CaRoot {
         reason: RevocationReason,
         notes: Option<String>,
     ) -> RevokedNode {
-        let mut revocation = RevokedNode::new(
-            node_id,
-            chrono::Utc::now(),
-            reason,
-            signing_public_key,
-        );
+        let mut revocation =
+            RevokedNode::new(node_id, chrono::Utc::now(), reason, signing_public_key);
         revocation.notes = notes;
         revocation
     }
@@ -309,6 +299,9 @@ impl CaRoot {
     ///
     /// * `revocations` - List of revoked nodes
     /// * `validity_days` - How many days the RSL should be valid
+    /// * `sequence_number` - This CA's next sequence number, from durable
+    ///   state — see [`sign_rsl`](Self::sign_rsl) for why the caller supplies
+    ///   it and there is no default.
     ///
     /// # Returns
     ///
@@ -317,27 +310,62 @@ impl CaRoot {
         &self,
         revocations: Vec<RevokedNode>,
         validity_days: u64,
+        sequence_number: u64,
     ) -> Result<RevocationStatusList> {
+        let unsigned = RevocationStatusList::builder(self.ca_id())
+            .sequence_number(sequence_number)
+            .validity_days(validity_days)
+            .add_revocations(revocations)
+            .build_unsigned();
+
+        self.sign_rsl(unsigned)
+    }
+
+    /// Sign a list an [`RslManager`](crate::RslManager) has already produced.
+    ///
+    /// The sequence number, the validity window and the revocation entries are
+    /// decided when a list is generated, and the signature has to cover *those*
+    /// values. Rebuilding a list at the signing site from only the revocations
+    /// resets the rest — including the counter whose whole job is to make an
+    /// old list recognisable as an old list — so a publisher signs the document
+    /// it was handed rather than a fresh copy of it.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(rsl)` - `rsl` with this CA as issuer and a signature over its own
+    ///   sequence, validity window and entries
+    /// * `Err` - If the sequence is 0 (nothing has been issued yet, so there is
+    ///   nothing to publish) or the list already names a different issuer: this
+    ///   key can only speak for itself, and signing another CA's list would
+    ///   produce a valid-looking credential it cannot stand behind.
+    pub fn sign_rsl(&self, rsl: RevocationStatusList) -> Result<RevocationStatusList> {
         use ed25519_dalek::Signer;
-        
-        let issued_at = chrono::Utc::now();
-        let expires_at = issued_at + chrono::Duration::days(validity_days as i64);
-        let sequence_number = 0; // TODO: Implement sequence tracking
 
-        // Build the payload to sign
-        let payload = self.rsl_payload_bytes(&revocations, issued_at, expires_at, sequence_number)?;
+        if rsl.sequence_number == 0 {
+            return Err(CaError::InvalidCredential(
+                "RSL sequence numbers start at 1; 0 means no list has been issued yet".to_string(),
+            ));
+        }
 
-        // Sign the payload
-        let signature = self.signing_key.sign(&payload);
+        let ca_id = self.ca_id();
+        if !rsl.issuer_id.is_empty() && rsl.issuer_id != ca_id {
+            return Err(CaError::InvalidCredential(format!(
+                "RSL names issuer {} but this key is {}",
+                rsl.issuer_id, ca_id
+            )));
+        }
 
-        Ok(RevocationStatusList {
-            issuer_id: self.ca_id(),
-            issued_at,
-            expires_at,
-            sequence_number,
-            revocations,
-            signature: signature.to_bytes().to_vec(),
-        })
+        let mut rsl = rsl;
+        rsl.issuer_id = ca_id;
+        let payload = self.rsl_payload_bytes(
+            &rsl.revocations,
+            rsl.issued_at,
+            rsl.expires_at,
+            rsl.sequence_number,
+        )?;
+        rsl.signature = self.signing_key.sign(&payload).to_bytes().to_vec();
+
+        Ok(rsl)
     }
 
     /// Verify a Revocation Status List's signature.
@@ -366,12 +394,17 @@ impl CaRoot {
         )?;
 
         // Parse the signature
-        let signature = ed25519_dalek::Signature::try_from(
-            rsl.signature.as_slice()
-        ).map_err(|_| CaError::InvalidCredential("RSL signature must be 64 bytes".to_string()))?;
+        let signature =
+            ed25519_dalek::Signature::try_from(rsl.signature.as_slice()).map_err(|_| {
+                CaError::InvalidCredential("RSL signature must be 64 bytes".to_string())
+            })?;
 
         // Verify
-        Ok(self.signing_key.verifying_key().verify(&payload, &signature).is_ok())
+        Ok(self
+            .signing_key
+            .verifying_key()
+            .verify(&payload, &signature)
+            .is_ok())
     }
 
     /// Encode the RSL payload for signing.
@@ -571,7 +604,7 @@ mod tests {
     fn test_ca_id_generation() {
         let ca = CaRoot::generate();
         let ca_id = ca.ca_id();
-        
+
         // Should be a valid hex string (64 chars for SHA-256)
         assert_eq!(ca_id.len(), 64);
         assert!(ca_id.chars().all(|c| c.is_ascii_hexdigit()));
@@ -597,15 +630,92 @@ mod tests {
         );
 
         // Create RSL
-        let rsl = ca.create_rsl(
-            vec![revocation1, revocation2],
-            7,
-        ).unwrap();
+        let rsl = ca.create_rsl(vec![revocation1, revocation2], 7, 1).unwrap();
 
         // Verify RSL
         assert!(ca.verify_rsl(&rsl).unwrap());
         assert_eq!(rsl.revocation_count(), 2);
         assert!(rsl.is_valid_now());
+    }
+
+    // The sequence number is only an anti-replay counter if a receiver can tell
+    // it has not been touched. Bumping it is how an old list gets presented as
+    // a new one, so it has to be inside the signature.
+    #[test]
+    fn the_sequence_number_is_inside_the_signature() {
+        let ca = CaRoot::generate();
+        let revocation = ca.revoke_node(
+            vec![1u8; 32],
+            vec![2u8; 32],
+            RevocationReason::KeyCompromise,
+            None,
+        );
+
+        let mut rsl = ca.create_rsl(vec![revocation], 7, 1).unwrap();
+        assert!(ca.verify_rsl(&rsl).unwrap());
+
+        rsl.sequence_number = 2;
+        assert!(
+            !ca.verify_rsl(&rsl).unwrap(),
+            "relabeling a list as newer must invalidate it"
+        );
+    }
+
+    #[test]
+    fn a_list_numbered_zero_cannot_be_signed() {
+        let ca = CaRoot::generate();
+
+        // 0 is "no list has been published", not a list in its own right.
+        let err = ca
+            .create_rsl(Vec::new(), 7, 0)
+            .expect_err("0 must not be publishable");
+        assert!(matches!(err, CaError::InvalidCredential(_)));
+    }
+
+    #[test]
+    fn sign_rsl_keeps_the_values_the_manager_already_chose() {
+        use crate::revocation::{RevocationStatusList, RevokedNode};
+
+        let ca = CaRoot::generate();
+        let unsigned = RevocationStatusList::builder(ca.ca_id())
+            .sequence_number(5)
+            .validity_days(30)
+            .add_revocation(RevokedNode::new(
+                vec![1u8; 32],
+                chrono::Utc::now(),
+                RevocationReason::KeyCompromise,
+                vec![2u8; 32],
+            ))
+            .build_unsigned();
+
+        let (issued_at, expires_at) = (unsigned.issued_at, unsigned.expires_at);
+        let signed = ca.sign_rsl(unsigned).unwrap();
+
+        // Signing is not re-generating: the document that leaves here is the one
+        // the sequence and validity window were chosen for.
+        assert_eq!(signed.sequence_number, 5);
+        assert_eq!(signed.issued_at, issued_at);
+        assert_eq!(signed.expires_at, expires_at);
+        assert_eq!(signed.revocation_count(), 1);
+        assert!(ca.verify_rsl(&signed).unwrap());
+    }
+
+    #[test]
+    fn a_key_cannot_sign_a_list_naming_another_ca() {
+        use crate::revocation::RevocationStatusList;
+
+        let ca = CaRoot::generate();
+        let other = CaRoot::generate();
+
+        let theirs = RevocationStatusList::builder(other.ca_id())
+            .sequence_number(1)
+            .validity_days(7)
+            .build_unsigned();
+
+        assert!(matches!(
+            ca.sign_rsl(theirs),
+            Err(CaError::InvalidCredential(_))
+        ));
     }
 
     #[test]
@@ -619,7 +729,7 @@ mod tests {
             None,
         );
 
-        let mut rsl = ca.create_rsl(vec![revocation], 7).unwrap();
+        let mut rsl = ca.create_rsl(vec![revocation], 7, 1).unwrap();
 
         // Tamper with the signature
         rsl.signature[0] ^= 1;
@@ -640,7 +750,7 @@ mod tests {
             None,
         );
 
-        let rsl = ca1.create_rsl(vec![revocation], 7).unwrap();
+        let rsl = ca1.create_rsl(vec![revocation], 7, 1).unwrap();
 
         // Verify with different CA should fail
         assert!(!ca2.verify_rsl(&rsl).unwrap());
@@ -660,7 +770,7 @@ mod tests {
             None,
         );
 
-        let rsl = ca.create_rsl(vec![revoked_node], 7).unwrap();
+        let rsl = ca.create_rsl(vec![revoked_node], 7, 1).unwrap();
 
         assert!(rsl.is_node_revoked(&revoked_node_id));
         assert!(!rsl.is_node_revoked(&active_node_id));

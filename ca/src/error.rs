@@ -33,6 +33,25 @@ pub enum CaError {
     #[error("Node {0} has been revoked")]
     NodeRevoked(String),
 
+    /// An RSL was offered that does not advance the sequence already held for
+    /// its CA. This is the replay rejection: an RSL captured yesterday and
+    /// served again today (or a second list minted with an already-used
+    /// number) carries no new information, and accepting it would let the
+    /// receiver believe it has current revocation data.
+    #[error("RSL sequence {incoming} does not advance {current} already held for CA {issuer_id}")]
+    RslNotNewer {
+        /// CA the list claims to come from.
+        issuer_id: String,
+        /// Sequence number the offered list carries.
+        incoming: u64,
+        /// Sequence number of the newest list already accepted for that CA.
+        current: u64,
+    },
+
+    /// A list was handed to something that only accepts signed RSLs.
+    #[error("RSL from {0} is not signed")]
+    UnsignedRsl(String),
+
     /// Invalid key format or length.
     #[error("Invalid key: {0}")]
     InvalidKey(String),

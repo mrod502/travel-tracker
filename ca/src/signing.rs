@@ -59,7 +59,7 @@ fn build_credential_payload(
     // 3. Expiration flag
     if let Some(expires) = expires_at {
         payload.push(1); // Has expiration
-        // 4. Expiration timestamp (8 bytes, big-endian)
+                         // 4. Expiration timestamp (8 bytes, big-endian)
         payload.extend_from_slice(&expires.timestamp().to_be_bytes());
     } else {
         payload.push(0); // No expiration
@@ -78,11 +78,8 @@ fn build_credential_payload(
 /// # Returns
 ///
 /// `Ok(true)` if the signature is valid, `Ok(false)` otherwise.
-pub fn verify_credential_signature(
-    ca_public_key: &[u8],
-    credential: &Credential,
-) -> Result<bool> {
-    use ed25519_dalek::{VerifyingKey, Verifier};
+pub fn verify_credential_signature(ca_public_key: &[u8], credential: &Credential) -> Result<bool> {
+    use ed25519_dalek::{Verifier, VerifyingKey};
 
     // Verify node_id integrity first
     credential.verify_node_id_integrity()?;
@@ -97,16 +94,17 @@ pub fn verify_credential_signature(
     // Parse the CA's public key
     let mut pk_bytes = [0u8; 32];
     if ca_public_key.len() != 32 {
-        return Err(CaError::Verification("Invalid CA public key length".to_string()));
+        return Err(CaError::Verification(
+            "Invalid CA public key length".to_string(),
+        ));
     }
     pk_bytes.copy_from_slice(ca_public_key);
     let verifying_key = VerifyingKey::from_bytes(&pk_bytes)
         .map_err(|e| CaError::Verification(format!("Invalid CA public key: {}", e)))?;
 
     // Parse the signature
-    let signature = ed25519_dalek::Signature::try_from(
-        credential.ca_signature.as_slice()
-    ).map_err(|_| CaError::InvalidCredential("Signature must be 64 bytes".to_string()))?;
+    let signature = ed25519_dalek::Signature::try_from(credential.ca_signature.as_slice())
+        .map_err(|_| CaError::InvalidCredential("Signature must be 64 bytes".to_string()))?;
 
     // Verify
     Ok(verifying_key.verify(&payload, &signature).is_ok())
@@ -147,7 +145,9 @@ mod tests {
         .unwrap();
 
         // Verify the signature
-        let is_valid = verify_credential_signature(ca_signing_key.verifying_key().as_bytes(), &credential).unwrap();
+        let is_valid =
+            verify_credential_signature(ca_signing_key.verifying_key().as_bytes(), &credential)
+                .unwrap();
         assert!(is_valid);
     }
 
@@ -161,29 +161,20 @@ mod tests {
         let node_public_key = vec![1u8; 32];
 
         // Sign the credential
-        let signature = sign_credential(
-            &ca_signing_key,
-            &node_public_key,
-            Utc::now(),
-            None,
-        )
-        .unwrap();
+        let signature =
+            sign_credential(&ca_signing_key, &node_public_key, Utc::now(), None).unwrap();
 
         // Create credential with signature
-        let mut credential = Credential::new(
-            node_public_key.clone(),
-            signature,
-            Utc::now(),
-            None,
-            None,
-        )
-        .unwrap();
+        let mut credential =
+            Credential::new(node_public_key.clone(), signature, Utc::now(), None, None).unwrap();
 
         // Tamper with the signature instead (to test signature verification failure)
         credential.ca_signature[0] ^= 1;
 
         // Verification should fail
-        let is_valid = verify_credential_signature(ca_signing_key.verifying_key().as_bytes(), &credential).unwrap();
+        let is_valid =
+            verify_credential_signature(ca_signing_key.verifying_key().as_bytes(), &credential)
+                .unwrap();
         assert!(!is_valid);
     }
 

@@ -101,13 +101,8 @@ impl Credential {
     ///
     /// This is for testing only. Production credentials MUST be signed by the CA.
     #[cfg(test)]
-    pub fn for_testing(
-        signing_public_key: Vec<u8>,
-        node_id: Option<Vec<u8>>,
-    ) -> Self {
-        let node_id = node_id.unwrap_or_else(|| {
-            Sha256::digest(&signing_public_key).to_vec()
-        });
+    pub fn for_testing(signing_public_key: Vec<u8>, node_id: Option<Vec<u8>>) -> Self {
+        let node_id = node_id.unwrap_or_else(|| Sha256::digest(&signing_public_key).to_vec());
 
         Credential {
             node_id,
@@ -154,9 +149,8 @@ impl Credential {
 
     /// Get the credential's validity period in days.
     pub fn validity_days(&self) -> Option<u64> {
-        self.expires_at.map(|expires_at| {
-            (expires_at - self.issued_at).num_days() as u64
-        })
+        self.expires_at
+            .map(|expires_at| (expires_at - self.issued_at).num_days() as u64)
     }
 
     /// Encode the credential as hex for storage/display.
@@ -236,14 +230,8 @@ mod tests {
         let public_key = vec![1u8; 32];
         let expected_node_id = Sha256::digest(&public_key).to_vec();
 
-        let credential = Credential::new(
-            public_key.clone(),
-            vec![0u8; 64],
-            Utc::now(),
-            None,
-            None,
-        )
-        .unwrap();
+        let credential =
+            Credential::new(public_key.clone(), vec![0u8; 64], Utc::now(), None, None).unwrap();
 
         assert_eq!(credential.node_id, expected_node_id);
     }
@@ -257,14 +245,8 @@ mod tests {
     #[test]
     fn test_credential_node_id_integrity() {
         let public_key = vec![1u8; 32];
-        let credential = Credential::new(
-            public_key.clone(),
-            vec![0u8; 64],
-            Utc::now(),
-            None,
-            None,
-        )
-        .unwrap();
+        let credential =
+            Credential::new(public_key.clone(), vec![0u8; 64], Utc::now(), None, None).unwrap();
 
         assert!(credential.verify_node_id_integrity().is_ok());
     }
@@ -275,14 +257,8 @@ mod tests {
         let issued_at = Utc::now() - chrono::Duration::days(100);
         let expires_at = Utc::now() - chrono::Duration::days(50);
 
-        let credential = Credential::new(
-            public_key,
-            vec![0u8; 64],
-            issued_at,
-            Some(expires_at),
-            None,
-        )
-        .unwrap();
+        let credential =
+            Credential::new(public_key, vec![0u8; 64], issued_at, Some(expires_at), None).unwrap();
 
         assert!(credential.is_valid_now().is_err());
     }
@@ -290,14 +266,8 @@ mod tests {
     #[test]
     fn test_credential_hex_encoding() {
         let public_key = vec![1u8; 32];
-        let credential = Credential::new(
-            public_key,
-            vec![2u8; 64],
-            Utc::now(),
-            None,
-            None,
-        )
-        .unwrap();
+        let credential =
+            Credential::new(public_key, vec![2u8; 64], Utc::now(), None, None).unwrap();
 
         let hex = credential.to_hex();
         let decoded = Credential::from_hex(&hex).unwrap();

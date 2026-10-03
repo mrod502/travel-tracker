@@ -40,8 +40,7 @@ pub enum DeviceEvent {
     /// because the alternative is swallowing the report, and a swallowed report
     /// is indistinguishable at the consumer from the device having left the
     /// room. That is how a stationary beacon — stable RSSI, unchanged payload —
-    /// produced exactly one sighting and then silence
-    /// ([GAP_ANALYSIS B14](https://example.invalid/GAP_ANALYSIS.md#81-blocking)).
+    /// produced exactly one sighting and then silence (GAP_ANALYSIS B14).
     ///
     /// A backend's job is to deliver what the radio heard; deciding whether a
     /// sighting deserves a record is the consumer's policy, and a consumer that

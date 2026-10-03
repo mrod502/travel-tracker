@@ -34,6 +34,25 @@ pub struct ResolverConfig {
     pub max_identity_age: Duration,
     /// Scoring weights for different matching features.
     pub weights: ScoringWeights,
+    /// Minimum fraction of the designed model that must have had something to say
+    /// before an inference-based merge is allowed.
+    ///
+    /// `merge_threshold` says how much evidence a merge needs; this says how much
+    /// *evidence there could have been*. A feed that cannot see AD structures,
+    /// appearance or connectability has a lower ceiling than the one the thresholds
+    /// were written against, and without a floor here a merge decided on a third of
+    /// the designed model would look exactly like one decided on all of it.
+    ///
+    /// An exact address match is exempt: it identifies the device rather than
+    /// inferring it, so no amount of missing data makes it weaker.
+    pub min_evidence_ratio: f64,
+    /// Multiplier applied to points earned from a feature whose value stands in for
+    /// the designed datum ([`Datum::Derived`](crate::evidence::Datum::Derived)).
+    ///
+    /// `1.0` treats a proxy as the real thing; `0.0` ignores it. Half keeps derived
+    /// data useful — it corroborates other features — while making it unable to
+    /// carry a merge on its own.
+    pub derived_evidence_factor: f64,
     /// Maximum RSSI window size for rolling statistics.
     pub rssi_window_size: usize,
     /// Whether to enable debug logging for match decisions.
@@ -48,6 +67,8 @@ impl Default for ResolverConfig {
             matching_window: Duration::from_secs(60),
             max_identity_age: Duration::from_secs(300),
             weights: ScoringWeights::default(),
+            min_evidence_ratio: 0.35,
+            derived_evidence_factor: 0.5,
             rssi_window_size: 10,
             debug_logging: false,
         }
@@ -62,8 +83,9 @@ impl ResolverConfig {
 
     /// Sets the merge threshold score.
     ///
-    /// Observations scoring at or above this value will be merged with
-    /// an existing identity. Default is 120.0.
+    /// Observations scoring at or above this value are merged with an existing
+    /// identity, provided [`ResolverConfig::min_evidence_ratio`] is met as well.
+    /// Default is 40.0.
     pub fn with_merge_threshold(mut self, threshold: f64) -> Self {
         self.merge_threshold = threshold;
         self
@@ -71,8 +93,8 @@ impl ResolverConfig {
 
     /// Sets the possible match threshold (internal use).
     ///
-    /// Scores below this value are considered unlikely matches.
-    /// Default is 80.0.
+    /// Scores below this value are not candidates at all.
+    /// Default is 25.0.
     pub fn with_possible_threshold(mut self, threshold: f64) -> Self {
         self.possible_threshold = threshold;
         self
@@ -99,6 +121,23 @@ impl ResolverConfig {
     /// Sets the scoring weights.
     pub fn with_weights(mut self, weights: ScoringWeights) -> Self {
         self.weights = weights;
+        self
+    }
+
+    /// Sets the minimum coverage of the designed model an inference-based merge needs.
+    ///
+    /// See [`ResolverConfig::min_evidence_ratio`]. `0.0` restores the behaviour of
+    /// judging on the absolute score alone.
+    pub fn with_min_evidence_ratio(mut self, ratio: f64) -> Self {
+        self.min_evidence_ratio = ratio;
+        self
+    }
+
+    /// Sets how much a feature derived from a proxy datum is worth.
+    ///
+    /// See [`ResolverConfig::derived_evidence_factor`].
+    pub fn with_derived_evidence_factor(mut self, factor: f64) -> Self {
+        self.derived_evidence_factor = factor;
         self
     }
 
@@ -140,6 +179,8 @@ pub struct ResolverConfigBuilder {
     matching_window: Option<Duration>,
     max_identity_age: Option<Duration>,
     weights: Option<ScoringWeights>,
+    min_evidence_ratio: Option<f64>,
+    derived_evidence_factor: Option<f64>,
     rssi_window_size: Option<usize>,
     debug_logging: Option<bool>,
 }
@@ -180,6 +221,18 @@ impl ResolverConfigBuilder {
         self
     }
 
+    /// Sets the minimum coverage of the designed model an inference-based merge needs.
+    pub fn min_evidence_ratio(mut self, value: f64) -> Self {
+        self.min_evidence_ratio = Some(value);
+        self
+    }
+
+    /// Sets how much a feature derived from a proxy datum is worth.
+    pub fn derived_evidence_factor(mut self, value: f64) -> Self {
+        self.derived_evidence_factor = Some(value);
+        self
+    }
+
     /// Sets the RSSI window size.
     pub fn rssi_window_size(mut self, value: usize) -> Self {
         self.rssi_window_size = Some(value);
@@ -210,6 +263,12 @@ impl ResolverConfigBuilder {
         }
         if let Some(v) = self.weights {
             config.weights = v;
+        }
+        if let Some(v) = self.min_evidence_ratio {
+            config.min_evidence_ratio = v;
+        }
+        if let Some(v) = self.derived_evidence_factor {
+            config.derived_evidence_factor = v;
         }
         if let Some(v) = self.rssi_window_size {
             config.rssi_window_size = v;

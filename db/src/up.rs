@@ -1,28 +1,63 @@
-use crate::{MIGRATION_TIME_FMT, file_attrs::FileAttrs, registry, runner::Runner};
+use crate::{MIGRATION_TIME_FMT, exec, file_attrs::FileAttrs, registry, runner::Runner};
 use async_trait::async_trait;
 use chrono::{Local, NaiveDateTime};
 use clap::Args;
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
-use sqlx::{AssertSqlSafe, PgPool, Pool, Postgres};
-use std::{error::Error, fmt::Display, fs::File, io::Read, path::Path};
+use sqlx::PgPool;
+use std::{
+    error::Error,
+    fmt::Display,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 use walkdir::WalkDir;
-
-/// How far ahead the splitter looks for the closing `$` of a dollar-quote tag.
-/// Tags are short; anything longer is not a tag, and scanning the whole file
-/// for a stray `$` would make splitting quadratic.
-const DOLLAR_TAG_LOOKAHEAD: usize = 64;
 
 /// Months of `occurrences` partitions `db up` keeps provisioned beyond the
 /// current month. Matches the horizon the partition migration itself opens with.
 const PARTITION_HORIZON_MONTHS: i32 = 15;
 
-/// Suffix marking a migration's revert script (`<migration>.down.sql`).
+/// Suffix of the files that used to hold a migration's revert.
+///
+/// A revert now lives in the migration file's own `--migrate:down` block, so a
+/// file with this suffix is not a migration and not a revert — it is a second
+/// source of truth. See [`legacy_revert_scripts`].
 pub(crate) const DOWN_SUFFIX: &str = ".down.sql";
 
 /// Is this a revert script rather than a migration to apply?
 pub(crate) fn is_down_script(path: &Path) -> bool {
     path.to_str().is_some_and(|s| s.ends_with(DOWN_SUFFIX))
+}
+
+/// Every `*.down.sql` under `migrations_path`.
+///
+/// Reverting a migration used to mean a sidecar file beside it. The revert is a
+/// `--migrate:down` block inside the migration now, so a leftover sidecar is SQL
+/// nothing runs: either its statements already live in the file, in which case
+/// it is dead weight that will silently rot, or they do not, in which case the
+/// migration is irreversible and looks reversible. Neither is worth discovering
+/// during an incident, so both `db up` and `db down` refuse until it is dealt
+/// with.
+pub(crate) fn legacy_revert_scripts(migrations_path: &str) -> Vec<PathBuf> {
+    WalkDir::new(migrations_path)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.into_path())
+        .filter(|path| is_down_script(path))
+        .collect()
+}
+
+/// The refusal both directions share, naming every file that has to go.
+pub(crate) fn legacy_revert_scripts_message(found: &[PathBuf]) -> String {
+    let list: Vec<String> = found
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    format!(
+        "found legacy revert script(s): {}. A revert is now a --migrate:down block inside the \
+         migration itself; move these statements into that block and delete the sidecar \
+         (see db/src/migrations/README.md).",
+        list.join(", ")
+    )
 }
 
 /// Locations `db` tries when `--migrations-path` is not given, relative to the
@@ -193,6 +228,10 @@ impl Runner for UpArgs {
         log::info!("running:{:?}", self);
 
         let migrations_path = resolve_migrations_path(&self.migrations_path)?;
+        let stale = legacy_revert_scripts(&migrations_path);
+        if !stale.is_empty() {
+            return Err(MigrationError::new(legacy_revert_scripts_message(&stale)));
+        }
         registry::ensure_registry(conn, &migrations_path).await?;
 
         let latest_migration = registry::latest_applied(conn).await?;
@@ -206,12 +245,8 @@ impl Runner for UpArgs {
                     Err(_) => return None,
                 };
                 let pth = de.clone().into_path();
-                let Some(ext) = pth.extension() else {
-                    return None;
-                };
-                let Some(ext_str) = ext.to_str() else {
-                    return None;
-                };
+                let ext = pth.extension()?;
+                let ext_str = ext.to_str()?;
                 if ext_str != "sql" || is_down_script(&pth) {
                     return None;
                 }
@@ -233,7 +268,20 @@ impl Runner for UpArgs {
         }
         if self.dry_run {
             for mig in &migrations_to_run {
-                println!("would apply {}", mig.full_path.display());
+                // Parsed here rather than printed blind: a dry run that cannot
+                // describe the statements it would run has nothing to report.
+                let migration = exec::parse_migration(&mig.full_path)?;
+                let outside = migration.skip_tx_statements().len();
+                let outside_note = if outside == 0 {
+                    String::new()
+                } else {
+                    format!(", {outside} outside the transaction")
+                };
+                println!(
+                    "would apply {} ({} statement(s){outside_note})",
+                    mig.full_path.display(),
+                    migration.up.len()
+                );
             }
             log::info!(
                 "dry run: {} migration(s) would be applied, nothing changed",
@@ -295,216 +343,24 @@ impl UpArgs {
         Ok(())
     }
 
-    async fn apply_migration(
-        &self,
-        attrs: FileAttrs,
-        conn: &Pool<Postgres>,
-    ) -> Result<(), MigrationError> {
-        log::info!("attrs:{:?}", attrs);
-        let mut tx = match conn.begin().await {
-            Ok(t) => t,
-            Err(e) => return Err(MigrationError::new_from("failed to begin tx", e)),
-        };
-
-        // Read file outside of transaction (file I/O doesn't need transaction)
-        let migration = read_migration_file(&attrs.full_path)?;
-
-        // Register migration in the transaction
-        let reg_result = registry::record_applied(&mut tx, &attrs.name, attrs.created_at).await;
-        if reg_result.is_err() {
-            let _ = tx.rollback().await;
-            return Err(MigrationError::new("failed to register migration"));
-        }
-
-        let statements = Self::split_query(&migration);
-
-        for statement in statements {
-            if statement.trim().is_empty() {
-                continue;
-            }
-            let exec_result = sqlx::query(AssertSqlSafe(statement.clone()))
-                .execute(&mut *tx)
-                .await;
-
-            if let Err(e) = exec_result {
-                let _ = tx.rollback().await;
-                log::error!("migration failed: {}", statement);
-                return Err(MigrationError::new_from(
-                    "failed to execute migration statement",
-                    e,
-                ));
-            }
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| MigrationError::new_from("failed to commit migration", e))
-    }
-    pub(crate) fn split_query(q: &str) -> Vec<String> {
-        let dialect = PostgreSqlDialect {};
-        match Parser::parse_sql(&dialect, q) {
-            Ok(statements) => {
-                // sqlparser succeeded - use its output
-                // It correctly handles: semicolons in strings/comments, dollar-quoted strings,
-                // complex PostgreSQL syntax, etc.
-                // Note: sqlparser normalizes output (removes comments, standardizes formatting)
-                // but this is fine for execution - the semantics are preserved.
-                statements
-                    .into_iter()
-                    .map(|stmt| stmt.to_string())
-                    .collect()
-            }
-            Err(e) => {
-                log::info!(
-                    "sqlparser failed (expected for some PostgreSQL syntax): {}, using fallback",
-                    e
-                );
-                // Fallback to smart split that handles comments and string literals
-                Self::smart_split_queries(q)
-            }
-        }
-    }
-
-    /// Smart SQL splitting that respects comments and string literals
-    /// Falls back to this when sqlparser fails
-    fn smart_split_queries(sql: &str) -> Vec<String> {
-        let mut statements = Vec::new();
-        let mut current = String::new();
-        let mut chars = sql.chars().peekable();
-        let mut in_line_comment = false;
-        let mut in_block_comment = false;
-        let mut in_single_quote = false;
-        let mut in_dollar_quote = false;
-        let mut dollar_delim = String::new();
-
-        while let Some(c) = chars.next() {
-            // Handle state transitions
-            if in_line_comment {
-                current.push(c);
-                if c == '\n' {
-                    in_line_comment = false;
-                }
-                continue;
-            }
-
-            if in_block_comment {
-                current.push(c);
-                if c == '*' && chars.peek() == Some(&'/') {
-                    chars.next(); // consume '/'
-                    current.push('/');
-                    in_block_comment = false;
-                }
-                continue;
-            }
-
-            if in_dollar_quote {
-                current.push(c);
-                // The opening delimiter is already in `current`, so the body
-                // ends where a '$' is followed by the rest of that same
-                // delimiter (`$` for `$$`, `fn$` for `$fn$`).
-                if c == '$' && !dollar_delim.is_empty() {
-                    let tail = &dollar_delim[1..];
-                    let tail_len = tail.chars().count();
-                    let rest: String = chars.clone().take(tail_len).collect();
-                    if rest == tail {
-                        let close_tag: String = chars.by_ref().take(tail_len).collect();
-                        current.push_str(&close_tag);
-                        in_dollar_quote = false;
-                        dollar_delim.clear();
-                    }
-                }
-                continue;
-            }
-
-            if in_single_quote {
-                current.push(c);
-                if c == '\'' {
-                    // Check for escaped quote ('')
-                    if chars.peek() == Some(&'\'') {
-                        current.push(chars.next().unwrap());
-                    } else {
-                        in_single_quote = false;
-                    }
-                }
-                continue;
-            }
-
-            // Normal mode - check for special sequences
-            match c {
-                '-' if chars.peek() == Some(&'-') => {
-                    in_line_comment = true;
-                    current.push(c);
-                    current.push(chars.next().unwrap()); // consume second '-'
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    in_block_comment = true;
-                    current.push(c);
-                    current.push(chars.next().unwrap()); // consume '*'
-                }
-                '$' => {
-                    // The leading '$' is consumed; the lookahead decides
-                    // whether this opens a quoted body or is just a '$' (a
-                    // positional parameter such as `$1` never opens one).
-                    let lookahead: String = chars.clone().take(DOLLAR_TAG_LOOKAHEAD).collect();
-                    if let Some(delim) = Self::opening_dollar_delimiter(&lookahead) {
-                        let rest_len = delim.chars().count() - 1;
-                        let rest: String = chars.by_ref().take(rest_len).collect();
-                        current.push(c);
-                        current.push_str(&rest);
-                        dollar_delim = delim;
-                        in_dollar_quote = true;
-                        continue;
-                    }
-                    current.push(c);
-                }
-                '\'' => {
-                    in_single_quote = true;
-                    current.push(c);
-                }
-                ';' => {
-                    // End of statement
-                    if !current.trim().is_empty() {
-                        statements.push(current.clone());
-                        current.clear();
-                    }
-                }
-                _ => {
-                    current.push(c);
-                }
-            }
-        }
-
-        // Don't forget the last statement
-        if !current.trim().is_empty() {
-            statements.push(current);
-        }
-
-        statements
-    }
-
-    /// The full `$…$` delimiter of an opening dollar quote, given the text
-    /// immediately after the leading `$` (which the caller already consumed).
+    /// Apply one migration: the file's `up` statements and its registry row,
+    /// committed together.
     ///
-    /// PostgreSQL tags are empty or `[A-Za-z_][A-Za-z0-9_]*`. A tag that starts
-    /// with a digit is not a tag, which is exactly what distinguishes the body
-    /// of `AS $fn$ … $fn$` from the positional parameter `$1`.
-    fn opening_dollar_delimiter(lookahead: &str) -> Option<String> {
-        let bytes = lookahead.as_bytes();
-        if bytes.first().is_some_and(u8::is_ascii_digit) {
-            return None;
-        }
-
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'$' => return Some(format!("${}", &lookahead[..=i])),
-                b'A'..=b'Z' | b'a'..=b'z' | b'_' => i += 1,
-                b'0'..=b'9' if i > 0 => i += 1,
-                _ => return None,
-            }
-        }
-
-        None
+    /// The file is parsed here, as it is applied, rather than at discovery —
+    /// the statements that run are the ones in the file on disk, and a file
+    /// that cannot be parsed stops before it touches the database.
+    async fn apply_migration(&self, attrs: FileAttrs, conn: &PgPool) -> Result<(), MigrationError> {
+        log::info!("applying {} as {}", attrs.full_path.display(), attrs.name);
+        let migration = exec::parse_migration(&attrs.full_path)?;
+        exec::apply_group(
+            conn,
+            &migration.up,
+            exec::Bookkeeping::Record {
+                name: &attrs.name,
+                created_at: attrs.created_at,
+            },
+        )
+        .await
     }
 }
 
@@ -596,243 +452,17 @@ mod tests {
     }
 
     // ========================================================================
-    // Query splitting tests
+    // Statement splitting
     // ========================================================================
-
-    #[test]
-    fn test_split_query_simple() {
-        let query = "SELECT 1; SELECT 2;";
-        let result = UpArgs::split_query(query);
-
-        // sqlparser correctly parses two statements
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], "SELECT 1");
-        assert_eq!(result[1], "SELECT 2");
-    }
-
-    #[test]
-    fn test_split_query_with_empty_statements() {
-        let query = "SELECT 1;; SELECT 2;";
-        let result = UpArgs::split_query(query);
-
-        // sqlparser correctly ignores empty statements (consecutive semicolons)
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], "SELECT 1");
-        assert_eq!(result[1], "SELECT 2");
-    }
-
-    #[test]
-    fn test_split_query_empty_input() {
-        let query = "";
-        let result = UpArgs::split_query(query);
-
-        // sqlparser returns empty vector for empty input
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_split_query_single_statement_no_semicolon() {
-        let query = "CREATE TABLE test (id INT)";
-        let result = UpArgs::split_query(query);
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], "CREATE TABLE test (id INT)");
-    }
-
-    #[test]
-    fn test_split_query_with_comments() {
-        let query = "-- comment\nSELECT 1; -- another comment";
-        let result = UpArgs::split_query(query);
-
-        // sqlparser strips comments but correctly ignores semicolons within them
-        assert_eq!(result.len(), 1);
-        assert!(result[0].contains("SELECT 1"));
-    }
-
-    #[test]
-    fn test_split_query_with_semicolon_in_string() {
-        let query = "INSERT INTO test VALUES ('a; b');";
-        let result = UpArgs::split_query(query);
-
-        // With sqlparser, semicolons inside strings are handled correctly
-        assert_eq!(
-            result.len(),
-            1,
-            "Should handle semicolons in string literals"
-        );
-        assert!(result[0].contains("INSERT INTO test VALUES"));
-        assert!(result[0].contains("a; b"));
-    }
-
-    #[test]
-    fn test_split_query_with_semicolon_in_comment() {
-        let query = "-- this is; a comment\nSELECT 1;";
-        let result = UpArgs::split_query(query);
-
-        // sqlparser strips comments but correctly handles semicolons in them
-        assert_eq!(
-            result.len(),
-            1,
-            "Semicolons in comments should not split statements"
-        );
-        assert!(result[0].contains("SELECT 1"));
-    }
-
-    #[test]
-    fn test_split_query_with_semicolon_in_block_comment() {
-        let query = "/* this; is; a; comment */ SELECT 1;";
-        let result = UpArgs::split_query(query);
-
-        // sqlparser strips comments but correctly handles semicolons in them
-        assert_eq!(
-            result.len(),
-            1,
-            "Semicolons in block comments should not split statements"
-        );
-        assert!(result[0].contains("SELECT 1"));
-    }
-
-    #[test]
-    fn test_split_query_dollar_quoted_strings() {
-        let query = r#"CREATE FUNCTION test() AS $$ SELECT 'a; b'; $$ LANGUAGE sql;"#;
-        let result = UpArgs::split_query(query);
-
-        // With sqlparser, dollar-quoted strings are handled correctly
-        assert_eq!(result.len(), 1, "Should handle dollar-quoted strings");
-        assert!(result[0].contains("CREATE FUNCTION"));
-    }
-
-    /// The fallback splitter is the one that actually runs on plpgsql bodies —
-    /// sqlparser rejects them — so it has to keep a tagged body in one piece.
-    /// It previously recognised `$$` but not `$fn$`, and split the body on its
-    /// inner semicolons, producing "unterminated dollar-quoted string".
-    #[test]
-    fn fallback_splitter_keeps_a_tagged_dollar_body_in_one_statement() {
-        let query = r#"
-CREATE OR REPLACE FUNCTION make_months(n integer) RETURNS integer LANGUAGE plpgsql AS $fn$
-DECLARE
-    i integer;
-    total integer := 0;
-BEGIN
-    FOR i IN 0..n LOOP
-        total := total + i;
-    END LOOP;
-    RETURN total;
-END;
-$fn$;
-
-SELECT make_months(3);
-"#;
-        let statements = UpArgs::smart_split_queries(query);
-
-        // The splitter drops the terminating `;`, so compare against the body.
-        assert_eq!(statements.len(), 2, "body must not split: {statements:#?}");
-        assert!(statements[0].trim_end().ends_with("$fn$"));
-        assert!(statements[0].contains("RETURN total;"));
-        assert_eq!(statements[1].trim(), "SELECT make_months(3)");
-    }
-
-    #[test]
-    fn fallback_splitter_closes_an_untagged_dollar_body() {
-        let query = "COMMENT ON TABLE nodes IS $$who\nsigned it; nobody$$;\nSELECT 1;";
-        let statements = UpArgs::smart_split_queries(query);
-
-        assert_eq!(
-            statements.len(),
-            2,
-            "body must not swallow the next statement: {statements:#?}"
-        );
-        assert!(statements[0].trim_end().ends_with("$$"));
-        assert_eq!(statements[1].trim(), "SELECT 1");
-    }
-
-    /// `$1` looks like the start of a tag and is not one: treating it as one
-    /// would glue every following statement into a phantom quoted body.
-    #[test]
-    fn fallback_splitter_does_not_open_a_dollar_body_on_a_parameter() {
-        let query = "INSERT INTO t (a, b) VALUES ($1, $2);\nSELECT a FROM t;";
-        let statements = UpArgs::smart_split_queries(query);
-
-        assert_eq!(statements.len(), 2, "{statements:#?}");
-    }
-
-    #[test]
-    fn fallback_splitter_keeps_the_partition_migration_whole() {
-        let sql = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/migrations/202609021200_partition_occurrences_forward.sql"
-        ))
-        .expect("partition migration should be readable");
-
-        let statements = UpArgs::smart_split_queries(&sql)
-            .into_iter()
-            .filter(|s| !s.trim().is_empty())
-            .collect::<Vec<_>>();
-
-        assert_eq!(statements.len(), 3, "{statements:#?}");
-        assert!(statements[0].contains("CREATE OR REPLACE FUNCTION ensure_occurrence_partitions"));
-        assert!(statements[0].trim_end().ends_with("$fn$"));
-        assert!(
-            statements[1]
-                .trim_start()
-                .starts_with("COMMENT ON FUNCTION")
-        );
-        assert!(statements[2].contains("SELECT ensure_occurrence_partitions(15)"));
-    }
-
-    #[test]
-    fn test_split_query_semicolon_in_comment_issue() {
-        // This is the exact issue that was causing create_bluetooth_occurrences.sql to fail
-        // The comment "-- Node identification (origin only; relay tracking" contains a semicolon
-        let query = r#"
-CREATE TABLE test (
-    id INT,
-    -- This is a comment with a semicolon; in it
-    name TEXT
-);
-        "#;
-        let result = UpArgs::split_query(query);
-
-        // Should produce exactly 1 statement, not split on the semicolon in the comment
-        let non_empty: Vec<&String> = result.iter().filter(|s| !s.trim().is_empty()).collect();
-        assert_eq!(
-            non_empty.len(),
-            1,
-            "Should not split on semicolon in comment"
-        );
-        assert!(non_empty[0].contains("CREATE TABLE"));
-        assert!(non_empty[0].contains("name TEXT"));
-    }
-
-    #[test]
-    fn test_split_query_semicolon_in_line_comment() {
-        // Test that smart_split_queries handles semicolons in line comments
-        let query = "-- comment with; semicolon\nSELECT 1;";
-        let result = UpArgs::split_query(query);
-
-        // Should produce exactly 1 statement
-        let non_empty: Vec<&String> = result.iter().filter(|s| !s.trim().is_empty()).collect();
-        assert_eq!(
-            non_empty.len(),
-            1,
-            "Semicolon in line comment should not split"
-        );
-        assert!(non_empty[0].contains("SELECT 1"));
-    }
-
-    #[test]
-    fn test_split_query_filters_empty_statements() {
-        // Verify that the migration runner correctly handles empty statements
-        // With sqlparser, empty statements are already filtered out
-        let query = "SELECT 1;; SELECT 2;";
-        let statements = UpArgs::split_query(query);
-
-        let non_empty: Vec<&String> = statements.iter().filter(|s| !s.trim().is_empty()).collect();
-
-        assert_eq!(non_empty.len(), 2);
-        assert_eq!(non_empty[0], "SELECT 1");
-        assert_eq!(non_empty[1], "SELECT 2"); // sqlparser trims whitespace
-    }
+    //
+    // `db` used to split each file itself: `sqlparser` first, a hand-written
+    // scanner where that gave up (plpgsql bodies, `DROP EXTENSION`, `uuidv7()`
+    // generated columns). Both are gone. `db::Lexer` is the only splitter now and
+    // it knows no dialect, so the behaviour these tests pinned down is covered
+    // where it now lives: `db/src/lex/mod.rs` for strings, comments, dollar
+    // quotes and `$1`; `db/tests/parse_migration_file.rs` for every committed
+    // migration file; `db/src/exec.rs` for which of those statements run inside
+    // the transaction.
 
     // ========================================================================
     // File reading tests
@@ -942,6 +572,47 @@ CREATE TABLE test (
         assert!(!is_down_script(Path::new("202607312146_create_nodes.sql")));
     }
 
+    /// A `*.down.sql` left behind is SQL nothing runs: the revert it holds is
+    /// either duplicated inside the migration or lost entirely. Finding one has
+    /// to be loud.
+    #[test]
+    fn legacy_revert_scripts_are_found_and_named() {
+        let dir = std::env::temp_dir().join("db_up_legacy_sidecars");
+        std::fs::create_dir_all(&dir).expect("temp dir is writable");
+        std::fs::write(dir.join("202601010000_things.sql"), "SELECT 1;").unwrap();
+        std::fs::write(
+            dir.join("202601010000_things.down.sql"),
+            "DROP TABLE things;",
+        )
+        .unwrap();
+
+        let found = legacy_revert_scripts(dir.to_str().unwrap());
+        assert_eq!(found.len(), 1, "the migration itself is not one: {found:?}");
+        assert!(found[0].ends_with("202601010000_things.down.sql"));
+
+        let message = legacy_revert_scripts_message(&found);
+        assert!(message.contains("202601010000_things.down.sql"));
+        assert!(
+            message.contains("--migrate:down"),
+            "the refusal has to say what to do instead: {message}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The shape the runner expects — one file per migration, revert inside it —
+    /// must not be flagged.
+    #[test]
+    fn a_directory_of_migrations_alone_is_not_flagged() {
+        let dir = std::env::temp_dir().join("db_up_no_sidecars");
+        std::fs::create_dir_all(&dir).expect("temp dir is writable");
+        std::fs::write(dir.join("202601010000_things.sql"), "SELECT 1;").unwrap();
+
+        assert!(legacy_revert_scripts(dir.to_str().unwrap()).is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // ========================================================================
     // FileAttrs ordering tests
     // ========================================================================
@@ -1003,175 +674,16 @@ CREATE TABLE test (
     }
 
     // ========================================================================
-    // Migration atomicity tests (unit-level, not integration)
+    // Migration atomicity
     // ========================================================================
-
-    #[test]
-    fn test_split_query_preserves_statement_boundaries() {
-        // Test that statements are properly delimited
-        let multi_statement = r#"
-CREATE TABLE users (id INT);
-CREATE INDEX idx_users_id ON users(id);
-INSERT INTO users VALUES (1);
-        "#;
-
-        let statements = UpArgs::split_query(multi_statement);
-
-        // Filter out empty statements
-        let non_empty: Vec<&String> = statements.iter().filter(|s| !s.trim().is_empty()).collect();
-
-        assert_eq!(non_empty.len(), 3);
-        assert!(non_empty[0].contains("CREATE TABLE"));
-        assert!(non_empty[1].contains("CREATE INDEX"));
-        assert!(non_empty[2].contains("INSERT"));
-    }
-
-    #[test]
-    fn test_split_query_fallback_on_parse_error() {
-        // Test that fallback to simple split works when sqlparser fails
-        // This can happen with PostgreSQL extensions or non-standard syntax
-        let query = "SELECT * FROM h3_to_string(123);"; // H3 function - may not parse
-
-        let result = UpArgs::split_query(query);
-
-        // Should return at least something (either parsed or fallback)
-        assert!(!result.is_empty(), "Should always return some statements");
-        assert!(result.iter().any(|s| s.contains("SELECT")));
-    }
-
-    #[test]
-    fn test_split_query_with_complex_postgres_syntax() {
-        // Test with PostgreSQL syntax that sqlparser may struggle with:
-        // - GENERATED ALWAYS AS (function call) STORED
-        // - UUIDV7() function
-        // - Complex table definitions
-        let query = r#"
-CREATE TABLE test_table (
-    id UUID NOT NULL DEFAULT uuidv7(),
-    data JSONB NOT NULL DEFAULT '{}',
-    computed_col TEXT GENERATED ALWAYS AS (upper(data::text)) STORED
-);
-CREATE INDEX idx_test ON test_table USING GIN (data);
-INSERT INTO test_table (data) VALUES ('{"key": "value"}');
-        "#;
-
-        let result = UpArgs::split_query(query);
-
-        // Should return at least something (either parsed or fallback)
-        assert!(!result.is_empty(), "Should always return some statements");
-
-        // Filter empty statements for counting
-        let non_empty: Vec<&String> = result.iter().filter(|s| !s.trim().is_empty()).collect();
-        assert_eq!(non_empty.len(), 3, "Should have 3 statements");
-    }
-
-    #[test]
-    fn test_split_query_long_migration_file() {
-        // Test with a long migration file similar to create_bluetooth_occurrences.sql
-        let query = r#"
--- Complex table with generated columns
-CREATE TABLE occurrences (
-    occurrence_id UUID NOT NULL DEFAULT uuidv7(),
-    signal_type TEXT NOT NULL,
-    location GEOGRAPHY(POINT, 4326),
-    geo_cell H3INDEX GENERATED ALWAYS AS (h3_latlng_to_cell(ST_Force2D(location::geometry), 9)) STORED,
-    signed_payload BYTEA NOT NULL,
-    schema_version SMALLINT NOT NULL DEFAULT 1,
-    PRIMARY KEY (occurrence_id, observed_at)
-) PARTITION BY RANGE (observed_at);
-
--- Create partition
-CREATE TABLE occurrences_2026_07 PARTITION OF occurrences
-    FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
-
--- Create indexes
-CREATE INDEX idx_occurrences_geo_cell ON occurrences (geo_cell);
-CREATE INDEX idx_occurrences_signal_type ON occurrences (signal_type);
-
--- Add comments
-COMMENT ON TABLE occurrences IS 'Append-only occurrence data';
-        "#;
-
-        let result = UpArgs::split_query(query);
-
-        // Should handle this successfully (either via sqlparser or fallback)
-        assert!(!result.is_empty(), "Should always return some statements");
-
-        let non_empty: Vec<&String> = result.iter().filter(|s| !s.trim().is_empty()).collect();
-        assert!(
-            non_empty.len() >= 5,
-            "Should have at least 5 statements, got {}",
-            non_empty.len()
-        );
-    }
-
-    #[test]
-    fn test_split_query_handles_uuidv7_and_generated_columns() {
-        // This tests specific PostgreSQL syntax from the bluetooth_occurrences migration
-        // that sqlparser version 0.51 may struggle with
-        let query = r#"
-CREATE TABLE test_occurrences (
-    occurrence_id UUID NOT NULL DEFAULT uuidv7(),
-    geo_cell H3INDEX GENERATED ALWAYS AS (h3_latlng_to_cell(ST_Force2D(location::geometry), 9)) STORED
-);
-        "#;
-
-        let result = UpArgs::split_query(query);
-
-        // sqlparser may fail on uuidv7() or GENERATED ALWAYS AS with function calls
-        // In that case, fallback to simple split should work
-        assert!(!result.is_empty(), "Should always return some statements");
-
-        let non_empty: Vec<&String> = result.iter().filter(|s| !s.trim().is_empty()).collect();
-        assert_eq!(
-            non_empty.len(),
-            1,
-            "Should have exactly 1 CREATE TABLE statement"
-        );
-        assert!(non_empty[0].contains("CREATE TABLE"));
-    }
-
-    #[test]
-    fn test_split_query_actual_migration_file() {
-        // Test parsing the actual create_bluetooth_occurrences.sql migration
-        // This validates that the SQL parser handles real-world migration files
-        let migration_path =
-            PathBuf::from("src/migrations/202607312147_create_bluetooth_occurrences.sql");
-
-        // Skip test if migration file doesn't exist (e.g., running from different directory)
-        if !migration_path.exists() {
-            return;
-        }
-
-        let sql_content =
-            read_migration_file(&migration_path).expect("Failed to read migration file");
-        let statements = UpArgs::split_query(&sql_content);
-
-        // Should always return some statements (either via sqlparser or fallback)
-        assert!(
-            !statements.is_empty(),
-            "Should always return some statements"
-        );
-
-        // Filter empty statements
-        let non_empty: Vec<&String> = statements.iter().filter(|s| !s.trim().is_empty()).collect();
-
-        // The migration file has at least: CREATE TABLE occurrences, CREATE TABLE occurrence_relays,
-        // CREATE TABLE partitions (2), CREATE INDEXes, COMMENTs = ~10+ statements
-        assert!(
-            non_empty.len() >= 5,
-            "Should have at least 5 statements, got {}",
-            non_empty.len()
-        );
-
-        // Verify we got the main CREATE TABLE statement
-        assert!(
-            non_empty
-                .iter()
-                .any(|s| s.contains("CREATE TABLE occurrences")),
-            "Should contain CREATE TABLE occurrences"
-        );
-    }
+    //
+    // What used to sit here tested the splitter against the PostgreSQL
+    // constructs that defeated it: `uuidv7()` defaults, `GENERATED ALWAYS AS
+    // (fn(x)) STORED`, `H3INDEX`, `USING GIN`, an extension's own function
+    // names. The lexer has no parser to defeat, so those inputs are covered as
+    // ordinary statement text in db/tests/parse_migration_file.rs, and what
+    // "atomic" actually means — the group and its registry row committing
+    // together, and `skipTx` being the one way out — is tested in db/src/exec.rs.
 
     // ========================================================================
     // Error handling tests

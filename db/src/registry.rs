@@ -9,9 +9,10 @@
 //! Every write goes through a `Transaction`, because a migration and the row
 //! recording it must commit or roll back together.
 
-use crate::up::{MigrationError, UpArgs, parse_file_name, read_migration_file};
+use crate::exec::{self, Bookkeeping};
+use crate::up::{MigrationError, parse_file_name};
 use chrono::{DateTime, Local, TimeZone};
-use sqlx::{AssertSqlSafe, Executor, Pool, Postgres, Row, Transaction};
+use sqlx::{AssertSqlSafe, Pool, Postgres, Row, Transaction};
 use std::path::Path;
 
 /// The migration that creates the registry. Its `name` as recorded in the
@@ -78,23 +79,21 @@ pub(crate) async fn ensure_registry(
         return Ok(());
     }
 
-    let ddl = read_migration_file(&Path::new(migrations_path).join(REGISTRY_FILE))?;
-    let mut tx = conn
-        .begin()
-        .await
-        .map_err(|e| MigrationError::new_from("failed to begin tx", e))?;
-    for statement in UpArgs::split_query(&ddl) {
-        if statement.trim().is_empty() {
-            continue;
-        }
-        tx.execute(AssertSqlSafe(statement.clone()))
-            .await
-            .map_err(|e| MigrationError::new_from("failed to create the migrations registry", e))?;
-    }
-    record_applied(&mut tx, &attrs.name, attrs.created_at).await?;
-    tx.commit()
-        .await
-        .map_err(|e| MigrationError::new_from("failed to commit tx", e))?;
+    // The registry is created by applying its own migration, through the same
+    // path every other migration takes: statements plus the row that records
+    // them, one commit. The row is written last, which is the only order that
+    // can work when the table creating it is in the same transaction.
+    let path = Path::new(migrations_path).join(REGISTRY_FILE);
+    let migration = exec::parse_migration(&path)?;
+    exec::apply_group(
+        conn,
+        &migration.up,
+        Bookkeeping::Record {
+            name: &attrs.name,
+            created_at: attrs.created_at,
+        },
+    )
+    .await?;
     log::info!("created the migrations registry from {REGISTRY_FILE}");
     Ok(())
 }
@@ -213,18 +212,20 @@ mod tests {
     }
 
     /// Bootstrapping is the one migration path that has to work on a database
-    /// with nothing in it, so it must not depend on the fallback splitter —
-    /// which only runs when `sqlparser` gives up, and which re-renders the
-    /// statement rather than running the file as written.
+    /// with nothing in it, so its file must parse as a migration and must not
+    /// ask to leave the transaction: the table and the row recording it have to
+    /// commit together.
     #[test]
-    fn registry_migration_parses_without_the_fallback_splitter() {
+    fn registry_migration_is_a_migration_that_fits_one_transaction() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations");
-        let sql = read_migration_file(&dir.join(REGISTRY_FILE)).unwrap();
+        let migration =
+            exec::parse_migration(&dir.join(REGISTRY_FILE)).expect("registry file must parse");
 
-        let parsed =
-            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, &sql)
-                .expect("registry bootstrap must parse with sqlparser");
-        assert_eq!(parsed.len(), 2, "{parsed:#?}");
+        assert_eq!(migration.up.len(), 2, "{:?}", migration.up.statements);
+        assert!(
+            migration.skip_tx_statements().is_empty(),
+            "the registry cannot be created outside the transaction that records it"
+        );
     }
 
     /// The name recorded for the registry is derived from the file name, so a

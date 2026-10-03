@@ -1,24 +1,31 @@
 //! `db down` — revert migrations — and `db reset` — destroy and re-apply.
 //!
 //! These are two different operations and deliberately have two argument
-//! types. `down` runs each migration's own `<name>.down.sql` in reverse order,
-//! one transaction per migration, and removes that migration's registry row.
-//! `reset` drops the schema and replays everything; it takes no `--number`,
+//! types. `down` runs each migration's own `--migrate:down` block in reverse
+//! order, one transaction per migration, and removes that migration's registry
+//! row. `reset` drops the schema and replays everything; it takes no `--number`,
 //! because an argument it could not honour would just be a lie.
+//!
+//! A revert lives in the file it reverts, so `down` reads exactly the same files
+//! `up` does and a migration cannot have a revert nobody kept in sync with it.
+//! A migration whose file declares no down block has no revert path, and naming
+//! it is more use than quietly skipping it.
 //!
 //! The registry created by `202607312100_create_migrations_registry.sql` is
 //! the floor of `down`: reverting it would delete the record of what is
 //! applied, so it is skipped rather than reverted.
 
+use crate::exec::{self, Bookkeeping};
 use crate::registry::{self, AppliedMigration};
 use crate::runner::Runner;
 use crate::up::{
-    DOWN_SUFFIX, MigrationError, UpArgs, is_down_script, parse_file_name, read_migration_file,
+    MigrationError, UpArgs, legacy_revert_scripts, legacy_revert_scripts_message, parse_file_name,
     resolve_migrations_path,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Local};
 use clap::Args;
+use db::StatementGroup;
 use sqlx::{AssertSqlSafe, Executor, Pool, Postgres, Row};
 use std::collections::HashMap;
 use std::error::Error;
@@ -26,14 +33,20 @@ use std::fmt::Display;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
-/// One migration queued for revert, with the script that reverts it.
+/// One migration queued for revert, with the statements that revert it.
+///
+/// The down block is parsed while planning, so a dry run reports the revert it
+/// would actually run and an unparseable file stops the plan before anything is
+/// dropped.
 #[derive(Debug)]
 struct RevertPlan {
     name: String,
     /// When the migration was authored, per its file name.
     authored_at: DateTime<Local>,
-    script: PathBuf,
-    /// True when the script only drops things, so running it loses data.
+    /// The migration file the revert came from.
+    file: PathBuf,
+    down: StatementGroup,
+    /// True when the revert drops things, so running it loses data.
     destroys_data: bool,
 }
 
@@ -180,10 +193,12 @@ impl Runner for DownArgs {
                     ""
                 };
                 println!(
-                    "would revert {} (from {}, via {}){}",
+                    "would revert {} (from {}, {} statement(s) from the --migrate:down block in \
+                     {}){}",
                     step.name,
                     step.authored_at.format("%Y%m%d%H%M"),
-                    step.script
+                    step.down.len(),
+                    step.file
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("?"),
@@ -204,20 +219,28 @@ impl Runner for DownArgs {
     }
 }
 
-/// Pair each applied migration with its revert script, newest first.
+/// Pair each applied migration with the revert its own file declares, newest
+/// first.
 ///
-/// Refuses to produce a partial plan: if any selected migration has no script,
-/// naming it is more useful than quietly reverting the ones that do.
+/// Refuses to produce a partial plan. A migration whose file has disappeared,
+/// or declares no `--migrate:down` block, is named — together with every other
+/// such migration — rather than quietly reverting the ones that can be reverted,
+/// because a half-reverted schema is not a state anybody asked for.
 fn plan_reverts(
     applied: Vec<AppliedMigration>,
     migrations_path: &str,
 ) -> Result<Vec<RevertPlan>, DownError> {
-    let scripts = discover_down_scripts(migrations_path)?;
+    let stale = legacy_revert_scripts(migrations_path);
+    if !stale.is_empty() {
+        return Err(DownError::new(legacy_revert_scripts_message(&stale)));
+    }
+
+    let files = discover_migrations(migrations_path)?;
     let mut plan = Vec::new();
-    let mut missing = Vec::new();
+    let mut unrevertible = Vec::new();
 
     for applied in applied {
-        // The registry is the floor: it has no revert script by design.
+        // The registry is the floor: it has no revert by design.
         if applied.name == registry_name() {
             log::debug!(
                 "{} is the floor of db down; not a revert candidate",
@@ -225,67 +248,78 @@ fn plan_reverts(
             );
             continue;
         }
-        match scripts.get(&applied.name) {
-            Some(script) => plan.push(RevertPlan {
-                name: applied.name,
-                authored_at: applied.created_at,
-                destroys_data: destroys_data(script)?,
-                script: script.clone(),
-            }),
-            None => missing.push(applied.name),
-        }
+
+        let Some(file) = files.get(&applied.name) else {
+            unrevertible.push(format!(
+                "{} (its file is not in {migrations_path})",
+                applied.name
+            ));
+            continue;
+        };
+
+        let migration = exec::parse_migration(file)
+            .map_err(|e| DownError::new_from(format!("cannot revert '{}'", applied.name), e))?;
+        // `down` is `None` only when the file declares no revert at all: a
+        // declared-but-empty block is rejected while parsing, so a planned step
+        // always has at least one statement to run.
+        let Some(down) = migration.down else {
+            unrevertible.push(format!(
+                "{} (no --migrate:down block in {})",
+                applied.name,
+                file.display()
+            ));
+            continue;
+        };
+
+        plan.push(RevertPlan {
+            name: applied.name,
+            authored_at: applied.created_at,
+            destroys_data: destroys_data(&down),
+            file: file.clone(),
+            down,
+        });
     }
 
-    if !missing.is_empty() {
+    if !unrevertible.is_empty() {
         return Err(DownError::new(format!(
-            "no revert script for: {}. Write {name}.down.sql for each (see \
-             db/src/migrations/README.md) — a migration with no revert path is \
-             not safe to undo, so nothing was reverted.",
-            missing.join(", "),
-            name = "<timestamp>_<name>"
+            "nothing was reverted. These applied migrations have no revert path: {}. Add a \
+             --migrate:down block to the migration file that owns it (see \
+             db/src/migrations/README.md).",
+            unrevertible.join("; ")
         )));
     }
     Ok(plan)
 }
 
-/// Every `*.down.sql` in the migrations directory, keyed by the `name` the
-/// registry stores for the migration it reverts.
-fn discover_down_scripts(migrations_path: &str) -> Result<HashMap<String, PathBuf>, DownError> {
-    let mut scripts = HashMap::new();
+/// Every migration file in the directory, keyed by the `name` the registry
+/// stores for the migration it defines.
+///
+/// The key comes from the same parser `db up` uses, so a file cannot register
+/// itself under one name and be looked up under another.
+fn discover_migrations(migrations_path: &str) -> Result<HashMap<String, PathBuf>, DownError> {
+    let mut files = HashMap::new();
     for entry in WalkDir::new(migrations_path)
         .into_iter()
         .filter_map(|e| e.ok())
     {
         let path = entry.into_path();
-        if !is_down_script(&path) {
+        if path.extension().and_then(|s| s.to_str()) != Some("sql") {
             continue;
         }
-        let name = revert_name(&path)?;
-        if let Some(previous) = scripts.insert(name, path.clone()) {
+        // A file whose name is not a migration name is not a migration, the same
+        // way `db up` decides.
+        let Ok(attrs) = parse_file_name(&path) else {
+            continue;
+        };
+        if let Some(previous) = files.insert(attrs.name, path.clone()) {
             return Err(DownError::new(format!(
-                "two revert scripts for the same migration: {} and {}",
+                "two migration files claim the same name: {} and {}",
                 previous.display(),
                 path.display()
             )));
         }
     }
-    Ok(scripts)
-}
-
-/// The registry `name` a revert script targets, i.e. the same string the
-/// matching up migration registers itself under.
-fn revert_name(path: &std::path::Path) -> Result<String, MigrationError> {
-    let stem = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| MigrationError::new("unreadable revert file name"))?;
-    let stem = stem
-        .strip_suffix(DOWN_SUFFIX)
-        .ok_or_else(|| MigrationError::new("not a revert script"))?;
-    // Reuse the up-migration parser so the derived name cannot drift from the
-    // one `db up` would have recorded: pretend it is the up file.
-    let as_up = PathBuf::from(format!("{}.sql", stem));
-    Ok(parse_file_name(&as_up)?.name)
+    Ok(files)
 }
 
 /// The registry name of the migration that creates the registry itself.
@@ -295,59 +329,33 @@ fn registry_name() -> String {
         .name
 }
 
-/// Does this revert script drop objects, and therefore lose whatever rows are
-/// in them? Used only to label the dry-run plan honestly.
-fn destroys_data(script: &PathBuf) -> Result<bool, DownError> {
-    let sql = read_migration_file(script)?;
-    let upper = sql.to_ascii_uppercase();
-    Ok([
+/// Does this revert drop objects, and therefore lose whatever rows are in them?
+/// Used only to label the dry-run plan honestly.
+fn destroys_data(down: &StatementGroup) -> bool {
+    let upper = down
+        .statements
+        .iter()
+        .map(|statement| statement.sql.to_ascii_uppercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    [
         "DROP TABLE ",
         "DROP TYPE ",
         "DROP EXTENSION ",
         "DROP COLUMN ",
     ]
     .iter()
-    .any(|keyword| upper.contains(keyword)))
+    .any(|keyword| upper.contains(keyword))
 }
 
-/// Revert one migration: its script and the removal of its registry row, in
-/// one transaction, so a half-reverted migration cannot be recorded as gone.
+/// Revert one migration: its `--migrate:down` statements and the removal of its
+/// registry row, in one transaction, so a half-reverted migration cannot be
+/// recorded as gone.
 async fn revert_one(conn: &Pool<Postgres>, step: &RevertPlan) -> Result<(), DownError> {
-    let sql = read_migration_file(&step.script)?;
-    let statements: Vec<String> = UpArgs::split_query(&sql)
-        .into_iter()
-        .filter(|s| !s.trim().is_empty())
-        .collect();
-
-    if statements.is_empty() {
-        return Err(DownError::new(format!(
-            "{} contains no executable statements; refusing to forget migration \
-             '{}' without undoing anything",
-            step.script.display(),
-            step.name
-        )));
-    }
-
-    let mut tx = conn
-        .begin()
+    exec::apply_group(conn, &step.down, Bookkeeping::Forget { name: &step.name })
         .await
-        .map_err(|e| DownError::new_from("failed to begin tx", e))?;
-
-    for statement in &statements {
-        if let Err(e) = tx.execute(AssertSqlSafe(statement.clone())).await {
-            let _ = tx.rollback().await;
-            log::error!("revert failed on: {}", statement);
-            return Err(DownError::new_from(
-                format!("failed to revert '{}'", step.name),
-                e,
-            ));
-        }
-    }
-
-    registry::forget(&mut tx, &step.name).await?;
-    tx.commit()
-        .await
-        .map_err(|e| DownError::new_from("failed to commit revert", e))?;
+        .map_err(|e| DownError::new_from(format!("failed to revert '{}'", step.name), e))?;
 
     log::info!("reverted {}", step.name);
     Ok(())
@@ -523,85 +531,61 @@ mod tests {
     /// Every committed migration must be revertible, or must say so out loud
     /// (the registry migration is the documented floor).
     #[test]
-    fn every_migration_has_a_revert_script() {
+    fn every_non_floor_migration_declares_a_down_block() {
         let dir = migrations_dir();
-        let scripts = discover_down_scripts(dir.to_str().unwrap()).unwrap();
+        let files = discover_migrations(dir.to_str().unwrap()).unwrap();
 
-        let unrevertible: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("sql"))
-            .filter(|p| !is_down_script(p))
-            .filter_map(|p| parse_file_name(&p).ok())
-            .map(|a| a.name)
-            .filter(|name| *name != registry_name())
-            .filter(|name| !scripts.contains_key(name))
-            .collect();
+        let mut unrevertible = Vec::new();
+        for (name, path) in &files {
+            if name == &registry_name() {
+                continue;
+            }
+            let migration = exec::parse_migration(path)
+                .unwrap_or_else(|e| panic!("{} must parse: {e:?}", path.display()));
+            if !migration.is_revertible() {
+                unrevertible.push(name.clone());
+            }
+        }
 
         assert!(
             unrevertible.is_empty(),
-            "migrations with no .down.sql: {unrevertible:?}"
+            "migrations with no --migrate:down block: {unrevertible:?}"
         );
     }
 
-    /// A committed revert script has to revert something. The stub
-    /// `db new-migration` writes is a placeholder; committing it unwritten
-    /// would make a migration irreversible in a way only `db down` would
-    /// discover, which is the worst possible time.
+    /// A `*.down.sql` beside a migration is a revert the runner will not read.
+    /// Committing one means the migration's real revert is somewhere else, so
+    /// none may exist.
     #[test]
-    fn committed_revert_scripts_have_statements() {
-        let scripts = discover_down_scripts(migrations_dir().to_str().unwrap()).unwrap();
-
-        let empty: Vec<String> = scripts
-            .iter()
-            .filter_map(|(name, path)| {
-                let sql = read_migration_file(path).expect("revert script should be readable");
-                let has_statement = UpArgs::split_query(&sql)
-                    .iter()
-                    .any(|statement| !statement.trim().is_empty());
-                if has_statement {
-                    return None;
-                }
-                Some(name.clone())
-            })
-            .collect();
-
+    fn no_legacy_revert_scripts_are_committed() {
+        let found = legacy_revert_scripts(migrations_dir().to_str().unwrap());
         assert!(
-            empty.is_empty(),
-            "revert scripts that contain no statements: {empty:?}"
+            found.is_empty(),
+            "reverts belong in a --migrate:down block inside the migration file: {found:?}"
         );
     }
 
-    /// A revert script maps to the same registry name as its up migration —
-    /// otherwise `db down` would never find it.
+    /// A migration file maps to the registry name `db up` records for it —
+    /// otherwise `db down` would never find the revert.
     #[test]
-    fn revert_scripts_map_to_the_migrations_they_undo() {
+    fn migration_files_map_to_the_names_the_registry_stores() {
         let dir = migrations_dir();
-        let scripts = discover_down_scripts(dir.to_str().unwrap()).unwrap();
+        let files = discover_migrations(dir.to_str().unwrap()).unwrap();
 
-        let up_names: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("sql"))
-            .filter(|p| !is_down_script(p))
-            .filter_map(|p| parse_file_name(&p).ok())
-            .map(|a| a.name)
-            .collect();
-
-        for name in up_names.iter().filter(|n| **n != registry_name()) {
-            assert!(scripts.contains_key(name), "no revert script for {name}");
+        for (name, path) in &files {
+            let derived = parse_file_name(path).expect("committed name parses").name;
+            assert_eq!(name, &derived, "key drifted from what db up records");
         }
-        // The registry has no revert script, by design.
-        assert!(!scripts.contains_key(&registry_name()));
+        // The registry file is discovered like any other; it is the floor that
+        // keeps it out of the plan, not a gap in discovery.
+        assert!(files.contains_key(&registry_name()));
     }
 
-    /// Reverting a script-less migration must fail the whole plan, never part
-    /// of it: a half-reverted schema is not a state anybody asked for.
+    /// Reverting a migration whose file is gone must fail the whole plan, never
+    /// part of it: a half-reverted schema is not a state anybody asked for.
     #[test]
-    fn plan_reverts_refuses_when_a_script_is_missing() {
-        let empty_dir = std::env::temp_dir().join("db_down_no_scripts");
+    fn plan_reverts_refuses_when_the_file_is_missing() {
+        let empty_dir = std::env::temp_dir().join("db_down_no_files");
         std::fs::create_dir_all(&empty_dir).unwrap();
 
         let applied = vec![AppliedMigration {
@@ -612,11 +596,37 @@ mod tests {
         }];
 
         let err = plan_reverts(applied, empty_dir.to_str().unwrap())
-            .expect_err("must refuse without a script");
+            .expect_err("must refuse without the file");
         assert!(
             format!("{}", err).contains("create_something"),
             "error should name the migration: {err}"
         );
+    }
+
+    /// A file that exists but declares no revert is the same refusal, with the
+    /// file named so the fix is obvious.
+    #[test]
+    fn plan_reverts_refuses_when_no_down_block_is_declared() {
+        let dir = std::env::temp_dir().join("db_down_no_down_block");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("202601010000_create_something.sql");
+        std::fs::write(&file, "CREATE TABLE something (id INT);\n").unwrap();
+
+        let applied = vec![AppliedMigration {
+            name: "create_something".to_string(),
+            created_at: parse_file_name(&file).unwrap().created_at,
+        }];
+
+        let err = plan_reverts(applied, dir.to_str().unwrap())
+            .expect_err("must refuse without a down block");
+        let message = format!("{err}");
+        assert!(message.contains("create_something"), "{message}");
+        assert!(
+            message.contains("--migrate:down"),
+            "the refusal has to say what to add: {message}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -651,10 +661,14 @@ mod tests {
     /// The plan labels the steps that lose rows, so a dry run reads as an
     /// honest description of what `down` will do.
     #[test]
-    fn destructive_scripts_are_flagged_in_the_plan() {
-        let dir = migrations_dir();
-        let scripts = discover_down_scripts(dir.to_str().unwrap()).unwrap();
-        let dropping = scripts.get("create_nodes").expect("nodes revert script");
-        assert!(destroys_data(dropping).unwrap());
+    fn destructive_reverts_are_flagged_in_the_plan() {
+        let files = discover_migrations(migrations_dir().to_str().unwrap()).unwrap();
+        let nodes = files.get("create_nodes").expect("nodes migration file");
+        let down = exec::parse_migration(nodes)
+            .expect("nodes migration parses")
+            .down
+            .expect("nodes migration declares a revert");
+
+        assert!(destroys_data(&down), "dropping nodes loses their rows");
     }
 }

@@ -23,16 +23,15 @@
 //! - Appropriate permissions to access Bluetooth hardware
 //! - A connected BLE device
 
-use bt_mon::{DeviceMonitor, GattClient, CharacteristicUuid, DeviceId, create_btleplug_monitor};
-use log::{info, warn, debug};
+use bt_mon::{create_btleplug_monitor, CharacteristicUuid, DeviceId, DeviceMonitor, GattClient};
+use log::{debug, info, warn};
 use std::env;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
@@ -44,13 +43,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  - Platform-specific ID");
         return Err("Device ID required".into());
     }
-    
+
     let device_id_str = &args[1];
     let device_id = DeviceId::new(device_id_str);
-    
+
     info!("Creating Bluetooth monitor...");
     let monitor = create_btleplug_monitor().await?;
-    
+
     // Check if adapter is powered
     let powered = monitor.is_powered().await?;
     if !powered {
@@ -58,30 +57,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Bluetooth adapter not powered".into());
     }
     info!("Bluetooth adapter is powered on");
-    
+
     // Try to find the device
     let devices = monitor.devices().await?;
     let device_found = devices.iter().any(|d| d.id == device_id);
-    
+
     if !device_found {
         info!("Device not in cache. Starting scan to find it...");
         monitor.start_scan().await?;
         tokio::time::sleep(Duration::from_secs(5)).await;
         monitor.stop_scan().await?;
-        
+
         let devices = monitor.devices().await?;
         if !devices.iter().any(|d| d.id == device_id) {
             warn!("Device {} not found. Make sure it's in range.", device_id);
             return Err("Device not found".into());
         }
     }
-    
+
     info!("Connecting to device {}...", device_id);
     monitor.connect(&device_id).await?;
-    
+
     // Wait a moment for connection to stabilize
     tokio::time::sleep(Duration::from_millis(500)).await;
-    
+
     // Check connection status
     let connected = monitor.is_connected(&device_id).await?;
     if !connected {
@@ -89,15 +88,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Connection failed".into());
     }
     info!("Connected to device");
-    
+
     // Discover services
     info!("Discovering services...");
     let services = monitor.discover_services(&device_id).await?;
     info!("Found {} services:", services.len());
-    
+
     for service in &services {
-        info!("  Service: {} (primary={})", service.uuid, service.is_primary);
-        
+        info!(
+            "  Service: {} (primary={})",
+            service.uuid, service.is_primary
+        );
+
         for char in &service.characteristics {
             info!("    Characteristic: {}", char.uuid);
             info!("      Properties:");
@@ -112,11 +114,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    
+
     // Try to read the Device Name characteristic (0x2A00)
     let device_name_uuid = CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb")?;
-    
-    if let Ok(value) = monitor.read_characteristic(&device_id, &device_name_uuid).await {
+
+    if let Ok(value) = monitor
+        .read_characteristic(&device_id, &device_name_uuid)
+        .await
+    {
         if let Ok(text) = std::str::from_utf8(&value) {
             info!("Device Name: {}", text);
         } else {
@@ -125,11 +130,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         debug!("Could not read Device Name characteristic");
     }
-    
+
     // Try to read the Appearance characteristic (0x2A01)
     let appearance_uuid = CharacteristicUuid::parse_str("00002a01-0000-1000-8000-00805f9b34fb")?;
-    
-    if let Ok(value) = monitor.read_characteristic(&device_id, &appearance_uuid).await {
+
+    if let Ok(value) = monitor
+        .read_characteristic(&device_id, &appearance_uuid)
+        .await
+    {
         if value.len() >= 2 {
             let appearance = u16::from_le_bytes([value[0], value[1]]);
             info!("Appearance: 0x{:04x}", appearance);
@@ -137,11 +145,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         debug!("Could not read Appearance characteristic");
     }
-    
+
     // Disconnect
     info!("Disconnecting...");
     monitor.disconnect(&device_id).await?;
     info!("Disconnected");
-    
+
     Ok(())
 }

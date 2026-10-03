@@ -31,17 +31,16 @@
 //! cargo run --example subscribe_notifications -- AA:BB:CC:DD:EE:FF 00002a37-0000-1000-8000-00805f9b34fb
 //! ```
 
-use bt_mon::{DeviceMonitor, GattClient, CharacteristicUuid, DeviceId, create_btleplug_monitor};
+use bt_mon::{create_btleplug_monitor, CharacteristicUuid, DeviceId, DeviceMonitor, GattClient};
 use futures_util::stream::StreamExt;
-use log::{info, warn, debug};
+use log::{debug, info, warn};
 use std::env;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Parse command line arguments
     let args: Vec<String> = env::args().collect();
@@ -49,7 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Usage: {} <device_id> <characteristic_uuid>", args[0]);
         eprintln!();
         eprintln!("Example:");
-        eprintln!("  {} AA:BB:CC:DD:EE:FF 00002a37-0000-1000-8000-00805f9b34fb", args[0]);
+        eprintln!(
+            "  {} AA:BB:CC:DD:EE:FF 00002a37-0000-1000-8000-00805f9b34fb",
+            args[0]
+        );
         eprintln!();
         eprintln!("Common characteristic UUIDs:");
         eprintln!("  - Device Name: 00002a00-0000-1000-8000-00805f9b34fb");
@@ -57,13 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("  - Battery Level: 00002a19-0000-1000-8000-00805f9b34fb");
         return Err("Arguments required".into());
     }
-    
+
     let device_id = DeviceId::new(&args[1]);
     let char_uuid = CharacteristicUuid::parse_str(&args[2])?;
-    
+
     info!("Creating Bluetooth monitor...");
     let monitor = create_btleplug_monitor().await?;
-    
+
     // Check if adapter is powered
     let powered = monitor.is_powered().await?;
     if !powered {
@@ -71,20 +73,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Bluetooth adapter not powered".into());
     }
     info!("Bluetooth adapter is powered on");
-    
+
     // Try to find and connect to the device
     info!("Connecting to device {}...", device_id);
-    
+
     // Start a quick scan to find the device
     monitor.start_scan().await?;
     tokio::time::sleep(Duration::from_secs(3)).await;
     monitor.stop_scan().await?;
-    
+
     monitor.connect(&device_id).await?;
-    
+
     // Wait for connection to stabilize
     tokio::time::sleep(Duration::from_millis(500)).await;
-    
+
     // Check connection status
     let connected = monitor.is_connected(&device_id).await?;
     if !connected {
@@ -92,39 +94,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Connection failed".into());
     }
     info!("Connected to device");
-    
+
     // Discover services to ensure the characteristic is available
     info!("Discovering services...");
     let _services = monitor.discover_services(&device_id).await?;
     info!("Services discovered");
-    
+
     // Subscribe to notifications
     info!("Subscribing to characteristic {}...", char_uuid);
     monitor.subscribe(&device_id, &char_uuid).await?;
     info!("Subscribed to notifications");
-    
+
     // Listen for notifications
     info!("Waiting for notifications (press Ctrl+C to stop)...");
     let mut notifications = monitor.notifications(&device_id).await?;
-    
+
     while let Some(notification) = notifications.next().await {
         info!(
             "Notification from {}: {:02x?}",
-            notification.characteristic,
-            notification.value
+            notification.characteristic, notification.value
         );
-        
+
         // Try to decode as UTF-8 string
         if let Ok(text) = std::str::from_utf8(&notification.value) {
             debug!("  As string: '{}'", text);
         }
-        
+
         // For heart rate monitors, decode the value
-        if notification.characteristic == CharacteristicUuid::parse_str("00002a37-0000-1000-8000-00805f9b34fb")? {
+        if notification.characteristic
+            == CharacteristicUuid::parse_str("00002a37-0000-1000-8000-00805f9b34fb")?
+        {
             if notification.value.len() >= 2 {
                 let flags = notification.value[0];
                 let heart_rate_is_16bit = (flags & 0x01) == 0;
-                
+
                 if heart_rate_is_16bit {
                     if notification.value.len() >= 4 {
                         let hr = u16::from_le_bytes([notification.value[1], notification.value[2]]);
@@ -137,15 +140,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    
+
     // Unsubscribe on exit
     info!("Unsubscribing...");
     monitor.unsubscribe(&device_id, &char_uuid).await?;
-    
+
     // Disconnect
     info!("Disconnecting...");
     monitor.disconnect(&device_id).await?;
     info!("Done");
-    
+
     Ok(())
 }

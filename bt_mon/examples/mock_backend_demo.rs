@@ -10,8 +10,7 @@
 
 use bt_mon::{
     backends::mock::{MockConfig, MockMonitor, SimulatedCharacteristic, SimulatedService},
-    CharacteristicProperties, CharacteristicUuid, DeviceId, DeviceMonitor, GattClient,
-    ServiceUuid,
+    CharacteristicProperties, CharacteristicUuid, DeviceId, DeviceMonitor, GattClient, ServiceUuid,
 };
 use log::info;
 
@@ -158,7 +157,9 @@ async fn demo_gatt_simulation() -> Result<(), bt_mon::Error> {
     )
     .with_characteristic(SimulatedCharacteristic::new(
         CharacteristicUuid::parse_str("00002a19-0000-1000-8000-00805f9b34fb").unwrap(),
-        CharacteristicProperties::new().with_read(true).with_notify(true),
+        CharacteristicProperties::new()
+            .with_read(true)
+            .with_notify(true),
     ));
 
     // Add a device with custom services
@@ -201,7 +202,9 @@ async fn demo_gatt_simulation() -> Result<(), bt_mon::Error> {
     let device_info_char =
         CharacteristicUuid::parse_str("00002a29-0000-1000-8000-00805f9b34fb").unwrap();
 
-    let value = monitor.read_characteristic(&device_id, &device_info_char).await?;
+    let value = monitor
+        .read_characteristic(&device_id, &device_info_char)
+        .await?;
     info!(
         "Read {} bytes from manufacturer name characteristic",
         value.len()
@@ -292,8 +295,9 @@ async fn demo_error_simulation() -> Result<(), bt_mon::Error> {
     monitor4.connect(&device_id).await?;
 
     // Test write error
-    let write_result =
-        monitor4.write_characteristic(&device_id, &test_char, &[0x01, 0x02], true).await;
+    let write_result = monitor4
+        .write_characteristic(&device_id, &test_char, &[0x01, 0x02], true)
+        .await;
     match write_result {
         Ok(_) => info!("ERROR: Write should have failed!"),
         Err(e) => info!("✓ Write error simulated: {}", e),

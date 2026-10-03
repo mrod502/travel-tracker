@@ -19,7 +19,7 @@
 #   - Rust tools: rustfmt, clippy, rust-analyzer, cargo-watch
 #   - Rust uses project-local target/, so no special cache volumes needed
 
-FROM rust:1.97-bookworm
+FROM rust:1.98-bookworm
 
 ARG USERNAME=dev
 ARG USER_UID=1000

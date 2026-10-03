@@ -105,12 +105,15 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bt_iden",
  "bt_mon",
  "ca",
  "chrono",
  "ciborium",
  "clap",
  "dashmap 6.2.1",
+ "db",
  "ed25519-dalek",
  "env_logger 0.11.11",
  "futures-util",
@@ -118,6 +121,7 @@ dependencies = [
  "log",
  "rand 0.8.7",
  "repo",
+ "rust-mqtt",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -414,6 +418,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "db",
  "ed25519-dalek",
  "hex",
  "rand 0.8.7",
@@ -598,6 +603,12 @@ dependencies = [
  "once_cell",
  "tiny-keccak",
 ]
+
+[[package]]
+name = "const_fn"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
 name = "core-foundation-sys"
@@ -869,7 +880,6 @@ dependencies = [
  "dotenv",
  "log",
  "log4rs",
- "sqlparser",
  "sqlx",
  "tokio",
  "walkdir",
@@ -1053,6 +1063,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
+name = "embedded-io-async"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2564b9f813c544241430e147d8bc454815ef9ac998878d30cc3055449f7fd4c0"
+dependencies = [
+ "embedded-io",
 ]
 
 [[package]]
@@ -1527,6 +1552,16 @@ name = "heapless"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
+dependencies = [
+ "hash32 0.3.1",
+ "stable_deref_trait",
+]
+
+[[package]]
+name = "heapless"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
 dependencies = [
  "hash32 0.3.1",
  "stable_deref_trait",
@@ -2556,6 +2591,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "db",
  "geo-types",
  "h3o",
  "serde",
@@ -2643,6 +2679,17 @@ dependencies = [
  "num-traits",
  "serde",
  "smallvec",
+]
+
+[[package]]
+name = "rust-mqtt"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7609e36dcc9f31070b169bbdf3b903f7004f951807f14e0ae9f662d7c2ae3da7"
+dependencies = [
+ "const_fn",
+ "embedded-io-async",
+ "heapless 0.9.3",
 ]
 
 [[package]]
@@ -2925,15 +2972,6 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
-]
-
-[[package]]
-name = "sqlparser"
-version = "0.51.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fe11944a61da0da3f592e19a45ebe5ab92dc14a779907ff1f08fbb797bfefc7"
-dependencies = [
- "log",
 ]
 
 [[package]]

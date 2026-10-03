@@ -82,7 +82,7 @@ fn now() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn generated_h3_columns_decode_into_h3index(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
 
@@ -99,7 +99,7 @@ async fn generated_h3_columns_decode_into_h3index(pool: sqlx::PgPool) {
     assert_eq!(stored.geo_cell_macro, Some(H3Index::from(macro_cell)));
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn an_occurrence_without_a_location_has_no_cells(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
 
@@ -115,7 +115,7 @@ async fn an_occurrence_without_a_location_has_no_cells(pool: sqlx::PgPool) {
     assert_eq!(stored.geo_cell_macro, None);
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn geography_survives_the_round_trip_as_a_point(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
 
@@ -138,7 +138,7 @@ async fn geography_survives_the_round_trip_as_a_point(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn the_stored_fine_cell_actually_contains_the_location(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     OccurrenceRepository::create(&pool, &occurrence(&origin, now()))
@@ -167,7 +167,7 @@ async fn the_stored_fine_cell_actually_contains_the_location(pool: sqlx::PgPool)
     );
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn a_bare_integer_parameter_would_not_match_an_h3index_column(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     let macro_cell = repo::geo::macro_cell(LAT, LON).unwrap();
@@ -201,7 +201,7 @@ async fn a_bare_integer_parameter_would_not_match_an_h3index_column(pool: sqlx::
     assert_eq!(found[0].geo_cell_macro, Some(H3Index::from(macro_cell)));
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn text_and_binary_forms_name_the_same_cell(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     let macro_cell = repo::geo::macro_cell(LAT, LON).unwrap();
@@ -221,7 +221,7 @@ async fn text_and_binary_forms_name_the_same_cell(pool: sqlx::PgPool) {
     assert_eq!(repo::geo::parse_cell(&printed).unwrap(), macro_cell);
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn owns_geo_cells_round_trips_and_absence_means_no_claim(pool: sqlx::PgPool) {
     let id = node_id(0x1a);
     let claimed = [repo::geo::macro_cell(LAT, LON).unwrap()];
@@ -263,7 +263,7 @@ async fn owns_geo_cells_round_trips_and_absence_means_no_claim(pool: sqlx::PgPoo
     );
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn a_node_row_loads_with_the_declared_field_types(pool: sqlx::PgPool) {
     let id = node_id(0x2a);
     let claimed = repo::geo::macro_cell(LAT, LON).unwrap();
@@ -289,7 +289,7 @@ async fn a_node_row_loads_with_the_declared_field_types(pool: sqlx::PgPool) {
     assert_eq!(node.fixed_lat, Some(LAT));
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn a_node_with_no_claim_loads_as_none(pool: sqlx::PgPool) {
     let id = node_id(0x3a);
     NodeRepository::register(
@@ -312,7 +312,7 @@ async fn a_node_with_no_claim_loads_as_none(pool: sqlx::PgPool) {
     assert_eq!(node.owns_geo_cells, None);
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn an_h3index_column_refuses_to_decode_as_an_ordinary_integer(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     OccurrenceRepository::create(&pool, &occurrence(&origin, now()))
@@ -365,7 +365,7 @@ fn rust_labels<T>(variants: &[T], as_str: fn(&T) -> &'static str) -> Vec<String>
     variants.iter().map(|v| as_str(v).to_string()).collect()
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn the_enum_labels_the_payload_codes_map_to_are_the_servers_own(pool: sqlx::PgPool) {
     // Signed payload v2 carries `adv_type` and `location_source` as integer codes, and
     // the table that turns a code back into a label names these strings. So a verifier
@@ -430,7 +430,7 @@ async fn the_enum_labels_the_payload_codes_map_to_are_the_servers_own(pool: sqlx
     );
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn an_instant_finer_than_a_microsecond_is_truncated_not_rounded(pool: sqlx::PgPool) {
     // The signature spells `observed_at` with six fractional digits. That is only a
     // description of the row if the column holds the same digits, so the writer
@@ -487,7 +487,7 @@ async fn an_instant_finer_than_a_microsecond_is_truncated_not_rounded(pool: sqlx
     assert_eq!(server_rounds, "12:00:00.123457");
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn a_jsonb_column_serialises_the_same_after_the_round_trip(pool: sqlx::PgPool) {
     // v2 signs `serde_json`'s compact bytes of this column, which is only a promise a
     // reader can keep if JSONB's own normalisation — sorting object keys, collapsing

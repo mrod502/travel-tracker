@@ -25,3 +25,12 @@ thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 h3o = { version = "0.10.0", features = ["serde", "geo"] }
+
+[dev-dependencies]
+# The `#[sqlx::test]` suites build a throwaway schema from `db`'s migration
+# corpus through `db::SQLX_FORWARD_MIGRATOR`. It has to be the library and not a
+# `migrations = "../db/src/migrations"` path: sqlx reads whole files and does not
+# know what `--migrate:` means, so it would apply each file's revert block on the
+# way up. See db/src/forward.rs.
+db = { path = "../db" }
+

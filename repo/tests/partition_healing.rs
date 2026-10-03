@@ -138,7 +138,7 @@ fn expect_partition_error(error: RepoError) {
     );
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn create_creates_the_month_a_row_needs(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     // Past the provisioned horizon, inside the window the schema will open.
@@ -177,7 +177,7 @@ async fn create_creates_the_month_a_row_needs(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn healing_creates_only_the_month_that_was_asked_for(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     let before = partition_count(&pool).await;
@@ -194,7 +194,7 @@ async fn healing_creates_only_the_month_that_was_asked_for(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn a_healed_month_is_reused_not_repeated(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     let observed_at = month_offset(PROVISIONED_HORIZON_MONTHS + 5);
@@ -211,7 +211,7 @@ async fn a_healed_month_is_reused_not_repeated(pool: sqlx::PgPool) {
     assert!(partition_exists(&pool, &partition).await);
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn writers_racing_for_one_missing_month_create_one_partition(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     let observed_at = month_offset(PROVISIONED_HORIZON_MONTHS + 6);
@@ -250,7 +250,7 @@ async fn writers_racing_for_one_missing_month_create_one_partition(pool: sqlx::P
     );
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn a_timestamp_outside_the_window_is_refused_loudly(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     let observed_at = month_offset(12 * 60); // sixty years out
@@ -277,7 +277,7 @@ async fn a_timestamp_outside_the_window_is_refused_loudly(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn duplicate_ids_still_report_duplicate(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     let record = occurrence(&origin, Utc::now(), 0x0c);
@@ -295,7 +295,7 @@ async fn duplicate_ids_still_report_duplicate(pool: sqlx::PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "../db/src/migrations")]
+#[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
 async fn a_transaction_heals_only_when_asked_first(pool: sqlx::PgPool) {
     let origin = registered_node(&pool).await;
     let observed_at = month_offset(PROVISIONED_HORIZON_MONTHS + 7);

@@ -263,10 +263,13 @@ mod tests {
     use super::*;
     use crate::pool::Pool;
 
-    // `migrations` points at the crate that owns the schema: `#[sqlx::test]`
+    // `migrator` is `db`'s own projection of the corpus: `#[sqlx::test]`
     // provisions a throwaway database per test, and the only schema worth testing
-    // against is the one `db up` applies.
-    #[sqlx::test(migrations = "../db/src/migrations")]
+    // against is the one `db up` applies. It comes from `db` rather than from the
+    // directory because sqlx reads whole files and knows nothing about
+    // `--migrate:` — pointed at the directory it would run every revert on the way
+    // up. See `db/src/forward.rs`.
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
     async fn test_check_revoked_status(pool: sqlx::PgPool) {
         // First, ensure the node doesn't exist
         let wrapper = Pool::from_pool(pool.clone());
@@ -276,7 +279,7 @@ mod tests {
         assert!(!not_revoked);
     }
 
-    #[sqlx::test(migrations = "../db/src/migrations")]
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
     async fn test_get_all_revoked(pool: sqlx::PgPool) {
         // For now, just test that we can query an empty table
         let wrapper = Pool::from_pool(pool.clone());
@@ -307,7 +310,7 @@ mod tests {
     // The status column is a `node_status` enum. Binding the Rust enum sends it as
     // one; binding an integer made every status update fail at the server, which
     // is the defect this pins.
-    #[sqlx::test(migrations = "../db/src/migrations")]
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
     async fn update_node_status_writes_the_enum_not_a_number(pool: sqlx::PgPool) {
         let node_id = node(&pool).await;
 
@@ -324,7 +327,7 @@ mod tests {
         assert_eq!(status, NodeStatus::Revoked);
     }
 
-    #[sqlx::test(migrations = "../db/src/migrations")]
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
     async fn revoke_node_writes_the_record_and_the_status(pool: sqlx::PgPool) {
         let node_id = node(&pool).await;
 

@@ -258,6 +258,48 @@ LIMIT $2
         .map_err(RepoError::Database)
     }
 
+    /// Every occurrence in a time window, oldest first, optionally one node's.
+    ///
+    /// Oldest-first is the opposite of every other read here, and on purpose: this is the
+    /// scan a batch replays, and a pass that read newest-first would hand its resolver the
+    /// present before the past and compute time continuity backwards.
+    ///
+    /// With `node_id`, this is an index scan on
+    /// `idx_occurrence_origin_node (origin_node_id, observed_at)`. Without one it scans the
+    /// window across every partition — which is what a whole-network reprocess costs, and
+    /// why the parameter is here rather than filtered by the caller after the fact.
+    pub async fn find_in_window<'e, E>(
+        executor: E,
+        signal_type: SignalType,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        node_id: Option<&[u8]>,
+        limit: i64,
+    ) -> Result<Vec<Occurrence>, RepoError>
+    where
+        E: Executor<'e, Database = sqlx::Postgres>,
+    {
+        sqlx::query_as::<_, Occurrence>(
+            r#"
+SELECT * FROM occurrences
+WHERE signal_type = $1
+  AND observed_at >= $2
+  AND observed_at <= $3
+  AND ($4::bytea IS NULL OR origin_node_id = $4)
+ORDER BY observed_at ASC
+LIMIT $5
+            "#,
+        )
+        .bind(signal_type)
+        .bind(from)
+        .bind(to)
+        .bind(node_id)
+        .bind(limit)
+        .fetch_all(executor)
+        .await
+        .map_err(RepoError::Database)
+    }
+
     /// Find occurrences by H3 macro cell, newest first.
     ///
     /// Unbounded on `observed_at`, like [`find_by_signal_type`](Self::find_by_signal_type).

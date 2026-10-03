@@ -1,4 +1,5 @@
 mod down;
+mod exec;
 mod file_attrs;
 mod new;
 mod registry;
@@ -117,7 +118,11 @@ impl Error for AppError {
 }
 
 impl AppError {
-    pub fn new(message: &str, cause: impl Error + 'static) -> Self {
+    // `_message` is accepted and dropped: `AppError` carries only a cause today,
+    // so the callers' context strings never reach the output. Kept as an
+    // underscored parameter rather than removed so the call sites stay readable
+    // until the message is given a field and a place in `Display`.
+    pub fn new(_message: &str, cause: impl Error + 'static) -> Self {
         AppError {
             cause: Some(Box::new(cause)),
         }

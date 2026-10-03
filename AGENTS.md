@@ -198,10 +198,13 @@ This project has specialized skills that should be invoked automatically for rel
 ### `h3-geospatial-indexing` (H3 geospatial, spatial queries)
 **When to use**: When working with location data, H3 cells, spatial indexing, or geographic queries. Triggers on: "H3", "geospatial", "location", "spatial query", "geo cell", "hex grid".
 
+### `micro-swim` (Gossip protocol for edge devices)
+**When to use**: When implementing decentralized peer-to-peer communication on resource-constrained devices, gossip-based membership protocols, or edge device coordination. Triggers on: "gossip", "SWIM", "μswim", "edge device", "constrained node", "decentralized discovery", "federated learning", "collective sensing".
+
 ### `provenance-verification` (Node identity, occurrence authenticity)
 **When to use**: When verifying occurrence origins, working with node identities, or implementing signature verification. Triggers on: "provenance", "node identity", "signature verification", "origin_node_id", "reporting_node_id", "CA credential".
 
-**How skills are invoked**: Skills are automatically considered when their keywords appear in your request. For explicit invocation, use `/skill canonical-cbor`, `/skill h3-geospatial-indexing`, or `/skill provenance-verification`.
+**How skills are invoked**: Skills are automatically considered when their keywords appear in your request. For explicit invocation, use `/skill canonical-cbor`, `/skill h3-geospatial-indexing`, `/skill micro-swim`, or `/skill provenance-verification`.
 
 ## Security Best Practices
 

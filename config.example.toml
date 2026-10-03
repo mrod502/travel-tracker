@@ -1,28 +1,158 @@
 # btmon Configuration File Example
-# Copy this file to config.toml and modify as needed
+#
+# Copy this file to e.g. config.toml and point the application at it with
+# `--config-file path/to/config.toml` or `CONFIG_FILE=path/to/config.toml`.
+#
+# The file is only read when you name it. Nothing here is discovered from the
+# working directory, so a stray config.toml cannot change how a node behaves. A
+# named file that cannot be read is a hard error, not a shrug.
+#
+# ## Precedence
+#
+# Every setting is taken from the first layer that states it:
+#
+#   1. command-line flag          (--rate-limit-ms 5000)
+#   2. this file                  ([bluetooth] rate_limit_ms = 5000)
+#   3. environment                (exported variable, then the .env file below)
+#   4. built-in default           (shown next to each setting)
+#
+# A setting counts as "stated" only when it is actually present, so a flag you
+# typed wins even when its value happens to equal the default, and a value you
+# leave out of this file keeps coming from the environment.
+#
+# ## The env file
+#
+# Below this file sits a dotenv-style file: `.env` in the working directory, or
+# `.env.database` if there is no `.env`. Set `ENV_FILE=/path/to/file` to name one
+# explicitly. Variables you export outrank that file (`PGPASSWORD=x btmon ...`),
+# and an exported-but-empty variable counts as absent.
+#
+# Every setting below lists its environment variable in a comment. The names
+# starting `BT_` are the ones the application has always used; `[location]` adds
+# `BT_LOCATION_*` and `BT_GPS_*`.
 
 # Database configuration
 [database]
+# A URL wins over the components below it, so uncomment one or the other.
+# env: DATABASE_URL   | flag: -d, --database-url
 url = "postgres://postgres:devpassword@localhost:7789/postgres"
+
 # Alternatively, use individual connection parameters:
+# env: PGHOST          | flag: --pg-host        (default: localhost)
 # host = "localhost"
+# env: PGPORT          | flag: --pg-port        (default: 5432)
 # port = 5432
+# env: PGDATABASE      | flag: --pg-database    (required if no url)
 # database = "travel"
+# env: PGUSER          | flag: --pg-user        (required if no url)
 # user = "btmon"
+# env: PGPASSWORD      | flag: --pg-password
 # password = "btmon"
 
 # Logging configuration
 [log]
-level = "info" # Options: debug, info, warn, error
+level = "info" # env: LOG_LEVEL | flag: --log-level (default: info; debug, info, warn, error)
 
 # Node configuration
 [node]
-id = "49bb4b0d-2645-452d-bd81-e76b65901f08" # Your node UUID
+# The node id this node has to turn out to be, spelled the way the node prints it
+# at startup and the way `ca ca-enroll` prints it: 64 hex characters, the SHA-256
+# of the node's signing key.
+#
+# Optional, and it cannot choose an identity — the key in `[bluetooth].data_dir`
+# does that. What it does is refuse to run a node that is not the one the operator
+# believes they are starting: startup stops and prints both ids. Leave it unset to
+# accept the key the node already has. A UUID here is a hard error: that is what
+# this setting asked for before a node id was a hash.
+# env: NODE_ID | flag: --node-id
+# id = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
 
 # Bluetooth configuration
 [bluetooth]
-scan_interval_ms = 1000             # Scan interval in milliseconds
-store_raw_payload = true            # Store raw advertisement data
-data_dir = "~/.btmon/data"          # Directory for node identity and state
-rate_limit_ms = 15000               # Rate limit threshold in milliseconds (15s default)
-fixed_location = "40.6892,-74.0445" # Optional: fixed location "lat,lon"
+# Which radio to monitor: adapter id, name, or MAC address. Matched
+# case-insensitively against the whole adapter description or its first word —
+# `hci1` in `hci1 (usb:1d6b:0003)`. A selector that matches nothing, or matches
+# more than one adapter, stops startup instead of picking one for you. Unset takes
+# the first adapter the system reports.
+# env: BT_ADAPTER_ID             | flag: --adapter-id
+# adapter_id = "hci0"
+
+# How often to re-arm the scan, in milliseconds. Scanning is continuous, so this is
+# not a duty cycle: every interval the monitor issues a fresh stop/start, which is
+# what keeps a controller-side scan that has gone stale (adapter sleep, bluetoothd
+# restart) from leaving a running node silently deaf. It is also how often the
+# simulated radio advertises.
+scan_interval_ms = 3000   # env: BT_SCAN_INTERVAL_MS      | flag: --scan-interval-ms (default: 1000; must be > 0)
+
+# Keep the radio's own advertisement bytes as `signal_payload.ble.raw_payload_hex`.
+# They are the one part of a capture that cannot be reconstructed afterwards, and
+# they sit inside the signature, so this setting changes what the node attests to.
+# A backend that hands over only decoded properties stores nothing extra and says
+# so once at the first advertisement.
+store_raw_payload = true  # env: BT_STORE_RAW_PAYLOAD     | flag: --store-raw-payload (default: true; bare flag means yes, =false means no)
+data_dir = "~/.btmon/data" # env: BT_DATA_DIR             | flag: --data-dir (default: ~/.btmon/data)
+rate_limit_ms = 15000     # env: BT_RATE_LIMIT_MS         | flag: --rate-limit-ms (default: 15000; must be > 0)
+stream_reopen_delay_ms = 3000 # env: BT_STREAM_REOPEN_DELAY_MS | flag: --stream-reopen-delay-ms (default: 1000; must be > 0)
+use_mock_backend = false  # env: BT_USE_MOCK_BACKEND      | flag: --use-mock-backend (needs the `mock` build feature)
+
+# Position acquisition
+#
+# A node reports where it was when it saw a device. Where that comes from is the
+# one decision here; `mode` picks the strategy and each strategy has its own
+# settings. A position that cannot be acquired never blocks a run: the occurrence
+# is stored with a NULL location and the failure is logged once, not per device.
+[location]
+# env: BT_LOCATION_MODE | flag: --location-mode (default: auto)
+#   auto   - the fixed point if there is one, otherwise the receiver
+#   fixed  - only `[location].fixed`; startup fails if it is missing
+#   gps    - only the receiver; see [location.gps]
+#   off    - never report a position
+mode = "auto"
+
+# Fixed coordinates as "lat,lon", for a stationary node.
+# env: BT_LOCATION_FIXED | flag: --fixed-location
+fixed = "40.712851,-73.910533"
+
+# A GPS receiver. Writing the header at all is what says "this node has one":
+# with no [location.gps] section, `auto` never tries to connect and `gps` mode
+# fails at startup rather than probing a port nobody listens on.
+[location.gps]
+# env: BT_GPS_BACKEND        | flag: --gps-backend (default: gpsd; gpsd or mock)
+backend = "gpsd"
+# env: BT_GPS_HOST           | flag: --gps-host (default: 127.0.0.1)
+host = "127.0.0.1"
+# env: BT_GPS_PORT           | flag: --gps-port (default: 2947)
+# port = 2947
+# How long to wait for a report before giving up on this occurrence.
+# env: BT_GPS_TIMEOUT_MS     | flag: --gps-timeout-ms (default: 2000)
+timeout_ms = 2000
+# How long an acquired fix may be reused, so a busy node does not query gpsd per
+# advertisement.
+# env: BT_GPS_MAX_AGE_MS     (default: 60000)
+# max_age_ms = 60000
+# How long to stop retrying after a failure, so a node with no receiver does not
+# open a connection per occurrence.
+# env: BT_GPS_RETRY_BACKOFF_MS (default: 30000)
+# retry_backoff_ms = 30000
+
+# Certificate authority defaults, used by the `ca` subcommands
+#
+# These are what a `ca` command falls back to when you do not pass its own flag,
+# so a deployment can keep the root key path in one place instead of in five
+# shell histories.
+[ca]
+# env: CA_ROOT_KEY_PATH  | flag: ca-init --key-path (default: /var/lib/btmon/ca/root_key.hex)
+key_path = "/var/lib/btmon/ca/root_key.hex"
+# env: CA_VALIDITY_DAYS  | flag: ca-enroll --validity-days (default: 90)
+validity_days = 90
+# env: CA_NODE_TYPE      | flag: ca-enroll --node-type (default: full; full, light, aggregator, signal)
+node_type = "full"
+
+# Deprecated
+#
+# `[bluetooth].fixed_location` and `BT_FIXED_LOCATION` still work and mean
+# `[location].fixed`, but `[location]` wins when both are set. Using the old
+# name logs a note naming the new one; move it on the next edit:
+#
+# [bluetooth]
+# fixed_location = "40.712851,-73.910533"   # -> [location] fixed = "..."

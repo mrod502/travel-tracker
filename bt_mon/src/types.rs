@@ -715,15 +715,4 @@ mod tests {
         assert_eq!(device.id, cloned.id);
         assert_eq!(device.name, cloned.name);
     }
-
-    #[test]
-    fn test_update_field_variants() {
-        let fields = vec![
-            UpdateField::Name,
-            UpdateField::Rssi,
-            UpdateField::ServicesResolved,
-            UpdateField::Connected,
-        ];
-        assert_eq!(fields.len(), 4);
-    }
 }

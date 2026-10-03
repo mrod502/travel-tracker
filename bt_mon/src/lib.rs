@@ -66,7 +66,7 @@ pub use config::{adapter_matches, MonitorConfig, DEFAULT_SCAN_INTERVAL};
 pub use error::{BackendKind, Error, Result};
 pub use types::{
     BluetoothDevice, CharacteristicProperties, CharacteristicUuid, DeviceId, GattCharacteristic,
-    GattService, ServiceUuid, UpdateField, ValueNotification,
+    GattService, ServiceUuid, ValueNotification,
 };
 
 // Monitor traits
@@ -76,7 +76,11 @@ pub mod monitor;
 pub use monitor::{DeviceMonitor, GattClient};
 
 // Re-export event types
-pub use monitor::events::{DeviceEvent, NotificationEvent};
+//
+// `UpdateField` re-exports from the events module rather than `types`: it is a
+// property of an event, and it used to live in `types` as a second, distinct
+// enum of the same name.
+pub use monitor::events::{changed_device_fields, report_event, DeviceEvent, NotificationEvent, UpdateField};
 
 // Backend implementations
 //

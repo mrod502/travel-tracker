@@ -53,6 +53,8 @@ services:
         # DEV_UID/DEV_GID in .env (e.g., `id -u`/`id -g`; defaults to 1000).
         USER_UID: ${DEV_UID:-1000}
         USER_GID: ${DEV_GID:-1000}
+      
+    env_file: .env.dev
 
     container_name: llm-dev
 

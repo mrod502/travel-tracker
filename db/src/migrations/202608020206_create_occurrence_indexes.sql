@@ -1,3 +1,4 @@
+--migrate:up.begin
 -- Device identity queries (most common: trace a device's history)
 CREATE INDEX idx_occurrence_device_hash    ON occurrences (device_hash, observed_at DESC);
 
@@ -27,3 +28,19 @@ CREATE INDEX idx_occurrence_relay_occurrence
 -- Query relays by geo cell (find all relays in a region)
 CREATE INDEX idx_occurrence_relay_geo_cell 
     ON occurrence_relays (geo_cell_macro, observed_at DESC);
+--migrate:up.end
+
+--migrate:down.begin
+-- Revert the statements above.
+--
+-- Index-only revert: no rows are lost. Reverting this while the tables still
+-- exist costs the queries that need them, which is the point of a revert.
+DROP INDEX IF EXISTS idx_occurrence_device_hash;
+DROP INDEX IF EXISTS idx_occurrence_origin_node;
+DROP INDEX IF EXISTS idx_occurrence_geo_fine;
+DROP INDEX IF EXISTS idx_occurrence_geo_macro;
+DROP INDEX IF EXISTS idx_occurrence_location;
+DROP INDEX IF EXISTS idx_occurrence_relay_reporting_node;
+DROP INDEX IF EXISTS idx_occurrence_relay_occurrence;
+DROP INDEX IF EXISTS idx_occurrence_relay_geo_cell;
+--migrate:down.end

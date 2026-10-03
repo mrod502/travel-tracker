@@ -1,3 +1,4 @@
+--migrate:up.begin
 -- =====================================================================
 -- Distributed Wireless Signal Tracking - Initial Schema Migration
 -- Creates core tables: nodes, occurrences (partitioned), and supporting indexes
@@ -132,3 +133,18 @@ COMMENT ON TABLE occurrences IS
      Every row is independently verifiable: recompute/compare signed_payload
      and check signature against node(origin_node_id).signing_public_key.
      See docs/provenance.md for the exact verification procedure.';
+--migrate:up.end
+
+--migrate:down.begin
+-- Revert the statements above.
+--
+-- This is the one that loses the data: every occurrence row goes with the
+-- partitioned parent, along with each monthly partition attached to it
+-- (partitions are auto-dependent, so they drop with the parent under
+-- RESTRICT — including the ones ensure_occurrence_partitions() created at
+-- runtime, which no migration owns).
+--
+-- occurrence_relays holds the FK to occurrences, so it goes first.
+DROP TABLE IF EXISTS occurrence_relays RESTRICT;
+DROP TABLE IF EXISTS occurrences RESTRICT;
+--migrate:down.end

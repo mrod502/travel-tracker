@@ -1,3 +1,4 @@
+--migrate:up.begin
 -- ---------------------------------------------------------------------
 -- NODE REVOCATIONS
 -- Tracks revoked nodes and their revocation metadata.
@@ -66,3 +67,15 @@ Note: We use a simplified mapping:
 - Superseded = 5
 - Hold = 6
 $$;
+--migrate:up.end
+
+--migrate:down.begin
+-- Revert the statements above.
+--
+-- The revocation ledger is deleted along with its audit trail. That is what
+-- reverting this migration means, and it is worth being blunt about: a
+-- deployment that has ever revoked a node should not run this revert, because
+-- the record of that revocation is the only local evidence of it. The three
+-- indexes go with the table.
+DROP TABLE IF EXISTS node_revocations RESTRICT;
+--migrate:down.end

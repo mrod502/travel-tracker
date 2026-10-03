@@ -1,3 +1,4 @@
+--migrate:up.begin
 -- ---------------------------------------------------------------------
 -- NODES REGISTRY
 -- Local cache of known peers, synced via gossip membership (SWIM) and
@@ -48,4 +49,13 @@ occurrence's origin offline: check ca_credential against the CA's known
 root key once, then verify the occurrence signature against signing_public_key.
 Neither step requires a live CA call at verification time.
 $$;
+--migrate:up.end
 
+--migrate:down.begin
+-- Revert the statements above.
+--
+-- Drops the node registry, including every row in it. idx_node_type,
+-- idx_node_owns_geo_cells and idx_node_status go with the table.
+-- sync_cursors and occurrence_relays both reference nodes; they revert first.
+DROP TABLE IF EXISTS nodes RESTRICT;
+--migrate:down.end

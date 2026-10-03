@@ -1,3 +1,4 @@
+--migrate:up.begin
 -- =====================================================================
 -- The runner's own registry, as the first migration.
 --
@@ -25,3 +26,9 @@ CREATE TABLE IF NOT EXISTS migrations (
 
 COMMENT ON TABLE migrations IS
     'Applied-migration log for the db CLI: one row per migration file that has been applied. db up inserts the row inside the same transaction as the migration itself, so a rolled-back migration leaves no row, and db down removes the row when it reverts. This table is itself migration 202607312100 and is the floor of db down — reverting it would delete the record of what is applied, so it has no .down.sql.';
+--migrate:up.end
+
+-- No revert block, deliberately: this table is the record of what has been
+-- applied, so `db down` stops here rather than erasing the history it reads.
+-- (The table comment above predates revert blocks living in the migration file;
+-- it is stored in every database already built, so it is left as applied.)

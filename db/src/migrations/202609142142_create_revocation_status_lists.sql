@@ -1,3 +1,4 @@
+--migrate:up.begin
 -- ---------------------------------------------------------------------
 -- REVOCATION STATUS LISTS
 -- One row per Revocation Status List a CA has published, in the exact
@@ -75,3 +76,18 @@ The serialized signed list, including its revocation entries and signature.
 revocation_count is checked against this document's own array length so the
 indexed header cannot drift from the payload it summarises.
 $$;
+--migrate:up.end
+
+--migrate:down.begin
+-- Revert the statements above.
+--
+-- Dropping this table drops the record of which RSL sequence numbers a CA
+-- has already used. Re-applying the migration afterwards restarts every
+-- issuer's counter at 1, which means a list held back from before the drop
+-- becomes publishable again — so this revert is only safe on a deployment
+-- that has never issued an RSL, or one being torn down entirely.
+--
+-- node_revocations is left alone: it is the revocation ledger, created by
+-- its own migration, and outlives the lists generated from it.
+DROP TABLE IF EXISTS revocation_status_lists RESTRICT;
+--migrate:down.end

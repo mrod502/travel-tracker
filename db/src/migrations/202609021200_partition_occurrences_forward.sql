@@ -1,3 +1,4 @@
+--migrate:up.begin
 -- =====================================================================
 -- Occurrence partitions through the end of next year, and the mechanism
 -- that stops them running out a second time.
@@ -97,3 +98,18 @@ COMMENT ON FUNCTION ensure_occurrence_partitions(integer) IS
 -- Through the end of next year: i = 0 is the current month, i = 15 is
 -- December of the following year, so 16 months of head start.
 SELECT ensure_occurrence_partitions(15);
+--migrate:up.end
+
+--migrate:down.begin
+-- Revert the statements above.
+--
+-- Drops the maintenance function only. The monthly partitions it created stay
+-- attached to occurrences: they may hold rows, and deleting a partition is
+-- deleting the observations inside it. The partitions belong to occurrences
+-- and go with it when 202607312147_create_bluetooth_occurrences is reverted.
+--
+-- Consequence of reverting this alone: nothing creates next month's partition,
+-- which is the state the migration exists to prevent. Re-applying it restores
+-- the horizon immediately, because the function is idempotent.
+DROP FUNCTION IF EXISTS ensure_occurrence_partitions(integer) RESTRICT;
+--migrate:down.end

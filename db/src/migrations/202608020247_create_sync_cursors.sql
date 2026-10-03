@@ -1,3 +1,4 @@
+--migrate:up.begin
 -- ---------------------------------------------------------------------
 -- SYNC BOOKKEEPING
 -- Tracks per-peer replication cursor for application-level batch sync
@@ -18,3 +19,13 @@ COMMENT ON TABLE sync_cursors IS
     'Application-level sync progress tracking for store-and-forward
      replication over intermittent links. Used for both inbound (receiving
      from peers) and outbound (sending to peers) cursors.';
+--migrate:up.end
+
+--migrate:down.begin
+-- Revert the statements above.
+--
+-- Replication cursors go with it. Nothing else references this table, so the
+-- revert does not depend on ordering — except that it holds the only FK to
+-- nodes(other than the occurrences ones), and nodes reverts after it.
+DROP TABLE IF EXISTS sync_cursors RESTRICT;
+--migrate:down.end

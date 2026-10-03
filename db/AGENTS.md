@@ -69,21 +69,31 @@ Example: `202607312147_create_bluetooth_occurrences.sql`
 - **description**: snake_case description of the migration
 - **Extension**: Must be `.sql`
 
-Every migration is paired with a revert script of the same timestamp:
+Every migration carries its own revert, in the same file:
 
+```sql
+--migrate:up.begin
+    ...the change...
+--migrate:up.end
+
+--migrate:down.begin
+    ...the undo...
+--migrate:down.end
 ```
-<YYYYMMDDHHMM>_<description>.down.sql
-```
 
-`db down` runs that script and forgets the migration's registry row in one
-transaction. A migration with no revert script cannot be reverted at all — the
-run names it and stops rather than reverting part of the set. Prefer `RESTRICT`
-over `CASCADE` so an unexpected dependent fails loudly instead of being
-dropped silently.
+`db down` runs that `--migrate:down` block and forgets the migration's registry
+row in one transaction. A migration with no `down` block cannot be reverted at
+all — the run names it and stops rather than reverting part of the set. Prefer
+`RESTRICT` over `CASCADE` so an unexpected dependent fails loudly instead of
+being dropped silently.
 
-`db new-migration` writes both files; the `.down.sql` it generates is comments
-only, and `db down` refuses to revert a migration whose script has no
-statements. Write the revert before applying the migration, not after.
+`db new-migration` writes one file with an open, empty `up` block and a
+commented-out `down` block; `db down` refuses to revert a migration whose
+`down` block has no statements. Write the revert before applying the migration,
+not after. A `*.down.sql` left anywhere under the migrations directory stops
+`db up` and `db down` — the revert belongs to the migration file now, so a
+surviving sidecar is either dead weight or an irreversible migration that looks
+reversible.
 
 The one exception is `202607312100_create_migrations_registry.sql`, which
 creates the `migrations` table itself. It is the floor of `db down`: the
@@ -158,8 +168,9 @@ cargo run --bin db -- --host database --port 5432 --user ${DB_USER} --db ${DB_NA
 cargo run --bin db -- new-migration <description>
 ```
 
-Creates both `<timestamp>_<description>.sql` and
-`<timestamp>_<description>.down.sql` in `src/migrations`.
+Writes `<timestamp>_<description>.sql` in `src/migrations`, with the statements
+to fill into an empty `--migrate:up.begin`/`up.end` block and a commented-out
+`--migrate:down.begin`/`down.end` block.
 
 ## Modules
 
@@ -168,8 +179,9 @@ Creates both `<timestamp>_<description>.sql` and
 * [runner](./src/runner.rs) - Database migration runner logic
 * [up](./src/up.rs) - Migration up functionality (discovers and applies pending migrations)
 * [down](./src/down.rs) - `db down` (per-migration revert) and `db reset` (drop and re-apply)
+* [exec](./src/exec.rs) - Runs a parsed `up`/`down` group against Postgres, honouring `skipTx`
 * [registry](./src/registry.rs) - The `migrations` table: bootstrap, reads, and row writes
-* [new](./src/new.rs) - Migration creation utility (writes the up file and its revert script)
+* [new](./src/new.rs) - Migration creation utility (writes the up file with a revert block)
 * [file_attrs](./src/file_attrs.rs) - File attribute parsing for migration ordering
 
 ## Testing

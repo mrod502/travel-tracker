@@ -57,10 +57,12 @@
 //! ```
 
 // Core modules
+pub mod config;
 pub mod error;
 pub mod types;
 
 // Re-export core types for convenience
+pub use config::{adapter_matches, MonitorConfig, DEFAULT_SCAN_INTERVAL};
 pub use error::{BackendKind, Error, Result};
 pub use types::{
     BluetoothDevice, CharacteristicProperties, CharacteristicUuid, DeviceId, GattCharacteristic,
@@ -77,7 +79,12 @@ pub use monitor::{DeviceMonitor, GattClient};
 pub use monitor::events::{DeviceEvent, NotificationEvent};
 
 // Backend implementations
-#[cfg(any(feature = "btleplug", feature = "bluer"))]
+//
+// `mock` belongs in this list: the crate's own documentation offers
+// `default-features = false, features = ["mock"]` as a way to depend on the
+// library without a Bluetooth stack, and gating the module on the real backends
+// only makes that combination fail to compile.
+#[cfg(any(feature = "btleplug", feature = "bluer", feature = "mock"))]
 pub mod backends;
 
 /// Create a new Bluetooth monitor using the btleplug backend (cross-platform).
@@ -110,6 +117,42 @@ pub mod backends;
 #[cfg(feature = "btleplug")]
 pub async fn create_btleplug_monitor() -> Result<impl crate::monitor::GattClient> {
     crate::backends::btleplug::BtleplugMonitor::new().await
+}
+
+/// Create a btleplug monitor on the adapter and cadence `config` selects.
+///
+/// Use this whenever the operator has named an adapter or set a scan interval:
+/// [`create_btleplug_monitor`] takes the first adapter the system reports and no
+/// interval at all, so a setting that arrives here has to be handed over or it
+/// stops existing at this boundary.
+///
+/// # Errors
+///
+/// As [`create_btleplug_monitor`], plus an error when `config` names an adapter
+/// that this system does not have, or names one that more than one adapter
+/// matches.
+///
+/// # Example
+///
+/// ```no_run
+/// use bt_mon::{DeviceMonitor, MonitorConfig, create_btleplug_monitor_with_config};
+/// use std::time::Duration;
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), bt_mon::Error> {
+/// let monitor = create_btleplug_monitor_with_config(
+///     MonitorConfig::new().with_adapter("hci1").with_scan_interval(Duration::from_millis(500)),
+/// )
+/// .await?;
+/// monitor.start_scan().await?;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "btleplug")]
+pub async fn create_btleplug_monitor_with_config(
+    config: MonitorConfig,
+) -> Result<crate::backends::btleplug::BtleplugMonitor> {
+    crate::backends::btleplug::BtleplugMonitor::with_config(config).await
 }
 
 /// Create a new Bluetooth monitor using the bluer backend (Linux/BlueZ only).
@@ -145,6 +188,23 @@ pub async fn create_bluer_monitor() -> Result<impl crate::monitor::GattClient> {
     crate::backends::bluer::BluerMonitor::new().await
 }
 
+/// Create a bluer monitor on the adapter and cadence `config` selects.
+///
+/// The bluer analogue of [`create_btleplug_monitor_with_config`]: BlueZ has a
+/// default adapter, and "the default one" is not the same answer as "the one the
+/// operator asked for".
+///
+/// # Errors
+///
+/// As [`create_bluer_monitor`], plus an error when `config` names an adapter
+/// this session does not have, or one that several adapters match.
+#[cfg(feature = "bluer")]
+pub async fn create_bluer_monitor_with_config(
+    config: MonitorConfig,
+) -> Result<crate::backends::bluer::BluerMonitor> {
+    crate::backends::bluer::BluerMonitor::with_config(config).await
+}
+
 /// Create a new Bluetooth monitor using the mock backend (testing/development).
 ///
 /// This function is only available when the `mock` feature is enabled.
@@ -157,6 +217,11 @@ pub async fn create_bluer_monitor() -> Result<impl crate::monitor::GattClient> {
 /// - Configurable error responses for testing error handling
 /// - Simulated GATT services and characteristics
 /// - Configurable delays to simulate network/Bluetooth latency
+///
+/// The return type is the concrete [`MockMonitor`](backends::mock::MockMonitor)
+/// rather than `impl GattClient`: everything that makes the mock useful —
+/// `add_device`, `remove_device`, `set_device_services` — is inherent to it, and
+/// an opaque return type hides the API this function exists to hand out.
 ///
 /// # Example
 ///
@@ -180,8 +245,43 @@ pub async fn create_bluer_monitor() -> Result<impl crate::monitor::GattClient> {
 /// # }
 /// ```
 #[cfg(feature = "mock")]
-pub async fn create_mock_monitor() -> Result<impl crate::monitor::GattClient> {
+pub async fn create_mock_monitor() -> Result<crate::backends::mock::MockMonitor> {
     Ok(crate::backends::mock::MockMonitor::new())
+}
+
+/// Create a mock monitor from a [`MockConfig`].
+///
+/// `create_mock_monitor` builds a harness: the room is empty until the caller
+/// adds a device to it, so a scan of an unattended run discovers nothing. Put
+/// advertisers in the config to get an environment instead — see
+/// [`MockConfig::with_advertiser_count`].
+///
+/// [`MockConfig`]: backends::mock::MockConfig
+///
+/// # Example
+///
+/// ```
+/// use bt_mon::{DeviceMonitor, create_mock_monitor_with_config};
+/// use bt_mon::backends::mock::MockConfig;
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), bt_mon::Error> {
+/// let monitor = create_mock_monitor_with_config(
+///     MockConfig::default().with_advertiser_count(3),
+/// )
+/// .await?;
+///
+/// monitor.start_scan().await?;
+/// // The three beacons are now on the air, and any stream opened from here
+/// // receives them.
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "mock")]
+pub async fn create_mock_monitor_with_config(
+    config: crate::backends::mock::MockConfig,
+) -> Result<crate::backends::mock::MockMonitor> {
+    Ok(crate::backends::mock::MockMonitor::with_config(config))
 }
 
 #[cfg(test)]

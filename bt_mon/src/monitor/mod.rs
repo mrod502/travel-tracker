@@ -6,10 +6,8 @@
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::types::{
-    BluetoothDevice, CharacteristicUuid, DeviceId, GattService,
-};
 use crate::monitor::events::{DeviceEventStream, NotificationStream};
+use crate::types::{BluetoothDevice, CharacteristicUuid, DeviceId, GattService};
 
 pub mod events;
 
@@ -165,8 +163,11 @@ pub trait GattClient: DeviceMonitor {
     ///
     /// Returns an error if the characteristic doesn't support reading,
     /// if the read operation fails, or if the device disconnects.
-    async fn read_characteristic(&self, id: &DeviceId, uuid: &CharacteristicUuid)
-        -> Result<Vec<u8>>;
+    async fn read_characteristic(
+        &self,
+        id: &DeviceId,
+        uuid: &CharacteristicUuid,
+    ) -> Result<Vec<u8>>;
 
     /// Write a characteristic value.
     ///
@@ -195,22 +196,14 @@ pub trait GattClient: DeviceMonitor {
     ///
     /// Returns an error if the characteristic doesn't support notifications,
     /// if the subscription fails, or if the device disconnects.
-    async fn subscribe(
-        &self,
-        id: &DeviceId,
-        uuid: &CharacteristicUuid,
-    ) -> Result<()>;
+    async fn subscribe(&self, id: &DeviceId, uuid: &CharacteristicUuid) -> Result<()>;
 
     /// Unsubscribe from characteristic notifications.
     ///
     /// # Errors
     ///
     /// Returns an error if the unsubscribe operation fails.
-    async fn unsubscribe(
-        &self,
-        id: &DeviceId,
-        uuid: &CharacteristicUuid,
-    ) -> Result<()>;
+    async fn unsubscribe(&self, id: &DeviceId, uuid: &CharacteristicUuid) -> Result<()>;
 
     /// Get notification stream for a device.
     ///

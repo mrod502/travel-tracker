@@ -64,6 +64,15 @@ impl fmt::Display for DeviceId {
     }
 }
 
+/// The conversion callers reach for when they already own the address string —
+/// `bluer` reports a `SimpleAddress` and converts with `.into()`, so without this
+/// the `bluer` backend does not compile at all.
+impl From<String> for DeviceId {
+    fn from(id: String) -> Self {
+        Self(id)
+    }
+}
+
 /// UUID for a GATT service.
 ///
 /// A type-safe wrapper around `uuid::Uuid` for GATT services.
@@ -193,6 +202,16 @@ pub struct BluetoothDevice {
     pub service_data: HashMap<ServiceUuid, Vec<u8>>,
     /// Whether services have been resolved.
     pub services_resolved: bool,
+    /// The advertisement payload as the backend reported it, undecoded.
+    ///
+    /// Distinct from [`manufacturer_data`](Self::manufacturer_data) and
+    /// [`service_data`](Self::service_data), which are the fields the backend
+    /// parsed *out* of these bytes. Whether they exist at all depends on the
+    /// backend: a stack that hands over parsed properties only (btleplug on
+    /// BlueZ does exactly this) leaves this `None`, so `None` means "this
+    /// backend does not expose the raw payload", never "the device advertised
+    /// nothing".
+    pub raw_payload: Option<Vec<u8>>,
 }
 
 impl BluetoothDevice {
@@ -210,6 +229,7 @@ impl BluetoothDevice {
             manufacturer_data: HashMap::new(),
             service_data: HashMap::new(),
             services_resolved: false,
+            raw_payload: None,
         }
     }
 
@@ -251,6 +271,16 @@ impl BluetoothDevice {
     /// contains UUID-keyed service-specific data.
     pub fn with_service_data(mut self, uuid: ServiceUuid, data: Vec<u8>) -> Self {
         self.service_data.insert(uuid, data);
+        self
+    }
+
+    /// Attach the undecoded advertisement payload.
+    ///
+    /// Backends that receive the advertisement as a byte string use this to pass
+    /// it through verbatim; see [`BluetoothDevice::raw_payload`] for what `None`
+    /// means to a consumer.
+    pub fn with_raw_payload(mut self, payload: impl Into<Vec<u8>>) -> Self {
+        self.raw_payload = Some(payload.into());
         self
     }
 }
@@ -626,7 +656,8 @@ mod tests {
 
     #[test]
     fn test_gatt_characteristic() {
-        let char_uuid = CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
+        let char_uuid =
+            CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
         let props = CharacteristicProperties::new()
             .with_read(true)
             .with_write(true)
@@ -663,7 +694,8 @@ mod tests {
 
     #[test]
     fn test_value_notification() {
-        let char_uuid = CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
+        let char_uuid =
+            CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
         let notification = ValueNotification::new(char_uuid, vec![1, 2, 3, 4]);
 
         assert_eq!(notification.characteristic, char_uuid);
@@ -674,7 +706,8 @@ mod tests {
 
     #[test]
     fn test_value_notification_without_timestamp() {
-        let char_uuid = CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
+        let char_uuid =
+            CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
         let notification = ValueNotification::without_timestamp(char_uuid, vec![1, 2, 3]);
 
         assert!(notification.timestamp.is_none());

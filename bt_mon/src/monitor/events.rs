@@ -59,18 +59,16 @@ impl NotificationEvent {
 }
 
 /// Type alias for device event streams.
-pub type DeviceEventStream = std::pin::Pin<
-    Box<dyn futures::stream::Stream<Item = DeviceEvent> + Send + 'static>,
->;
+pub type DeviceEventStream =
+    std::pin::Pin<Box<dyn futures::stream::Stream<Item = DeviceEvent> + Send + 'static>>;
 
 /// Default capacity for the channel bridging a backend's event source and
 /// consumers of [`DeviceEventStream`].
 pub const DEVICE_EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Type alias for notification streams.
-pub type NotificationStream = std::pin::Pin<
-    Box<dyn futures::stream::Stream<Item = ValueNotification> + Send + 'static>,
->;
+pub type NotificationStream =
+    std::pin::Pin<Box<dyn futures::stream::Stream<Item = ValueNotification> + Send + 'static>>;
 
 #[cfg(test)]
 mod tests {
@@ -83,9 +81,11 @@ mod tests {
             "AA:BB:CC:DD:EE:FF".to_string(),
         )
         .with_name("Test Device");
-        
-        let event = DeviceEvent::DeviceAdded { device: device.clone() };
-        
+
+        let event = DeviceEvent::DeviceAdded {
+            device: device.clone(),
+        };
+
         match event {
             DeviceEvent::DeviceAdded { device } => {
                 assert_eq!(device.name, Some("Test Device".to_string()));
@@ -98,7 +98,7 @@ mod tests {
     fn test_device_event_removed() {
         let id = DeviceId::new("AA:BB:CC:DD:EE:FF");
         let event = DeviceEvent::DeviceRemoved { id: id.clone() };
-        
+
         match event {
             DeviceEvent::DeviceRemoved { id } => {
                 assert_eq!(id.as_str(), "AA:BB:CC:DD:EE:FF");
@@ -117,7 +117,7 @@ mod tests {
             device,
             changed_fields: vec![UpdateField::Rssi, UpdateField::Name],
         };
-        
+
         match event {
             DeviceEvent::DeviceUpdated { changed_fields, .. } => {
                 assert_eq!(changed_fields.len(), 2);
@@ -132,11 +132,12 @@ mod tests {
     fn test_notification_event() {
         use crate::types::CharacteristicUuid;
         let device_id = DeviceId::new("AA:BB:CC:DD:EE:FF");
-        let char_uuid = CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
+        let char_uuid =
+            CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
         let notification = ValueNotification::new(char_uuid, vec![1, 2, 3]);
-        
+
         let event = NotificationEvent::new(device_id.clone(), notification);
-        
+
         assert_eq!(event.device_id, device_id);
         assert_eq!(event.notification.as_slice(), &[1, 2, 3]);
     }

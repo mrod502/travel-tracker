@@ -111,7 +111,10 @@ impl fmt::Display for Error {
             Error::ConnectionTimeout => write!(f, "Connection timeout"),
             Error::Cancelled => write!(f, "Operation cancelled"),
             Error::InvalidArgument(msg) => write!(f, "Invalid argument: {}", msg),
-            Error::BackendUnavailable { required, available } => {
+            Error::BackendUnavailable {
+                required,
+                available,
+            } => {
                 write!(
                     f,
                     "Backend {} unavailable. Available: {:?}",
@@ -185,8 +188,13 @@ mod tests {
         let err = Error::DeviceNotFound(DeviceId("AA:BB:CC:DD:EE:FF".to_string()));
         assert_eq!(format!("{}", err), "Device not found: AA:BB:CC:DD:EE:FF");
 
-        let err = Error::ServiceNotFound(ServiceUuid(uuid::Uuid::parse_str("00001800-0000-1000-8000-00805f9b34fb").unwrap()));
-        assert_eq!(format!("{}", err), "Service not found: 00001800-0000-1000-8000-00805f9b34fb");
+        let err = Error::ServiceNotFound(ServiceUuid(
+            uuid::Uuid::parse_str("00001800-0000-1000-8000-00805f9b34fb").unwrap(),
+        ));
+        assert_eq!(
+            format!("{}", err),
+            "Service not found: 00001800-0000-1000-8000-00805f9b34fb"
+        );
 
         let err = Error::ConnectionTimeout;
         assert_eq!(format!("{}", err), "Connection timeout");

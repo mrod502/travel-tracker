@@ -31,6 +31,25 @@ tokio = { version = "1.35", features = ["full"] }
 env_logger = "0.10"
 futures-util = "0.3"
 
+# Each example names the backend feature it compiles against, so
+# `cargo check --workspace --all-targets` skips the ones whose backend is
+# not enabled instead of failing on a configured-out module.
+[[example]]
+name = "connect_and_read"
+required-features = ["btleplug"]
+
+[[example]]
+name = "device_discovery"
+required-features = ["btleplug"]
+
+[[example]]
+name = "subscribe_notifications"
+required-features = ["btleplug"]
+
+[[example]]
+name = "mock_backend_demo"
+required-features = ["mock"]
+
 [features]
 default = ["btleplug"]
 btleplug = ["dep:btleplug"]

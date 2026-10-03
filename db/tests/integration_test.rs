@@ -19,23 +19,18 @@ struct FileAttrs {
     created_at: chrono::DateTime<Local>,
 }
 
-impl PartialOrd for FileAttrs {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match self.created_at.partial_cmp(&other.created_at) {
-            Some(core::cmp::Ordering::Equal) => {}
-            ord => return ord,
-        }
-        match self.full_path.partial_cmp(&other.full_path) {
-            Some(core::cmp::Ordering::Equal) => {}
-            ord => return ord,
-        }
-        self.name.partial_cmp(&other.name)
+impl Ord for FileAttrs {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.created_at
+            .cmp(&other.created_at)
+            .then_with(|| self.full_path.cmp(&other.full_path))
+            .then_with(|| self.name.cmp(&other.name))
     }
 }
 
-impl Ord for FileAttrs {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.created_at.cmp(&other.created_at)
+impl PartialOrd for FileAttrs {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -125,58 +120,38 @@ fn test_file_attrs_reflexivity() {
 // Migration Statement Splitting Tests
 // ============================================================================
 
-/// Simulate the split_query function from UpArgs (using sqlparser)
-fn split_query(q: &str) -> Vec<String> {
-    use sqlparser::dialect::PostgreSqlDialect;
-    use sqlparser::parser::Parser;
-
-    let dialect = PostgreSqlDialect {};
-    match Parser::parse_sql(&dialect, q) {
-        Ok(statements) => statements
-            .into_iter()
-            .map(|stmt| stmt.to_string())
-            .collect(),
-        Err(_) => {
-            // Fallback to simple split
-            q.split(';').map(|v| v.to_string()).collect()
-        }
-    }
+// The runner splits with `db::Lexer`; these exercise it from outside the crate,
+// the way `db` itself does. There is no longer a `sqlparser` path to fall back
+// to, so dialect-specific syntax and a positional `$1` are just characters.
+fn lex(source: &str) -> Vec<String> {
+    db::Lexer::new(source, "integration_test.sql")
+        .filter_map(|token| token.ok())
+        .filter_map(|token| match token {
+            db::LexToken::Statement(statement) => Some(statement.sql),
+            db::LexToken::Directive(_) => None,
+        })
+        .collect()
 }
 
 #[test]
 fn test_split_query_filters_empty_statements() {
-    let query = "CREATE TABLE a (id INT); CREATE INDEX idx ON a(id); INSERT INTO a VALUES (1);";
-    let statements = split_query(query);
+    let statements =
+        lex("CREATE TABLE a (id INT); CREATE INDEX idx ON a(id); INSERT INTO a VALUES (1);");
 
-    // With sqlparser, statements are properly parsed without trailing empty ones
-    let non_empty: Vec<&String> = statements.iter().filter(|s| !s.trim().is_empty()).collect();
-
-    assert_eq!(non_empty.len(), 3);
-    assert!(non_empty[0].contains("CREATE TABLE"));
-    assert!(non_empty[1].contains("CREATE INDEX"));
-    assert!(non_empty[2].contains("INSERT"));
+    assert_eq!(statements.len(), 3);
+    assert!(statements[0].contains("CREATE TABLE"));
+    assert!(statements[1].contains("CREATE INDEX"));
+    assert!(statements[2].contains("INSERT"));
 }
 
 #[test]
 fn test_split_query_handles_consecutive_semicolons() {
-    let query = "SELECT 1;; SELECT 2;";
-    let statements = split_query(query);
-
-    // With sqlparser, empty statements between consecutive semicolons are filtered
-    assert_eq!(statements.len(), 2);
-    assert_eq!(statements[0], "SELECT 1");
-    assert_eq!(statements[1], "SELECT 2");
+    assert_eq!(lex("SELECT 1;; SELECT 2;"), ["SELECT 1", "SELECT 2"]);
 }
 
 #[test]
 fn test_split_query_trims_whitespace() {
-    let query = "  SELECT 1;  SELECT 2;  ";
-    let statements = split_query(query);
-
-    // sqlparser trims whitespace from statements
-    assert_eq!(statements.len(), 2);
-    assert_eq!(statements[0], "SELECT 1");
-    assert_eq!(statements[1], "SELECT 2");
+    assert_eq!(lex("  SELECT 1;  SELECT 2;  "), ["SELECT 1", "SELECT 2"]);
 }
 
 // ============================================================================

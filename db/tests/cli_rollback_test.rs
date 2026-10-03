@@ -11,6 +11,7 @@
 //! * reverting a migration changes the schema, instead of `down` wiping it
 //!   wholesale and re-applying everything (M1).
 
+use db::MigrationParser;
 use sqlx::{AssertSqlSafe, Executor, PgPool, Row};
 use std::path::Path;
 use std::process::Command;
@@ -353,29 +354,48 @@ async fn destructive_commands_refuse_a_remote_target_without_acknowledgement() {
     target.cleanup(&db, pool).await;
 }
 
+/// Every committed migration carries its own revert, except the registry —
+/// `db down`'s floor. A `*.down.sql` beside a migration is not a revert the
+/// runner reads any more, so none may be committed: its statements are either
+/// already inside the file, where they will rot, or not, where they make the
+/// migration irreversible while looking reversible.
 #[test]
 fn every_committed_migration_is_revertible_or_the_floor() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations");
-    let mut up = Vec::new();
-    let mut down = Vec::new();
+    let registry =
+        db::DirectiveRegistry::with_builtins().expect("built-in directive keys are distinct");
+    let mut sidecars = Vec::new();
+    let mut unrevertible = Vec::new();
+
     for entry in std::fs::read_dir(&dir).expect("migrations directory") {
         let path = entry.expect("readable entry").path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
         if name.ends_with(".down.sql") {
-            down.push(name.replacen(".down.sql", "", 1));
-        } else if name.ends_with(".sql") {
-            up.push(name.trim_end_matches(".sql").to_string());
+            sidecars.push(name.to_string());
+            continue;
+        }
+        if !name.ends_with(".sql") {
+            continue;
+        }
+
+        let source = std::fs::read_to_string(&path).expect("migration should be readable");
+        let migration = db::StandardMigrationParser::new(&path)
+            .parse(&source, &registry)
+            .unwrap_or_else(|e| panic!("{name} should parse: {e}"));
+
+        if migration.down.is_none() && !name.ends_with("create_migrations_registry.sql") {
+            unrevertible.push(name.to_string());
         }
     }
 
-    let orphan_reverts: Vec<&String> = down
-        .iter()
-        .filter(|stem| !up.iter().any(|u| u == *stem))
-        .collect();
     assert!(
-        orphan_reverts.is_empty(),
-        "revert scripts with no matching migration: {orphan_reverts:?}"
+        sidecars.is_empty(),
+        "legacy revert scripts are committed: {sidecars:?}"
+    );
+    assert!(
+        unrevertible.is_empty(),
+        "migrations with no --migrate:down block: {unrevertible:?}"
     );
 }

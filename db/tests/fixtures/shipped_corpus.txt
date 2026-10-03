@@ -1,0 +1,36 @@
+# What each committed migration contributes, as `db::Lexer` reads it.
+#
+#     <file>    up=<count>/<digest>   down=<count>/<digest>
+#
+# The digest is FNV-1a over the whitespace-collapsed statement text in file
+# order. It changes when a statement changes, appears, or disappears; it does
+# not change when a comment is reworded or a block is re-wrapped. `0/0…0` means
+# the file declares no revert at all.
+#
+# A migration that has been applied somewhere is a fact about that database, so
+# editing what a committed file means is not a refactor — the databases that ran
+# it cannot be diffed afterwards, which is what makes this lock the only place
+# such a change shows up.
+#
+# Captured when each `<name>.down.sql` was folded into a `--migrate:down` block
+# inside its own migration: every `up` digest is the one its file had as a plain
+# pre-directive migration, and every `down` digest equals the `up` digest of the
+# sidecar it absorbed.
+#
+# If a committed migration genuinely has to change, regenerate this file and say
+# why in the commit message:
+#
+#     DB_CORPUS_REGEN=1 cargo test -p db --test parse_migration_file
+202607312100_create_migrations_registry.sql	up=2/d8fcf628f584d6ca	down=0/0000000000000000
+202607312127_add_extensions.sql	up=4/b60fb4dce65489cc	down=4/108bef9cf2c5c534
+202607312137_create_bluetooth_occurrence_types.sql	up=7/619f17ac15cf47d4	down=7/55ca3155771403c5
+202607312146_create_nodes.sql	up=5/1f8d163719859d47	down=1/d352752562d7f2bc
+202607312147_create_bluetooth_occurrences.sql	up=6/927a0560c451b9e8	down=2/1ccd09dc38ad445f
+202608020206_create_occurrence_indexes.sql	up=8/9ce2ff2c238b92c5	down=8/0c3162aa715a431a
+202608020247_create_sync_cursors.sql	up=2/fd06a4eab0825686	down=1/e23abb7483e3eecc
+202608260000_create_node_revocations.sql	up=6/9c7d398810c8d12b	down=1/17a5d9253ee54667
+202609021200_partition_occurrences_forward.sql	up=3/f988d7ba43be60a9	down=1/e7b8c66bef7f83a8
+202609041200_fix_geo_cell_coordinate_order.sql	up=4/e34c4474466e808d	down=4/1bf4e684732009fd
+202609141353_ensure_occurrence_partition_on_demand.sql	up=8/51cac840d2ea98a5	down=4/479cf1354affdc6c
+202609142142_create_revocation_status_lists.sql	up=5/be595524ab01c141	down=1/41d02c36a8477688
+202609271430_create_device_identity_tables.sql	up=23/c7df670fd69337e5	down=5/2ad0754d3144a6da

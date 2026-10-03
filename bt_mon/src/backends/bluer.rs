@@ -10,11 +10,13 @@ use dashmap::DashMap;
 use futures::stream::{self, StreamExt};
 use log::{debug, info, warn};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time;
 
+use crate::config::{adapter_matches, MonitorConfig};
 use crate::error::{BackendKind, Error, Result};
 use crate::monitor::events::{DeviceEvent, DeviceEventStream, NotificationStream};
 use crate::monitor::{DeviceMonitor, GattClient};
@@ -36,31 +38,51 @@ pub struct BluerMonitor {
     adapter: Arc<Mutex<Adapter>>,
     adapter_name: String,
     devices: Arc<DashMap<DeviceId, DiscoveredDevice>>,
-    scanning: Arc<Mutex<bool>>,
+    scanning: Arc<AtomicBool>,
+    /// How often the discovery session is re-opened; see
+    /// [`MonitorConfig::scan_interval`].
+    scan_interval: Duration,
 }
 
 impl BluerMonitor {
-    /// Create a new bluer monitor.
+    /// Create a new bluer monitor on the default adapter.
     ///
     /// # Errors
     ///
     /// Returns an error if the BlueZ session cannot be established
     /// or if no Bluetooth adapter is found.
     pub async fn new() -> Result<Self> {
+        Self::with_config(MonitorConfig::default()).await
+    }
+
+    /// Create a bluer monitor on the adapter and scan cadence `config` asks for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the BlueZ session cannot be established, if no
+    /// Bluetooth adapter is found, or — when [`MonitorConfig::adapter`] is set —
+    /// if the selector matches no adapter or matches more than one.
+    pub async fn with_config(config: MonitorConfig) -> Result<Self> {
         debug!("Initializing bluer monitor");
 
-        let session = bluer::Session::new().await
+        let session = bluer::Session::new()
+            .await
             .map_err(|e| Error::InitFailed(format!("Failed to create bluer session: {}", e)))?;
 
-        let adapter = session.default_adapter()
-            .await
-            .map_err(|e| Error::InitFailed(format!("Failed to get default adapter: {}", e)))?;
+        let adapter = match config.adapter.as_deref() {
+            None => session
+                .default_adapter()
+                .await
+                .map_err(|e| Error::InitFailed(format!("Failed to get default adapter: {}", e)))?,
+            Some(selector) => Self::select_adapter(&session, selector).await?,
+        };
 
         let adapter_name = adapter.name().to_string();
         debug!("Using adapter: {}", adapter_name);
 
-        let is_powered = adapter.is_powered().await
-            .map_err(|e| Error::InitFailed(format!("Failed to check adapter power state: {}", e)))?;
+        let is_powered = adapter.is_powered().await.map_err(|e| {
+            Error::InitFailed(format!("Failed to check adapter power state: {}", e))
+        })?;
 
         if !is_powered {
             warn!("Bluetooth adapter '{}' is not powered on.", adapter_name);
@@ -72,8 +94,66 @@ impl BluerMonitor {
             adapter: Arc::new(Mutex::new(adapter)),
             adapter_name,
             devices: Arc::new(DashMap::new()),
-            scanning: Arc::new(Mutex::new(false)),
+            scanning: Arc::new(AtomicBool::new(false)),
+            scan_interval: config.scan_interval,
         })
+    }
+
+    /// Pick the one adapter the operator named, or say what the session has.
+    ///
+    /// A BlueZ adapter is named by its D-Bus object (`hci0`), so the selector is
+    /// matched against the name and, since an operator more often has the MAC
+    /// address to hand, against the address too.
+    async fn select_adapter(session: &bluer::Session, selector: &str) -> Result<Adapter> {
+        let names = session
+            .adapter_names()
+            .await
+            .map_err(|e| Error::InitFailed(format!("Failed to list adapters: {}", e)))?;
+
+        let mut found = Vec::new();
+        let mut matching = Vec::new();
+
+        for name in &names {
+            let address = match session.adapter(name) {
+                Ok(adapter) => adapter
+                    .address()
+                    .await
+                    .map(|address| address.to_string())
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            };
+            let description = if address.is_empty() {
+                name.clone()
+            } else {
+                format!("{name} ({address})")
+            };
+            found.push(description.clone());
+            if adapter_matches(&description, selector) {
+                match session.adapter(name) {
+                    Ok(adapter) => matching.push(adapter),
+                    Err(e) => {
+                        return Err(Error::InitFailed(format!(
+                            "Failed to open adapter '{name}': {e}"
+                        )))
+                    }
+                }
+            }
+        }
+
+        match matching.len() {
+            1 => Ok(matching.pop().expect("one match counted")),
+            0 if found.is_empty() => {
+                Err(Error::InitFailed("No Bluetooth adapters found".to_string()))
+            }
+            0 => Err(Error::InitFailed(format!(
+                "no Bluetooth adapter matches '{selector}'; this system has: {}",
+                found.join(", ")
+            ))),
+            count => Err(Error::InitFailed(format!(
+                "'{selector}' matches {count} adapters ({}); select one of them exactly",
+                found.join(", ")
+            ))),
+        }
     }
 
     fn address_to_device_id(address: &bluer::Address) -> DeviceId {
@@ -84,7 +164,8 @@ impl BluerMonitor {
         adapter: &Adapter,
         address: &bluer::Address,
     ) -> Result<BluetoothDevice> {
-        let device = adapter.device(*address)
+        let device = adapter
+            .device(*address)
             .map_err(|_e| Error::DeviceNotFound(address.to_string().into()))?;
 
         let id = Self::address_to_device_id(address);
@@ -103,6 +184,9 @@ impl BluerMonitor {
             manufacturer_data: HashMap::new(),
             service_data: HashMap::new(),
             services_resolved,
+            // BlueZ hands bluer parsed device properties, not the advertisement
+            // octets they were decoded from.
+            raw_payload: None,
         })
     }
 
@@ -125,17 +209,18 @@ impl BluerMonitor {
         _adapter: &Adapter,
         service: &bluer::gatt::remote::Service,
     ) -> Result<GattService> {
-        let uuid = service.uuid().await
-            .map_err(|e| Error::BackendError {
-                backend: BackendKind::Bluer,
-                message: format!("Failed to get service UUID: {}", e),
-            })?;
+        let uuid = service.uuid().await.map_err(|e| Error::BackendError {
+            backend: BackendKind::Bluer,
+            message: format!("Failed to get service UUID: {}", e),
+        })?;
         let svc_uuid = ServiceUuid(uuid);
 
         // Primary flag - bluer doesn't directly expose this, default to false
         let is_primary = false;
 
-        let characteristics = service.characteristics().await
+        let characteristics = service
+            .characteristics()
+            .await
             .map_err(|e| Error::BackendError {
                 backend: BackendKind::Bluer,
                 message: format!("Failed to get characteristics: {}", e),
@@ -143,19 +228,17 @@ impl BluerMonitor {
 
         let mut gatt_characteristics = Vec::new();
         for char in characteristics.iter() {
-            let char_uuid = char.uuid().await
-                .map_err(|e| Error::BackendError {
-                    backend: BackendKind::Bluer,
-                    message: format!("Failed to get characteristic UUID: {}", e),
-                })?;
+            let char_uuid = char.uuid().await.map_err(|e| Error::BackendError {
+                backend: BackendKind::Bluer,
+                message: format!("Failed to get characteristic UUID: {}", e),
+            })?;
             let char_uuid = CharacteristicUuid(char_uuid);
 
             // Get properties from flags
-            let flags = char.flags().await
-                .map_err(|e| Error::BackendError {
-                    backend: BackendKind::Bluer,
-                    message: format!("Failed to get characteristic flags: {}", e),
-                })?;
+            let flags = char.flags().await.map_err(|e| Error::BackendError {
+                backend: BackendKind::Bluer,
+                message: format!("Failed to get characteristic flags: {}", e),
+            })?;
             let props = Self::bluer_flags_to_characteristic_props(flags);
 
             gatt_characteristics.push(GattCharacteristic {
@@ -206,8 +289,7 @@ impl BluerMonitor {
 #[async_trait]
 impl DeviceMonitor for BluerMonitor {
     async fn start_scan(&self) -> Result<()> {
-        let mut scanning = self.scanning.lock().await;
-        if *scanning {
+        if self.scanning.swap(true, Ordering::SeqCst) {
             return Err(Error::ScanAlreadyInProgress);
         }
 
@@ -215,45 +297,64 @@ impl DeviceMonitor for BluerMonitor {
         let adapter = self.adapter.lock().await;
         self.devices.clear();
 
-        let discover_stream = adapter.discover_devices().await
-            .map_err(|e| Error::BackendError {
-                backend: BackendKind::Bluer,
-                message: format!("Failed to start discovery: {}", e),
-            })?;
+        let discover_stream =
+            adapter
+                .discover_devices()
+                .await
+                .map_err(|e| Error::BackendError {
+                    backend: BackendKind::Bluer,
+                    message: format!("Failed to start discovery: {}", e),
+                })?;
 
-        *scanning = true;
-        info!("Scan started successfully on adapter '{}'", self.adapter_name);
+        info!(
+            "Scan started successfully on adapter '{}'",
+            self.adapter_name
+        );
         drop(adapter);
 
         let devices = self.devices.clone();
         let adapter_clone = self.adapter.clone();
+        let scanning = self.scanning.clone();
+        let interval = self.scan_interval;
 
         tokio::spawn(async move {
+            // Replacing the stream ends the old discovery session (its guard is
+            // what holds the session open) and opens a new one, which is how a
+            // discovery session that has gone stale without saying so gets
+            // refreshed instead of leaving a healthy-looking node deaf.
             let mut stream = discover_stream;
-            while let Some(event) = stream.next().await {
-                match event {
-                    bluer::AdapterEvent::DeviceAdded(address) => {
-                        debug!("Device added: {}", address);
-                        if let Ok(adapter) = adapter_clone.try_lock() {
-                            if let Ok(device) = Self::device_to_bluetooth_device(&adapter, &address).await {
-                                let id = device.id.clone();
-                                if let Ok(addr) = adapter.address().await {
-                                    devices.insert(id, DiscoveredDevice {
-                                        device,
-                                        adapter: adapter.clone(),
-                                        address: addr,
-                                    });
-                                }
+            loop {
+                if !scanning.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                if interval.is_zero() {
+                    while let Some(event) = stream.next().await {
+                        handle_adapter_event(event, &devices, &adapter_clone).await;
+                    }
+                    break;
+                }
+
+                let deadline = time::Instant::now() + interval;
+                tokio::select! {
+                    event = stream.next() => match event {
+                        Some(event) => handle_adapter_event(event, &devices, &adapter_clone).await,
+                        // The session ended; a re-open would need a fresh
+                        // `discover_devices()` call, which is `start_scan`'s job.
+                        None => break,
+                    },
+                    _ = time::sleep_until(deadline) => {
+                        let adapter = adapter_clone.lock().await;
+                        match adapter.discover_devices().await {
+                            Ok(fresh) => {
+                                stream = fresh;
+                                debug!("discovery session re-armed after {:?}", interval);
+                            }
+                            Err(e) => {
+                                warn!("failed to re-arm discovery: {}", e);
+                                break;
                             }
                         }
-                    }
-                    bluer::AdapterEvent::DeviceRemoved(address) => {
-                        debug!("Device removed: {}", address);
-                        let id = Self::address_to_device_id(&address);
-                        devices.remove(&id);
-                    }
-                    bluer::AdapterEvent::PropertyChanged(_) => {
-                        debug!("Adapter property changed");
                     }
                 }
             }
@@ -264,48 +365,57 @@ impl DeviceMonitor for BluerMonitor {
     }
 
     async fn stop_scan(&self) -> Result<()> {
-        let mut scanning = self.scanning.lock().await;
-        if !*scanning {
+        if !self.scanning.load(Ordering::SeqCst) {
             return Err(Error::NotScanning);
         }
         debug!("Stopping scan...");
-        *scanning = false;
+        self.scanning.store(false, Ordering::SeqCst);
         info!("Scan stopped successfully");
         Ok(())
     }
 
     async fn devices(&self) -> Result<Vec<BluetoothDevice>> {
-        Ok(self.devices.iter().map(|e| e.value().device.clone()).collect())
+        Ok(self
+            .devices
+            .iter()
+            .map(|e| e.value().device.clone())
+            .collect())
     }
 
     async fn device(&self, id: &DeviceId) -> Result<BluetoothDevice> {
-        let entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        let entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         Ok(entry.value().device.clone())
     }
 
     async fn is_powered(&self) -> Result<bool> {
         let adapter = self.adapter.lock().await;
-        adapter.is_powered().await
-            .map_err(|e| Error::BackendError {
-                backend: BackendKind::Bluer,
-                message: format!("Failed to check power state: {}", e),
-            })
+        adapter.is_powered().await.map_err(|e| Error::BackendError {
+            backend: BackendKind::Bluer,
+            message: format!("Failed to check power state: {}", e),
+        })
     }
 
     async fn adapter_info(&self) -> Result<String> {
         let adapter = self.adapter.lock().await;
         let name = adapter.name();
-        let address = adapter.address().await
-            .map_err(|e| Error::BackendError {
-                backend: BackendKind::Bluer,
-                message: format!("Failed to get address: {}", e),
-            })?;
-        let powered = adapter.is_powered().await
+        let address = adapter.address().await.map_err(|e| Error::BackendError {
+            backend: BackendKind::Bluer,
+            message: format!("Failed to get address: {}", e),
+        })?;
+        let powered = adapter
+            .is_powered()
+            .await
             .map_err(|e| Error::BackendError {
                 backend: BackendKind::Bluer,
                 message: format!("Failed to check power: {}", e),
             })?;
-        Ok(format!("Adapter '{}' ({}): powered={}", name, address, powered))
+        Ok(format!(
+            "Adapter '{}' ({}): powered={}",
+            name, address, powered
+        ))
     }
 
     async fn device_events(&self) -> Result<DeviceEventStream> {
@@ -313,8 +423,57 @@ impl DeviceMonitor for BluerMonitor {
     }
 
     async fn is_scanning(&self) -> Result<bool> {
-        let scanning = self.scanning.lock().await;
-        Ok(*scanning)
+        Ok(self.scanning.load(Ordering::SeqCst))
+    }
+}
+
+/// Record one discovery-stream event in the shared device map.
+async fn handle_adapter_event(
+    event: bluer::AdapterEvent,
+    devices: &DashMap<DeviceId, DiscoveredDevice>,
+    adapter: &Arc<Mutex<Adapter>>,
+) {
+    match event {
+        bluer::AdapterEvent::DeviceAdded(address) => {
+            debug!("Device added: {}", address);
+            // `try_lock` rather than `lock`: a discovery burst must not queue
+            // behind a GATT operation that is holding the adapter.
+            if let Ok(adapter) = adapter.try_lock() {
+                if let Ok(device) =
+                    BluerMonitor::device_to_bluetooth_device(&adapter, &address).await
+                {
+                    let id = device.id.clone();
+                    if let Ok(addr) = adapter.address().await {
+                        devices.insert(
+                            id,
+                            DiscoveredDevice {
+                                device,
+                                adapter: adapter.clone(),
+                                address: addr,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        bluer::AdapterEvent::DeviceRemoved(address) => {
+            debug!("Device removed: {}", address);
+            let id = BluerMonitor::address_to_device_id(&address);
+            devices.remove(&id);
+        }
+        bluer::AdapterEvent::PropertyChanged(_) => {
+            debug!("Adapter property changed");
+        }
+    }
+}
+
+/// Ends discovery when the monitor is discarded.
+///
+/// The discovery task holds `Arc` clones of the adapter and the device map, so
+/// dropping the monitor is the only signal it has that nobody is listening.
+impl Drop for BluerMonitor {
+    fn drop(&mut self) {
+        self.scanning.store(false, Ordering::SeqCst);
     }
 }
 
@@ -322,20 +481,23 @@ impl DeviceMonitor for BluerMonitor {
 impl GattClient for BluerMonitor {
     async fn connect(&self, id: &DeviceId) -> Result<()> {
         debug!("Connecting to device: {}", id);
-        let entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        let entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         let adapter = entry.value().adapter.clone();
         let address = entry.value().address;
         let device_id = id.clone();
         drop(entry);
 
-        let device = adapter.device(address)
+        let device = adapter
+            .device(address)
             .map_err(|_e| Error::DeviceNotFound(id.clone()))?;
 
-        device.connect().await
-            .map_err(|e| Error::BackendError {
-                backend: BackendKind::Bluer,
-                message: format!("Connection failed: {}", e),
-            })?;
+        device.connect().await.map_err(|e| Error::BackendError {
+            backend: BackendKind::Bluer,
+            message: format!("Connection failed: {}", e),
+        })?;
 
         if let Some(mut entry) = self.devices.get_mut(&device_id) {
             entry.value_mut().device.is_connected = true;
@@ -346,20 +508,23 @@ impl GattClient for BluerMonitor {
 
     async fn disconnect(&self, id: &DeviceId) -> Result<()> {
         debug!("Disconnecting from device: {}", id);
-        let entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        let entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         let adapter = entry.value().adapter.clone();
         let address = entry.value().address;
         let device_id = id.clone();
         drop(entry);
 
-        let device = adapter.device(address)
+        let device = adapter
+            .device(address)
             .map_err(|_e| Error::DeviceNotFound(id.clone()))?;
 
-        device.disconnect().await
-            .map_err(|e| Error::BackendError {
-                backend: BackendKind::Bluer,
-                message: format!("Disconnection failed: {}", e),
-            })?;
+        device.disconnect().await.map_err(|e| Error::BackendError {
+            backend: BackendKind::Bluer,
+            message: format!("Disconnection failed: {}", e),
+        })?;
 
         if let Some(mut entry) = self.devices.get_mut(&device_id) {
             entry.value_mut().device.is_connected = false;
@@ -369,15 +534,21 @@ impl GattClient for BluerMonitor {
     }
 
     async fn is_connected(&self, id: &DeviceId) -> Result<bool> {
-        let entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        let entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         let adapter = entry.value().adapter.clone();
         let address = entry.value().address;
         drop(entry);
 
-        let device = adapter.device(address)
+        let device = adapter
+            .device(address)
             .map_err(|_e| Error::DeviceNotFound(id.clone()))?;
 
-        device.is_connected().await
+        device
+            .is_connected()
+            .await
             .map_err(|e| Error::BackendError {
                 backend: BackendKind::Bluer,
                 message: format!("Failed to check connection: {}", e),
@@ -386,15 +557,21 @@ impl GattClient for BluerMonitor {
 
     async fn discover_services(&self, id: &DeviceId) -> Result<Vec<GattService>> {
         debug!("Discovering services for device: {}", id);
-        let entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        let entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         let adapter = entry.value().adapter.clone();
         let address = entry.value().address;
         drop(entry);
 
-        let device = adapter.device(address)
+        let device = adapter
+            .device(address)
             .map_err(|_e| Error::DeviceNotFound(id.clone()))?;
 
-        let is_connected = device.is_connected().await
+        let is_connected = device
+            .is_connected()
+            .await
             .map_err(|e| Error::BackendError {
                 backend: BackendKind::Bluer,
                 message: format!("Failed to check connection: {}", e),
@@ -421,17 +598,25 @@ impl GattClient for BluerMonitor {
             gatt_services.push(gatt_service);
         }
 
-        info!("Discovered {} services for device: {}", gatt_services.len(), id);
+        info!(
+            "Discovered {} services for device: {}",
+            gatt_services.len(),
+            id
+        );
         Ok(gatt_services)
     }
 
     async fn services(&self, id: &DeviceId) -> Result<Vec<GattService>> {
-        let entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        let entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         let adapter = entry.value().adapter.clone();
         let address = entry.value().address;
         drop(entry);
 
-        let device = adapter.device(address)
+        let device = adapter
+            .device(address)
             .map_err(|_e| Error::DeviceNotFound(id.clone()))?;
 
         let services_result = device.services().await;
@@ -454,17 +639,27 @@ impl GattClient for BluerMonitor {
         Ok(gatt_services)
     }
 
-    async fn read_characteristic(&self, id: &DeviceId, uuid: &CharacteristicUuid) -> Result<Vec<u8>> {
+    async fn read_characteristic(
+        &self,
+        id: &DeviceId,
+        uuid: &CharacteristicUuid,
+    ) -> Result<Vec<u8>> {
         debug!("Reading characteristic {} from device {}", uuid, id);
-        let entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        let entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         let adapter = entry.value().adapter.clone();
         let address = entry.value().address;
         drop(entry);
 
-        let device = adapter.device(address)
+        let device = adapter
+            .device(address)
             .map_err(|_e| Error::DeviceNotFound(id.clone()))?;
 
-        let is_connected = device.is_connected().await
+        let is_connected = device
+            .is_connected()
+            .await
             .map_err(|e| Error::BackendError {
                 backend: BackendKind::Bluer,
                 message: format!("Failed to check connection: {}", e),
@@ -477,7 +672,9 @@ impl GattClient for BluerMonitor {
         let char_opt = Self::find_characteristic_in_device(&adapter, &address, uuid).await;
         let characteristic = char_opt.ok_or(Error::CharacteristicNotFound(*uuid))?;
 
-        let value = characteristic.read().await
+        let value = characteristic
+            .read()
+            .await
             .map_err(|e| Error::BackendError {
                 backend: BackendKind::Bluer,
                 message: format!("Read failed: {}", e),
@@ -495,15 +692,21 @@ impl GattClient for BluerMonitor {
         _response: bool,
     ) -> Result<()> {
         debug!("Writing to characteristic {} on device {}", uuid, id);
-        let entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        let entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         let adapter = entry.value().adapter.clone();
         let address = entry.value().address;
         drop(entry);
 
-        let device = adapter.device(address)
+        let device = adapter
+            .device(address)
             .map_err(|_e| Error::DeviceNotFound(id.clone()))?;
 
-        let is_connected = device.is_connected().await
+        let is_connected = device
+            .is_connected()
+            .await
             .map_err(|e| Error::BackendError {
                 backend: BackendKind::Bluer,
                 message: format!("Failed to check connection: {}", e),
@@ -513,30 +716,46 @@ impl GattClient for BluerMonitor {
             return Err(Error::NotConnected(id.clone()));
         }
 
-        let characteristic = Self::find_characteristic_in_device(&adapter, &address, uuid).await
+        let characteristic = Self::find_characteristic_in_device(&adapter, &address, uuid)
+            .await
             .ok_or(Error::CharacteristicNotFound(*uuid))?;
 
-        characteristic.write(value).await
+        characteristic
+            .write(value)
+            .await
             .map_err(|e| Error::BackendError {
                 backend: BackendKind::Bluer,
                 message: format!("Write failed: {}", e),
             })?;
 
-        debug!("Successfully wrote {} bytes to characteristic {}", value.len(), uuid);
+        debug!(
+            "Successfully wrote {} bytes to characteristic {}",
+            value.len(),
+            uuid
+        );
         Ok(())
     }
 
     async fn subscribe(&self, id: &DeviceId, uuid: &CharacteristicUuid) -> Result<()> {
-        debug!("Subscribing to notifications for characteristic {} on device {}", uuid, id);
-        let entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        debug!(
+            "Subscribing to notifications for characteristic {} on device {}",
+            uuid, id
+        );
+        let entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         let adapter = entry.value().adapter.clone();
         let address = entry.value().address;
         drop(entry);
 
-        let device = adapter.device(address)
+        let device = adapter
+            .device(address)
             .map_err(|_e| Error::DeviceNotFound(id.clone()))?;
 
-        let is_connected = device.is_connected().await
+        let is_connected = device
+            .is_connected()
+            .await
             .map_err(|e| Error::BackendError {
                 backend: BackendKind::Bluer,
                 message: format!("Failed to check connection: {}", e),
@@ -546,11 +765,14 @@ impl GattClient for BluerMonitor {
             return Err(Error::NotConnected(id.clone()));
         }
 
-        let characteristic = Self::find_characteristic_in_device(&adapter, &address, uuid).await
+        let characteristic = Self::find_characteristic_in_device(&adapter, &address, uuid)
+            .await
             .ok_or(Error::CharacteristicNotFound(*uuid))?;
 
         // Check if characteristic supports notifications via flags
-        let flags = characteristic.flags().await
+        let flags = characteristic
+            .flags()
+            .await
             .map_err(|e| Error::BackendError {
                 backend: BackendKind::Bluer,
                 message: format!("Failed to get characteristic flags: {}", e),
@@ -569,15 +791,24 @@ impl GattClient for BluerMonitor {
     }
 
     async fn unsubscribe(&self, id: &DeviceId, uuid: &CharacteristicUuid) -> Result<()> {
-        debug!("Unsubscribing from notifications for characteristic {} on device {}", uuid, id);
-        let _entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        debug!(
+            "Unsubscribing from notifications for characteristic {} on device {}",
+            uuid, id
+        );
+        let _entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         debug!("Successfully unsubscribed from characteristic {}", uuid);
         Ok(())
     }
 
     async fn notifications(&self, id: &DeviceId) -> Result<NotificationStream> {
         debug!("Setting up notification stream for device {}", id);
-        let _entry = self.devices.get(id).ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        let _entry = self
+            .devices
+            .get(id)
+            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
         Ok(Box::pin(stream::empty::<ValueNotification>()))
     }
 }
@@ -631,6 +862,7 @@ mod tests {
             manufacturer_data: HashMap::new(),
             service_data: HashMap::new(),
             services_resolved: false,
+            raw_payload: None,
         };
     }
 

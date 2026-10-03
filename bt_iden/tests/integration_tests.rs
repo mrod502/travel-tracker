@@ -4,14 +4,15 @@
 //! under various scenarios.
 
 use bt_iden::models::{AddressType, AdvertisementObservation, BluetoothAddress};
-use bt_iden::{HeuristicIdentityResolver, IdentityResolver, ResolverConfig};
-use std::time::{Duration, Instant};
+use bt_iden::time::ObservationTime;
+use bt_iden::{HeuristicIdentityResolver, IdentityResolver, Outcome, ResolverConfig};
+use std::time::Duration;
 
-fn now() -> Instant {
-    Instant::now()
+fn now() -> ObservationTime {
+    ObservationTime::now()
 }
 
-fn obs_with_addr(ts: Instant, addr: [u8; 6]) -> AdvertisementObservation {
+fn obs_with_addr(ts: ObservationTime, addr: [u8; 6]) -> AdvertisementObservation {
     AdvertisementObservation::new(
         ts,
         BluetoothAddress::new(addr),
@@ -22,7 +23,11 @@ fn obs_with_addr(ts: Instant, addr: [u8; 6]) -> AdvertisementObservation {
 }
 
 #[expect(dead_code)]
-fn obs_with_uuid(ts: Instant, addr: [u8; 6], uuids: &[uuid::Uuid]) -> AdvertisementObservation {
+fn obs_with_uuid(
+    ts: ObservationTime,
+    addr: [u8; 6],
+    uuids: &[uuid::Uuid],
+) -> AdvertisementObservation {
     let mut obs = AdvertisementObservation::new(
         ts,
         BluetoothAddress::new(addr),
@@ -480,58 +485,168 @@ mod test_scoring_components {
 
     #[test]
     fn test_local_name_matching() {
+        // A name is not a unique identifier, and a feed that carries nothing else is
+        // not enough of the model to merge two addresses on (see
+        // `local_name_alone_is_refused_across_an_address_change`). Supply the
+        // advertisement structures as well - which is what a capture that keeps the
+        // raw payload can give, and a decoded-GATT backend cannot - and the same name
+        // clears the evidence floor.
         let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
         let t = now();
 
-        let obs1 = AdvertisementObservation::new(
-            t,
-            BluetoothAddress::new([0x12, 0x34, 0x56, 0x78, 0x90, 0xAB]),
-            AddressType::PrivateResolvable,
-        )
-        .with_local_name("MyDevice".to_string());
+        let named = |ts: ObservationTime, addr: [u8; 6]| {
+            AdvertisementObservation::new(
+                ts,
+                BluetoothAddress::new(addr),
+                AddressType::PrivateResolvable,
+            )
+            .with_local_name("MyDevice".to_string())
+            .with_field_layout(vec![0x01, 0x09, 0xFF])
+        };
 
-        let obs2 = AdvertisementObservation::new(
+        let first = resolver.resolve(named(t, [0x12, 0x34, 0x56, 0x78, 0x90, 0xAB]));
+        let second = resolver.resolve(named(
             t + Duration::from_secs(1),
-            BluetoothAddress::new([0xAB, 0x90, 0x78, 0x56, 0x34, 0x12]),
-            AddressType::PrivateResolvable,
-        )
-        .with_local_name("MyDevice".to_string());
+            [0xAB, 0x90, 0x78, 0x56, 0x34, 0x12],
+        ));
 
-        let id1 = resolver.observe(obs1);
-        let id2 = resolver.observe(obs2);
+        assert!(first.is_new());
+        assert!(
+            second.outcome.merged(),
+            "name plus a real advertisement structure should merge, got {:?} at coverage {}",
+            second.outcome,
+            second.outcome.coverage()
+        );
+        assert_eq!(first.identity, second.identity);
+    }
 
-        // Same name should contribute to merge
-        assert_eq!(id1, id2);
+    #[test]
+    fn local_name_alone_is_refused_across_an_address_change() {
+        let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
+        let t = now();
+
+        let named = |ts: ObservationTime, addr: [u8; 6]| {
+            AdvertisementObservation::new(
+                ts,
+                BluetoothAddress::new(addr),
+                AddressType::PrivateResolvable,
+            )
+            .with_local_name("MyDevice".to_string())
+        };
+
+        let first = resolver.resolve(named(t, [0x12, 0x34, 0x56, 0x78, 0x90, 0xAB]));
+        let second = resolver.resolve(named(
+            t + Duration::from_secs(1),
+            [0xAB, 0x90, 0x78, 0x56, 0x34, 0x12],
+        ));
+
+        assert!(first.is_new());
+        assert_ne!(first.identity, second.identity);
+        let evidence = second
+            .outcome
+            .evidence()
+            .expect("a refused merge keeps its evidence");
+        assert!(
+            matches!(second.outcome, Outcome::InsufficientEvidence(_)),
+            "the refusal should be about evidence coverage, got {:?}",
+            second.outcome
+        );
+        assert!(
+            evidence.total_score >= 40.0,
+            "the score alone clears the merge threshold here, got {}",
+            evidence.total_score
+        );
+        assert!(
+            evidence.coverage() < 0.35,
+            "name and timing should not cover the floor, got {}",
+            evidence.coverage()
+        );
     }
 
     #[test]
     fn test_appearance_matching() {
-        // Appearance alone may not be enough - test with lower threshold
-        let config = ResolverConfig::builder()
-            .merge_threshold(20.0)
-            .build();
+        // Appearance on its own is worth 15 of the 185 designed points, which is not
+        // enough of the model for an inference to be worth making (see
+        // `test_appearance_alone_is_refused_for_insufficient_evidence`). Given a feed
+        // that also names the device and reports its signal, the same feature carries
+        // a merge at a threshold the designed model would not clear without it.
+        let config = ResolverConfig::builder().merge_threshold(60.0).build();
         let mut resolver = HeuristicIdentityResolver::new(config);
         let t = now();
 
-        let obs1 = AdvertisementObservation::new(
-            t,
-            BluetoothAddress::new([0x12, 0x34, 0x56, 0x78, 0x90, 0xAB]),
-            AddressType::PrivateResolvable,
-        )
-        .with_appearance(0x0340); // Heart Rate Sensor
+        let appearance = |ts: ObservationTime, addr: [u8; 6]| {
+            AdvertisementObservation::new(
+                ts,
+                BluetoothAddress::new(addr),
+                AddressType::PrivateResolvable,
+            )
+            .with_appearance(0x0340) // Heart Rate Sensor
+            .with_local_name("HR-01".to_string())
+            .with_rssi(-60)
+        };
 
-        let obs2 = AdvertisementObservation::new(
+        let first = resolver.resolve(appearance(t, [0x12, 0x34, 0x56, 0x78, 0x90, 0xAB]));
+        let second = resolver.resolve(appearance(
             t + Duration::from_secs(1),
-            BluetoothAddress::new([0xAB, 0x90, 0x78, 0x56, 0x34, 0x12]),
-            AddressType::PrivateResolvable,
-        )
-        .with_appearance(0x0340); // Same type
+            [0xAB, 0x90, 0x78, 0x56, 0x34, 0x12],
+        ));
 
-        let id1 = resolver.observe(obs1);
-        let id2 = resolver.observe(obs2);
+        assert_eq!(first.identity, second.identity);
+        assert!(second.outcome.merged());
+        assert!(
+            second.outcome.coverage() > 0.35,
+            "appearance, name, rssi and timing should cover the evidence floor, got {}",
+            second.outcome.coverage()
+        );
+    }
 
-        // Same appearance should contribute to merge at lower threshold
-        assert_eq!(id1, id2);
+    #[test]
+    fn test_appearance_alone_is_refused_for_insufficient_evidence() {
+        // The score clears a low threshold: appearance matches, the device was just
+        // seen, and the two advertisements have the same shape. What is missing is
+        // any of the device-specific features the model was designed around, so the
+        // merge is refused rather than reported at the same confidence as one that
+        // had them.
+        let config = ResolverConfig::builder().merge_threshold(20.0).build();
+        let mut resolver = HeuristicIdentityResolver::new(config);
+        let t = now();
+
+        let appearance = |ts: ObservationTime, addr: [u8; 6]| {
+            AdvertisementObservation::new(
+                ts,
+                BluetoothAddress::new(addr),
+                AddressType::PrivateResolvable,
+            )
+            .with_appearance(0x0340)
+        };
+
+        let first = resolver.resolve(appearance(t, [0x12, 0x34, 0x56, 0x78, 0x90, 0xAB]));
+        let second = resolver.resolve(appearance(
+            t + Duration::from_secs(1),
+            [0xAB, 0x90, 0x78, 0x56, 0x34, 0x12],
+        ));
+
+        assert!(first.is_new());
+        assert_ne!(first.identity, second.identity);
+        assert!(
+            matches!(second.outcome, Outcome::InsufficientEvidence(_)),
+            "expected a coverage refusal, got {:?}",
+            second.outcome
+        );
+        let evidence = second
+            .outcome
+            .evidence()
+            .expect("a refused merge keeps its evidence");
+        assert!(
+            evidence.total_score >= 20.0,
+            "the score has to clear the threshold for this to be about coverage, got {}",
+            evidence.total_score
+        );
+        assert!(
+            evidence.coverage() < 0.35,
+            "appearance and timing alone should not clear the floor, got {}",
+            evidence.coverage()
+        );
     }
 }
 

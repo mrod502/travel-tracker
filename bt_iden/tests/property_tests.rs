@@ -4,9 +4,10 @@
 //! invariants hold across many iterations.
 
 use bt_iden::models::{AddressType, AdvertisementObservation, BluetoothAddress};
+use bt_iden::time::ObservationTime;
 use bt_iden::{HeuristicIdentityResolver, IdentityResolver, ResolverConfig};
 use proptest::prelude::*;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 proptest! {
     #[test]
@@ -17,7 +18,7 @@ proptest! {
     ) {
         let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
         let addr = BluetoothAddress::new(addr_bytes);
-        let t = Instant::now();
+        let t = ObservationTime::now();
 
         // Generate 10 identical observations
         let identities: Vec<_> = (0..10)
@@ -48,7 +49,7 @@ proptest! {
         prop_assume!(addr1 != addr2); // Ensure addresses are different
 
         let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
-        let t = Instant::now();
+        let t = ObservationTime::now();
 
         let obs1 = AdvertisementObservation::new(t, BluetoothAddress::new(addr1), AddressType::PrivateResolvable)
             .with_manufacturer_data(manufacturer_id, vec![0x01, 0x02, 0x03]);
@@ -73,7 +74,7 @@ proptest! {
         prop_assume!(man_id1 != man_id2);
 
         let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
-        let t = Instant::now();
+        let t = ObservationTime::now();
 
         let obs1 = AdvertisementObservation::new(t, BluetoothAddress::new(addr1), AddressType::PrivateResolvable)
             .with_manufacturer_data(man_id1, vec![0x01, 0x02, 0x03]);
@@ -93,7 +94,7 @@ proptest! {
         count in 10usize..=100usize,
     ) {
         let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
-        let t = Instant::now();
+        let t = ObservationTime::now();
 
         let identities: Vec<_> = (0..count)
             .map(|i| {
@@ -117,7 +118,7 @@ proptest! {
         count in 10usize..=50usize,
     ) {
         let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
-        let t = Instant::now();
+        let t = ObservationTime::now();
 
         let mut prev_id = 0u64;
         for i in 0..count {
@@ -145,7 +146,7 @@ proptest! {
             .matching_window(Duration::from_secs(2))
             .build();
         let mut resolver = HeuristicIdentityResolver::new(config);
-        let t = Instant::now();
+        let t = ObservationTime::now();
 
         // Create initial identity
         let obs1 = AdvertisementObservation::new(t, BluetoothAddress::new(addr_bytes), AddressType::PrivateResolvable)
@@ -186,7 +187,7 @@ proptest! {
         )
     ) {
         let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
-        let t = Instant::now();
+        let t = ObservationTime::now();
 
         // Shuffle observations (clone and shuffle)
         let mut shuffled = observations.clone();
@@ -217,7 +218,7 @@ proptest! {
         base_rssi in -80i16..-40i16,
     ) {
         let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
-        let t = Instant::now();
+        let t = ObservationTime::now();
 
         // Create initial observation
         let addr1 = [0x12, 0x34, 0x56, 0x78, 0x90, 0xAB];
@@ -241,7 +242,7 @@ proptest! {
         rssi_variation in -10i16..=10i16,
     ) {
         let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
-        let t = Instant::now();
+        let t = ObservationTime::now();
 
         let addr1 = [0x12, 0x34, 0x56, 0x78, 0x90, 0xAB];
         let obs1 = AdvertisementObservation::new(t, BluetoothAddress::new(addr1), AddressType::PrivateResolvable)
@@ -274,7 +275,7 @@ proptest! {
         // Run twice and compare outputs
         let run_once = || {
             let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
-            let t = Instant::now();
+            let t = ObservationTime::now();
             let mut ids = Vec::new();
 
             for (i, (addr_bytes, man_id, rssi)) in observations.iter().enumerate() {
@@ -311,7 +312,7 @@ proptest! {
         prop_assume!(data1 != data2);
 
         let mut resolver = HeuristicIdentityResolver::new(ResolverConfig::default());
-        let t = Instant::now();
+        let t = ObservationTime::now();
 
         let obs1 = AdvertisementObservation::new(t, BluetoothAddress::new(addr1), AddressType::PrivateResolvable)
             .with_manufacturer_data(0x1234, data1);

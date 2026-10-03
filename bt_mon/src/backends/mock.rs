@@ -61,7 +61,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use log::{debug, info};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -122,6 +122,18 @@ pub struct MockConfig {
     pub auto_send_notifications: bool,
     /// Interval between automatic notifications (milliseconds).
     pub notification_interval_ms: u64,
+    /// Devices the radio advertises on its own while a scan is running.
+    ///
+    /// Empty by default: a monitor built for unit tests should present an empty
+    /// room until the test puts a device in it with [`MockMonitor::add_device`].
+    /// Anything here is broadcast as a `DeviceAdded` on
+    /// [`MockConfig::advertise_interval_ms`] once `start_scan` succeeds, which is
+    /// what a development run needs — without it `--use-mock-backend` opens a
+    /// stream that never delivers anything, and the node scans successfully while
+    /// storing zero occurrences.
+    pub advertisers: Vec<SimulatedAdvertiser>,
+    /// Interval between simulated advertisements (milliseconds).
+    pub advertise_interval_ms: u64,
 }
 
 impl Default for MockConfig {
@@ -146,6 +158,116 @@ impl Default for MockConfig {
             notification_values: HashMap::new(),
             auto_send_notifications: false,
             notification_interval_ms: 1000,
+            advertisers: Vec::new(),
+            advertise_interval_ms: 1000,
+        }
+    }
+}
+
+/// A device the mock radio puts on the air by itself while a scan is running.
+///
+/// This is the difference between a mock *harness* — a monitor that reports an
+/// empty room until a test adds a device to it — and a mock *environment* an
+/// application can be started against: with nothing advertising, `--use-mock-backend`
+/// opens a stream that never delivers an event, so the node reports a healthy
+/// scan while storing no occurrences at all.
+#[derive(Debug, Clone)]
+pub struct SimulatedAdvertiser {
+    /// The advertised address.
+    pub id: DeviceId,
+    /// The advertised name.
+    pub name: String,
+    /// Signal strength reported for each advertisement.
+    pub rssi: i32,
+}
+
+impl SimulatedAdvertiser {
+    /// An advertiser with the default RSSI.
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: DeviceId::new(id),
+            name: name.into(),
+            rssi: -60,
+        }
+    }
+
+    /// Set the signal strength reported for each advertisement.
+    pub fn with_rssi(mut self, rssi: i32) -> Self {
+        self.rssi = rssi;
+        self
+    }
+
+    /// `count` advertisers with stable addresses (`F0:EE:…`) and names.
+    ///
+    /// Stable means two runs of the same command see the same devices, which is
+    /// what makes a mock run comparable to the one before it; the node's rate
+    /// limiter then does what it does with a device it has just heard from.
+    pub fn sequence(count: usize) -> Vec<SimulatedAdvertiser> {
+        (0..count)
+            .map(|i| {
+                SimulatedAdvertiser::new(
+                    format!("F0:EE:00:00:{:02X}:{:02X}", i / 256, i % 256),
+                    format!("Mock Beacon {i}"),
+                )
+            })
+            .collect()
+    }
+
+    /// The advertisement this beacon puts on the air, as advertisement
+    /// structures: flags, the complete local name, and a manufacturer-specific
+    /// block carrying the beacon's own address.
+    ///
+    /// The point is that a consumer of [`BluetoothDevice::raw_payload`] has
+    /// something real to store in a development run: the parsed fields say what
+    /// the beacon advertised, and this is the byte string they were parsed from,
+    /// in the same order every time, so a stored payload can be diffed against
+    /// the previous run's.
+    pub fn advertisement_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        // Flags: LE General Discoverable, no BR/EDR re-support.
+        bytes.extend_from_slice(&ad_structure(0x01, &[0x06]));
+        // Complete local name (AD forbids more than 30 bytes of payload).
+        let name = self.name.as_bytes();
+        bytes.extend_from_slice(&ad_structure(0x09, &name[..name.len().min(30)]));
+        // Manufacturer-specific data: a reserved company id plus the address
+        // bytes, which is what makes each beacon's payload distinct.
+        let mut manufacturer = 0xFFFFu16.to_le_bytes().to_vec();
+        manufacturer.extend_from_slice(&address_bytes(self.id.as_str()));
+        bytes.extend_from_slice(&ad_structure(0xFF, &manufacturer));
+        bytes
+    }
+}
+
+/// One `Length-Type-Data` advertisement structure, as it goes over the air.
+fn ad_structure(kind: u8, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 2);
+    out.push((data.len() + 1) as u8);
+    out.push(kind);
+    out.extend_from_slice(data);
+    out
+}
+
+/// The six address bytes behind a MAC-ish identifier, or a stable stand-in.
+///
+/// A mock can be given any string as an identifier, and the manufacturer block
+/// has to be six bytes whatever it is.
+fn address_bytes(id: &str) -> [u8; 6] {
+    let groups: Option<Vec<u8>> = id
+        .split(':')
+        .map(|group| u8::from_str_radix(group, 16).ok())
+        .collect();
+
+    match groups {
+        Some(bytes) if bytes.len() == 6 => bytes
+            .as_slice()
+            .try_into()
+            .expect("six groups collected above"),
+        _ => {
+            let mut out = [0u8; 6];
+            for (slot, byte) in out.iter_mut().zip(id.as_bytes()) {
+                *slot = *byte;
+            }
+            out
         }
     }
 }
@@ -248,11 +370,7 @@ impl MockConfig {
     }
 
     /// Add a notification value for a characteristic.
-    pub fn with_notification_value(
-        mut self,
-        uuid: CharacteristicUuid,
-        value: Vec<u8>,
-    ) -> Self {
+    pub fn with_notification_value(mut self, uuid: CharacteristicUuid, value: Vec<u8>) -> Self {
         self.notification_values
             .entry(uuid)
             .or_default()
@@ -269,6 +387,29 @@ impl MockConfig {
     /// Set the notification interval in milliseconds.
     pub fn with_notification_interval_ms(mut self, interval: u64) -> Self {
         self.notification_interval_ms = interval;
+        self
+    }
+
+    /// Advertise these devices whenever a scan is running.
+    pub fn with_advertisers(mut self, advertisers: Vec<SimulatedAdvertiser>) -> Self {
+        self.advertisers = advertisers;
+        self
+    }
+
+    /// Advertise `count` generated devices whenever a scan is running.
+    ///
+    /// This is the switch that turns the mock from a harness a test drives into
+    /// an environment `app --use-mock-backend` can be started against: an
+    /// unattended run has to have something to discover, or it stores nothing
+    /// and looks identical to a working node.
+    pub fn with_advertiser_count(mut self, count: usize) -> Self {
+        self.advertisers = SimulatedAdvertiser::sequence(count);
+        self
+    }
+
+    /// Set the interval between simulated advertisements in milliseconds.
+    pub fn with_advertise_interval_ms(mut self, interval: u64) -> Self {
+        self.advertise_interval_ms = interval;
         self
     }
 }
@@ -426,6 +567,9 @@ pub struct MockMonitor {
     config: MockConfig,
     devices: Arc<DashMap<DeviceId, SimulatedDevice>>,
     scanning: Arc<Mutex<bool>>,
+    /// Liveness flag for the advertiser loop, so dropping the monitor stops the
+    /// task it spawned rather than leaving it broadcasting to nobody.
+    advertising: Arc<AtomicBool>,
     notification_senders: Arc<DashMap<DeviceId, tokio::sync::mpsc::Sender<NotificationEvent>>>,
     event_senders: Arc<DashMap<u64, futures::channel::mpsc::Sender<DeviceEvent>>>,
     next_event_sender_id: Arc<AtomicU64>,
@@ -476,6 +620,7 @@ impl MockMonitor {
             config,
             devices: Arc::new(DashMap::new()),
             scanning: Arc::new(Mutex::new(false)),
+            advertising: Arc::new(AtomicBool::new(false)),
             notification_senders: Arc::new(DashMap::new()),
             event_senders: Arc::new(DashMap::new()),
             next_event_sender_id: Arc::new(AtomicU64::new(0)),
@@ -583,7 +728,11 @@ impl MockMonitor {
 
         let id_clone = id.clone();
         self.devices.insert(id_clone, simulated_device);
-        info!("Added simulated device with {} services: {}", services.len(), id);
+        info!(
+            "Added simulated device with {} services: {}",
+            services.len(),
+            id
+        );
         self.broadcast_event(&DeviceEvent::DeviceAdded { device });
         Ok(())
     }
@@ -747,19 +896,76 @@ impl MockMonitor {
     ///
     /// Senders whose receivers were dropped are removed from the registry.
     fn broadcast_event(&self, event: &DeviceEvent) {
-        let mut dead = Vec::new();
-        for mut entry in self.event_senders.iter_mut() {
-            if let Err(err) = entry.value_mut().try_send(event.clone()) {
-                if err.is_disconnected() {
-                    dead.push(*entry.key());
-                } else {
-                    debug!("Mock device event channel full; dropping event");
+        publish_event(&self.event_senders, event);
+    }
+
+    /// Puts the configured advertisers on the air until the scan stops.
+    ///
+    /// Each tick re-advertises every device, as a real radio does; the node's
+    /// rate limiter is what decides whether a repeat sighting is worth a row.
+    /// The device is registered with the monitor too, so `devices()` and the
+    /// event stream agree.
+    fn spawn_advertisers(&self) {
+        let devices = self.devices.clone();
+        let senders = self.event_senders.clone();
+        let advertising = self.advertising.clone();
+        let advertisers = self.config.advertisers.clone();
+        let interval = Duration::from_millis(self.config.advertise_interval_ms.max(1));
+
+        advertising.store(true, Ordering::SeqCst);
+        tokio::spawn(async move {
+            while advertising.load(Ordering::SeqCst) {
+                for advertiser in &advertisers {
+                    let device = BluetoothDevice::new(
+                        advertiser.id.clone(),
+                        advertiser.id.as_str().to_string(),
+                    )
+                    .with_name(advertiser.name.clone())
+                    .with_rssi(advertiser.rssi)
+                    .with_raw_payload(advertiser.advertisement_bytes());
+
+                    // An existing entry is left alone: a scan must not wipe the
+                    // services or connection state something else attached to the
+                    // same address.
+                    devices
+                        .entry(advertiser.id.clone())
+                        .or_insert_with(|| SimulatedDevice::new(device.clone()));
+
+                    publish_event(&senders, &DeviceEvent::DeviceAdded { device });
                 }
+
+                time::sleep(interval).await;
+            }
+        });
+    }
+}
+
+/// Delivers an event to every open subscriber, pruning the disconnected ones.
+fn publish_event(
+    senders: &DashMap<u64, futures::channel::mpsc::Sender<DeviceEvent>>,
+    event: &DeviceEvent,
+) {
+    let mut dead = Vec::new();
+    for mut entry in senders.iter_mut() {
+        if let Err(err) = entry.value_mut().try_send(event.clone()) {
+            if err.is_disconnected() {
+                dead.push(*entry.key());
+            } else {
+                debug!("Mock device event channel full; dropping event");
             }
         }
-        for id in dead {
-            self.event_senders.remove(&id);
-        }
+    }
+    for id in dead {
+        senders.remove(&id);
+    }
+}
+
+/// Stopping the advertiser loop on drop keeps a discarded monitor from
+/// broadcasting forever: the task holds `Arc` clones, so dropping the monitor is
+/// the only signal it has that nobody is listening any more.
+impl Drop for MockMonitor {
+    fn drop(&mut self) {
+        self.advertising.store(false, Ordering::SeqCst);
     }
 }
 
@@ -786,7 +992,15 @@ impl DeviceMonitor for MockMonitor {
         self.simulate_delay(self.config.scan_delay_ms).await;
 
         *scanning = true;
-        info!("Scan started successfully on mock adapter '{}'", self.config.adapter_name);
+        info!(
+            "Scan started successfully on mock adapter '{}'",
+            self.config.adapter_name
+        );
+
+        if !self.config.advertisers.is_empty() {
+            self.spawn_advertisers();
+        }
+
         Ok(())
     }
 
@@ -798,12 +1012,17 @@ impl DeviceMonitor for MockMonitor {
 
         debug!("Stopping scan");
         *scanning = false;
+        self.advertising.store(false, Ordering::SeqCst);
         info!("Scan stopped successfully");
         Ok(())
     }
 
     async fn devices(&self) -> Result<Vec<BluetoothDevice>> {
-        Ok(self.devices.iter().map(|e| e.value().device.clone()).collect())
+        Ok(self
+            .devices
+            .iter()
+            .map(|e| e.value().device.clone())
+            .collect())
     }
 
     async fn device(&self, id: &DeviceId) -> Result<BluetoothDevice> {
@@ -819,8 +1038,12 @@ impl DeviceMonitor for MockMonitor {
     }
 
     async fn adapter_info(&self) -> Result<String> {
+        // The name comes first, as it does on BlueZ ("<id> (<modalias>)"), so a
+        // selector that would pick this adapter on a real radio picks it here
+        // too — which is what makes the mock usable for checking adapter
+        // selection at all.
         Ok(format!(
-            "MockAdapter '{}' powered={}",
+            "{} (mock) powered={}",
             self.config.adapter_name, self.config.adapter_powered
         ))
     }
@@ -867,10 +1090,13 @@ impl GattClient for MockMonitor {
             return Err(Error::InitFailed(self.config.connect_error_message.clone()));
         }
 
-        let entry = self
-            .devices
-            .get(id)
-            .ok_or_else(|| Error::DeviceNotFound(id.clone()))?;
+        // Existence is checked without keeping a guard: a `DashMap` read guard
+        // held across `get_mut` below (or across the await) deadlocks on the
+        // same shard, which is what this used to do — every test that connected
+        // to a device hung forever.
+        if !self.devices.contains_key(id) {
+            return Err(Error::DeviceNotFound(id.clone()));
+        }
 
         self.simulate_delay(self.config.connect_delay_ms).await;
 
@@ -878,7 +1104,6 @@ impl GattClient for MockMonitor {
         if let Some(mut entry) = self.devices.get_mut(id) {
             entry.value_mut().device.is_connected = true;
         }
-        drop(entry);
 
         info!("Connected to mock device: {}", id);
         Ok(())
@@ -922,7 +1147,11 @@ impl GattClient for MockMonitor {
         let services = entry.value().services.clone();
         drop(entry);
 
-        info!("Discovered {} services for mock device: {}", services.len(), id);
+        info!(
+            "Discovered {} services for mock device: {}",
+            services.len(),
+            id
+        );
         Ok(services)
     }
 
@@ -1094,6 +1323,34 @@ mod tests {
         assert!(!monitor.is_scanning().await.unwrap());
     }
 
+    #[test]
+    fn an_advertisers_payload_is_its_own_and_the_same_every_time() {
+        let beacon = SimulatedAdvertiser::new("F0:EE:00:00:01:02", "Beacon A");
+        let other = SimulatedAdvertiser::new("F0:EE:00:00:01:03", "Beacon A");
+
+        assert_eq!(
+            beacon.advertisement_bytes(),
+            beacon.advertisement_bytes(),
+            "a stored payload has to be comparable across runs"
+        );
+        assert_ne!(
+            beacon.advertisement_bytes(),
+            other.advertisement_bytes(),
+            "two beacons must not look like one device"
+        );
+    }
+
+    #[test]
+    fn an_identifier_that_is_not_a_mac_still_gets_six_address_bytes() {
+        // The mock accepts any string as an identifier; the manufacturer block
+        // is always six bytes whatever arrives.
+        assert_eq!(address_bytes("not-a-mac").len(), 6);
+        assert_eq!(
+            address_bytes("AA:BB:CC:DD:EE:FF"),
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
+        );
+    }
+
     #[tokio::test]
     async fn test_mock_monitor_with_config() {
         let config = MockConfig::default()
@@ -1102,7 +1359,10 @@ mod tests {
             .with_error_on_scan(true);
 
         let monitor = MockMonitor::with_config(config);
-        assert_eq!(monitor.adapter_info().await.unwrap(), "MockAdapter 'TestAdapter' powered=true");
+        assert_eq!(
+            monitor.adapter_info().await.unwrap(),
+            "TestAdapter (mock) powered=true"
+        );
         assert!(monitor.is_powered().await.unwrap());
     }
 
@@ -1116,7 +1376,10 @@ mod tests {
         let devices = monitor.devices().await.unwrap();
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].id, device_id);
-        assert_eq!(devices[0].name, Some("Mock Device 00:11:22:33:44:55".to_string()));
+        assert_eq!(
+            devices[0].name,
+            Some("Mock Device 00:11:22:33:44:55".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1135,8 +1398,14 @@ mod tests {
     async fn test_clear_devices() {
         let monitor = MockMonitor::new();
 
-        monitor.add_device(DeviceId::new("00:11:22:33:44:55")).await.unwrap();
-        monitor.add_device(DeviceId::new("11:22:33:44:55:66")).await.unwrap();
+        monitor
+            .add_device(DeviceId::new("00:11:22:33:44:55"))
+            .await
+            .unwrap();
+        monitor
+            .add_device(DeviceId::new("11:22:33:44:55:66"))
+            .await
+            .unwrap();
 
         monitor.clear_devices().await;
 
@@ -1214,7 +1483,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_characteristic() {
-        let config = MockConfig::default().with_connect_delay_ms(1).with_read_delay_ms(1);
+        let config = MockConfig::default()
+            .with_connect_delay_ms(1)
+            .with_read_delay_ms(1);
         let monitor = MockMonitor::with_config(config);
         let device_id = DeviceId::new("00:11:22:33:44:55");
 
@@ -1225,7 +1496,10 @@ mod tests {
             CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
 
         // Read should return empty vector for unconfigured characteristics
-        let value = monitor.read_characteristic(&device_id, &char_uuid).await.unwrap();
+        let value = monitor
+            .read_characteristic(&device_id, &char_uuid)
+            .await
+            .unwrap();
         assert!(value.is_empty());
     }
 
@@ -1262,7 +1536,10 @@ mod tests {
             CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
 
         let value = vec![0x01, 0x02, 0x03, 0x04];
-        monitor.write_characteristic(&device_id, &char_uuid, &value, true).await.unwrap();
+        monitor
+            .write_characteristic(&device_id, &char_uuid, &value, true)
+            .await
+            .unwrap();
 
         // Write should succeed without error
     }
@@ -1282,7 +1559,9 @@ mod tests {
             CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
 
         let value = vec![0x01, 0x02, 0x03, 0x04];
-        let result = monitor.write_characteristic(&device_id, &char_uuid, &value, true).await;
+        let result = monitor
+            .write_characteristic(&device_id, &char_uuid, &value, true)
+            .await;
         assert!(matches!(result, Err(Error::Internal(_))));
     }
 
@@ -1349,18 +1628,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_simulated_service_and_characteristic() {
-        let service_uuid =
-            ServiceUuid::parse_str("00001800-0000-1000-8000-00805f9b34fb").unwrap();
+        let service_uuid = ServiceUuid::parse_str("00001800-0000-1000-8000-00805f9b34fb").unwrap();
         let char_uuid =
             CharacteristicUuid::parse_str("00002a00-0000-1000-8000-00805f9b34fb").unwrap();
 
-        let service = SimulatedService::new(service_uuid, true)
-            .with_characteristic(
-                SimulatedCharacteristic::new(char_uuid, CharacteristicProperties::new().with_read(true))
-                    .with_handle(0x0010)
-                    .with_read_value(b"Test Value".to_vec())
-                    .with_allow_read(true),
-            );
+        let service = SimulatedService::new(service_uuid, true).with_characteristic(
+            SimulatedCharacteristic::new(
+                char_uuid,
+                CharacteristicProperties::new().with_read(true),
+            )
+            .with_handle(0x0010)
+            .with_read_value(b"Test Value".to_vec())
+            .with_allow_read(true),
+        );
 
         assert_eq!(service.uuid, service_uuid);
         assert!(service.is_primary);
@@ -1373,7 +1653,10 @@ mod tests {
         let monitor = MockMonitor::new();
 
         for i in 0..5 {
-            let device_id = DeviceId::new(format!("{:02}:{:02}:{:02}:{:02}:{:02}:{:02}", 0, 0, 0, 0, 0, i));
+            let device_id = DeviceId::new(format!(
+                "{:02}:{:02}:{:02}:{:02}:{:02}:{:02}",
+                0, 0, 0, 0, 0, i
+            ));
             monitor.add_device(device_id).await.unwrap();
         }
 
@@ -1403,14 +1686,23 @@ mod tests {
         stream: &mut Pin<Box<dyn Stream<Item = DeviceEvent> + Send>>,
         timeout: Duration,
     ) -> Option<DeviceEvent> {
-        tokio::time::timeout(timeout, stream.next()).await.ok().flatten()
+        tokio::time::timeout(timeout, stream.next())
+            .await
+            .ok()
+            .flatten()
     }
 
     #[tokio::test]
     async fn test_device_events_replays_existing_devices() {
         let monitor = MockMonitor::new();
-        monitor.add_device(DeviceId::new("00:11:22:33:44:55")).await.unwrap();
-        monitor.add_device(DeviceId::new("11:22:33:44:55:66")).await.unwrap();
+        monitor
+            .add_device(DeviceId::new("00:11:22:33:44:55"))
+            .await
+            .unwrap();
+        monitor
+            .add_device(DeviceId::new("11:22:33:44:55:66"))
+            .await
+            .unwrap();
 
         let mut events = monitor.device_events().await.unwrap();
 
@@ -1461,5 +1753,51 @@ mod tests {
         // rather than the stream completing.
         let result = tokio::time::timeout(Duration::from_millis(200), events.next()).await;
         assert!(result.is_err(), "stream completed while monitor is alive");
+    }
+
+    #[tokio::test]
+    async fn test_configured_advertisers_reach_an_open_stream_while_scanning() {
+        let monitor = MockMonitor::with_config(
+            MockConfig::default()
+                .with_advertiser_count(3)
+                .with_advertise_interval_ms(20),
+        );
+        let mut events = monitor.device_events().await.unwrap();
+
+        monitor.start_scan().await.unwrap();
+
+        let mut seen: Vec<DeviceId> = Vec::new();
+        while seen.len() < 3 {
+            let event = next_event(&mut events, Duration::from_secs(2))
+                .await
+                .expect("an advertiser should be heard from while scanning");
+            if let DeviceEvent::DeviceAdded { device } = event {
+                if !seen.contains(&device.id) {
+                    seen.push(device.id);
+                }
+            }
+        }
+
+        // The stream and `devices()` agree, so a caller that lists rather than
+        // listens still sees the simulated room.
+        assert_eq!(monitor.devices().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_a_monitor_without_advertisers_stays_quiet() {
+        // The default has to stay an empty room: every unit test here adds its
+        // own devices and would have its assertions polluted by beacons that
+        // advertise themselves.
+        let monitor = MockMonitor::new();
+        let mut events = monitor.device_events().await.unwrap();
+
+        monitor.start_scan().await.unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), events.next())
+                .await
+                .is_err(),
+            "a monitor without advertisers should advertise nothing"
+        );
     }
 }

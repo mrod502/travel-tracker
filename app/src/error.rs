@@ -21,10 +21,6 @@ pub enum AppError {
     #[error("Invalid UUID: {0}")]
     InvalidUuid(#[from] uuid::Error),
 
-    /// Invalid MAC address.
-    #[error("Invalid MAC address: {0}")]
-    InvalidMacAddress(String),
-
     /// Configuration error.
     #[error("Configuration error: {0}")]
     Config(String),
@@ -32,6 +28,11 @@ pub enum AppError {
     /// Node ID not configured.
     #[error("NODE_ID environment variable or --node-id required")]
     NodeIdMissing,
+
+    /// Node has no row in the `nodes` registry, so the `origin_node_id` foreign
+    /// key rejects every occurrence it signs.
+    #[error("Node not registered: {0}")]
+    NodeNotRegistered(String),
 
     /// Validation error.
     #[error("Validation error: {0}")]

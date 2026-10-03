@@ -133,12 +133,8 @@ impl PositionSource for MockPositionSource {
                 let latitude = centre.0 + (*emitted as f64 * *step_deg);
                 *emitted += 1;
 
-                let position = Position::new(
-                    latitude,
-                    centre.1,
-                    PositionOrigin::Mock,
-                    self.clock.now(),
-                )?;
+                let position =
+                    Position::new(latitude, centre.1, PositionOrigin::Mock, self.clock.now())?;
                 Ok(Some(position))
             }
         }

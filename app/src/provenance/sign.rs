@@ -24,7 +24,7 @@
 //! verify_signature(&verifying_key, payload_bytes, &signature)?;
 //! ```
 
-use ed25519_dalek::{ed25519::signature::Signer, SigningKey, Signature};
+use ed25519_dalek::{ed25519::signature::Signer, Signature, SigningKey};
 
 /// Error type for signing operations.
 #[derive(Debug, Clone, PartialEq)]

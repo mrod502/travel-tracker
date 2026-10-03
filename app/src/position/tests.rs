@@ -41,7 +41,12 @@ fn coordinates_are_validated_on_construction() {
         Err(PositionError::InvalidLatitude { .. })
     ));
     assert!(matches!(
-        Position::new(0.0, f64::INFINITY, PositionOrigin::Gps, test_support::epoch()),
+        Position::new(
+            0.0,
+            f64::INFINITY,
+            PositionOrigin::Gps,
+            test_support::epoch()
+        ),
         Err(PositionError::InvalidLongitude { .. })
     ));
 }
@@ -71,7 +76,10 @@ fn a_fix_older_than_max_age_is_stale() {
     let stale = gps_fix_aged(1.0, Duration::from_secs(61));
     assert!(stale.is_stale(Duration::from_secs(60), epoch));
     // Time passing can turn a tolerable fix into an intolerable one.
-    assert!(fresh.is_stale(Duration::from_secs(60), epoch + chrono::Duration::seconds(3)));
+    assert!(fresh.is_stale(
+        Duration::from_secs(60),
+        epoch + chrono::Duration::seconds(3)
+    ));
 }
 
 #[test]
@@ -85,8 +93,14 @@ fn origin_labels_and_database_enum_agree() {
         LocationSource::NodeFixed
     );
     // A simulated fix is stored as a GPS fix, which is what it stands in for.
-    assert_eq!(PositionOrigin::Gps.location_source(), LocationSource::NodeGps);
-    assert_eq!(PositionOrigin::Mock.location_source(), LocationSource::NodeGps);
+    assert_eq!(
+        PositionOrigin::Gps.location_source(),
+        LocationSource::NodeGps
+    );
+    assert_eq!(
+        PositionOrigin::Mock.location_source(),
+        LocationSource::NodeGps
+    );
 }
 
 #[test]
@@ -95,11 +109,21 @@ fn coordinate_pairs_are_parsed_leniently_but_not_gullibly() {
         parse_coordinates("40.6892,-74.0445").unwrap(),
         (40.6892, -74.0445)
     );
-    assert_eq!(parse_coordinates(" 40.6892 , -74.0445 ").unwrap(), (40.6892, -74.0445));
+    assert_eq!(
+        parse_coordinates(" 40.6892 , -74.0445 ").unwrap(),
+        (40.6892, -74.0445)
+    );
     assert_eq!(parse_coordinates("0,0").unwrap(), (0.0, 0.0));
 
     for raw in [
-        "", "40.6892", "40.6892;", "lat,lon", "40.6892,-74.0445,10", ",,", "91,0", "0,181",
+        "",
+        "40.6892",
+        "40.6892;",
+        "lat,lon",
+        "40.6892,-74.0445,10",
+        ",,",
+        "91,0",
+        "0,181",
         "nan,0",
     ] {
         assert!(
@@ -161,9 +185,12 @@ baeckend = "gpsd"
 
 #[tokio::test]
 async fn auto_mode_prefers_the_fixed_location() {
-    let source =
-        compose_sources(Some(fixed_source(1.0)), Some(fixed_source(2.0)), PositionMode::Auto)
-            .unwrap();
+    let source = compose_sources(
+        Some(fixed_source(1.0)),
+        Some(fixed_source(2.0)),
+        PositionMode::Auto,
+    )
+    .unwrap();
 
     assert_eq!(
         source.current_position().await.unwrap().unwrap().latitude,
@@ -191,8 +218,12 @@ async fn auto_mode_without_anything_configured_reports_no_position() {
 
 #[tokio::test]
 async fn off_mode_ignores_what_is_configured() {
-    let source = compose_sources(Some(fixed_source(4.0)), Some(fixed_source(5.0)), PositionMode::Off)
-        .unwrap();
+    let source = compose_sources(
+        Some(fixed_source(4.0)),
+        Some(fixed_source(5.0)),
+        PositionMode::Off,
+    )
+    .unwrap();
 
     assert!(source.current_position().await.unwrap().is_none());
 }

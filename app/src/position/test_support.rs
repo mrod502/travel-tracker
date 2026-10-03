@@ -48,11 +48,5 @@ pub fn gps_fix_at(latitude: f64, fixed_at: DateTime<Utc>) -> Position {
 /// A fix acquired `age` before [`epoch`], for staleness assertions.
 pub fn gps_fix_aged(latitude: f64, age: std::time::Duration) -> Position {
     let offset = chrono::Duration::from_std(age).unwrap();
-    Position::new(
-        latitude,
-        1.0,
-        super::PositionOrigin::Gps,
-        epoch() - offset,
-    )
-    .unwrap()
+    Position::new(latitude, 1.0, super::PositionOrigin::Gps, epoch() - offset).unwrap()
 }

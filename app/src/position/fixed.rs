@@ -72,6 +72,9 @@ mod tests {
         let source = FixedPositionSource::new(91.0, 0.0);
 
         let error = source.current_position().await.unwrap_err();
-        assert!(matches!(error, PositionError::InvalidLatitude { value: 91.0 }));
+        assert!(matches!(
+            error,
+            PositionError::InvalidLatitude { value: 91.0 }
+        ));
     }
 }

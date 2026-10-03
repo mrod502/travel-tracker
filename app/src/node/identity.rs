@@ -303,8 +303,7 @@ impl NodeIdentity {
     /// let signature = identity.sign(payload);
     /// ```
     pub fn sign(&self, payload: &[u8]) -> ed25519_dalek::Signature {
-        sign_raw_payload(&self.signing_key, payload)
-            .expect("Signing should never fail")
+        sign_raw_payload(&self.signing_key, payload).expect("Signing should never fail")
     }
 
     /// Verify a signature.
@@ -318,7 +317,11 @@ impl NodeIdentity {
     ///
     /// * `Ok(())` - If the signature is valid
     /// * `Err(VerifyError)` - If verification fails
-    pub fn verify(&self, payload: &[u8], signature: &ed25519_dalek::Signature) -> crate::provenance::verify::Result<()> {
+    pub fn verify(
+        &self,
+        payload: &[u8],
+        signature: &ed25519_dalek::Signature,
+    ) -> crate::provenance::verify::Result<()> {
         verify_raw_signature(&self.verifying_key, payload, signature)
     }
 }
@@ -388,7 +391,10 @@ mod tests {
 
         // Verify they're the same
         assert_eq!(identity1.node_id(), identity2.node_id());
-        assert_eq!(identity1.verifying_key().as_bytes(), identity2.verifying_key().as_bytes());
+        assert_eq!(
+            identity1.verifying_key().as_bytes(),
+            identity2.verifying_key().as_bytes()
+        );
     }
 
     #[test]
@@ -408,7 +414,9 @@ mod tests {
 
         // Create identity
         let identity1 = NodeIdentity::generate();
-        identity1.save(&temp_dir.path().join("node_identity.json")).unwrap();
+        identity1
+            .save(&temp_dir.path().join("node_identity.json"))
+            .unwrap();
 
         // Load existing
         let identity2 = NodeIdentity::load_or_create(temp_dir.path()).unwrap();
@@ -432,7 +440,10 @@ mod tests {
             let mode = metadata.permissions().mode() & 0o777;
 
             // Should be 0o600 (owner read/write only)
-            assert_eq!(mode, 0o600, "Identity file should have restrictive permissions");
+            assert_eq!(
+                mode, 0o600,
+                "Identity file should have restrictive permissions"
+            );
         }
     }
 }

@@ -117,11 +117,19 @@ fn unquote(value: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct EnvLayer {
     file: EnvFile,
+    /// Whether the process environment outranks the map in `file`.
+    ///
+    /// Tests build a layer with `false` so the ambient environment of whoever
+    /// runs `cargo test` cannot decide whether they pass.
+    use_process_env: bool,
 }
 
 impl EnvLayer {
     pub fn new(file: EnvFile) -> Self {
-        Self { file }
+        Self {
+            file,
+            use_process_env: true,
+        }
     }
 
     /// Build the layer from `dir`, honouring `ENV_FILE` as an explicit path.
@@ -131,12 +139,13 @@ impl EnvLayer {
     }
 
     /// A layer backed by exactly these variables, for tests.
+    ///
+    /// The process environment is *not* consulted, unlike every other
+    /// constructor here.
     pub fn from_map(values: HashMap<String, String>) -> Self {
         Self {
-            file: EnvFile {
-                values,
-                path: None,
-            },
+            file: EnvFile { values, path: None },
+            use_process_env: false,
         }
     }
 
@@ -150,10 +159,18 @@ impl EnvLayer {
     /// An exported-but-empty variable counts as absent: `PGDATABASE= app` is how
     /// people clear a value, and an empty database name is never intended.
     pub fn get(&self, key: &str) -> Option<String> {
-        match std::env::var(key) {
-            Ok(value) if !value.is_empty() => Some(value),
-            _ => self.file.get(key).map(|value| value.to_string()).filter(|value| !value.is_empty()),
+        if self.use_process_env {
+            if let Ok(value) = std::env::var(key) {
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
         }
+
+        self.file
+            .get(key)
+            .map(|value| value.to_string())
+            .filter(|value| !value.is_empty())
     }
 }
 
@@ -194,9 +211,18 @@ TRAILING=unquoted # not a comment
 "#,
         );
 
-        assert_eq!(values.get("DOUBLE").map(String::as_str), Some("quoted value"));
-        assert_eq!(values.get("SINGLE").map(String::as_str), Some("quoted value"));
-        assert_eq!(values.get("MISMATCHED").map(String::as_str), Some("\"still quoted"));
+        assert_eq!(
+            values.get("DOUBLE").map(String::as_str),
+            Some("quoted value")
+        );
+        assert_eq!(
+            values.get("SINGLE").map(String::as_str),
+            Some("quoted value")
+        );
+        assert_eq!(
+            values.get("MISMATCHED").map(String::as_str),
+            Some("\"still quoted")
+        );
         assert_eq!(
             values.get("TRAILING").map(String::as_str),
             Some("unquoted # not a comment")

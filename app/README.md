@@ -45,17 +45,22 @@ At minimum, you need:
 
 | Variable | Description |
 |----------|-------------|
-| `NODE_ID` | UUID identifying this node (from certificate) |
 | `PGDATABASE` + `PGUSER` | **OR** `DATABASE_URL` |
+
+Nothing else is required. The node's identity comes from the Ed25519 key in the
+data directory (`BT_DATA_DIR`, default `~/.btmon/data`), which is created on first
+run; `NODE_ID` states which identity the node has to *turn out* to be and is
+optional — see below.
 
 ### Optional Configuration
 
 | Variable | CLI Flag | Default | Description |
 |----------|----------|---------|-------------|
 | `LOG_LEVEL` | `--log-level` | `info` | Log level (debug, info, warn, error) |
-| `BT_SCAN_INTERVAL_MS` | `--scan-interval-ms` | `1000` | Scan interval in milliseconds |
-| `BT_STORE_RAW_PAYLOAD` | `--store-raw-payload` | `true` | Whether to store raw advertisement payload |
-| `BT_ADAPTER_ID` | `--adapter-id` | (auto) | Specific Bluetooth adapter ID to use |
+| `NODE_ID` | `--node-id` | (unset) | The node id this node has to turn out to be: 64 hex characters, SHA-256 of its signing key. Checked against the key file, never used as an identity; a mismatch stops startup and prints both ids. A UUID here is an error — that is what this setting asked for before |
+| `BT_SCAN_INTERVAL_MS` | `--scan-interval-ms` | `1000` | How often the continuous scan is re-armed, and how often the simulated radio advertises. Not a duty cycle |
+| `BT_STORE_RAW_PAYLOAD` | `--store-raw-payload` | `true` | Keep the radio's advertisement bytes as `signal_payload.ble.raw_payload_hex`, inside the signed payload. A backend that exposes only decoded properties stores nothing extra and says so once |
+| `BT_ADAPTER_ID` | `--adapter-id` | (first adapter) | Which radio to open, by id, name, or MAC address. One that matches nothing — or more than one adapter — stops startup instead of picking |
 
 ## Usage
 
@@ -69,7 +74,8 @@ export PGDATABASE=travel
 export PGUSER=postgres
 export PGPASSWORD=postgres
 
-export NODE_ID="550e8400-e29b-41d4-a716-446655440000"
+# Optional: assert the identity this node must have, as the startup log prints it
+# export NODE_ID="0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
 
 # Optional: Set log level
 export LOG_LEVEL="debug"
@@ -83,7 +89,6 @@ cargo run --bin app
 ```bash
 # Set required environment variables
 export DATABASE_URL="postgres://user:pass@localhost:7789/travel"
-export NODE_ID="550e8400-e29b-41d4-a716-446655440000"
 
 # Run the application
 cargo run --bin app
@@ -99,13 +104,13 @@ cargo run --bin app -- \
   --pg-database travel \
   --pg-user postgres \
   --pg-password pass \
-  --node-id "550e8400-e29b-41d4-a716-446655440000" \
   --log-level debug
 
-# Using DATABASE_URL
+# Using DATABASE_URL, on a machine with two radios, asserting its enrolled identity
 cargo run --bin app -- \
   -d "postgres://localhost:7789/travel" \
-  --node-id "550e8400-e29b-41d4-a716-446655440000" \
+  --adapter-id hci1 \
+  --node-id "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0" \
   --log-level debug
 ```
 
@@ -114,6 +119,58 @@ cargo run --bin app -- \
 ```bash
 cargo run --bin app -- --help
 ```
+
+## Derived Device Identity
+
+`occurrences` record advertisements and never ask whether two of them came from the same device.
+The batch that asks is `identity-replay`:
+
+```bash
+cargo run --bin app -- identity-replay --last 7d              # read, print, write nothing
+cargo run --bin app -- identity-replay --last 7d --write      # and persist the derived tables
+cargo run --bin app -- identity-replay --last 7d --json       # same pass, machine-readable
+cargo run --bin app -- identity-replay --last 1d --node <64-hex>  # one node's rows only
+```
+
+It reads a window of stored occurrences oldest-first, replays them through `bt_iden`'s resolver, and
+prints every decision with the features that carried it, the score, and the weight that was *not*
+observed:
+
+```text
+== device identity replay: 55 observations, 10 identities, 45 merges, mean coverage 0.36 ==
+   1 2026-09-23T00:46:26 f0ee00000000 ble_mac  -> #1   new                   cov   -   score      -
+       not observed: uuid_overlap 30, appearance 15
+   2 2026-09-23T00:46:26 f0ee00000001 ble_mac  -> #2   contradicted          cov 0.76 score  109.1
+       carried: manufacturer_id 40, time_continuity 25, payload_similarity 17, field_layout 15
+       vetoed by a directly-observed name
+       not observed: uuid_overlap 30, appearance 15
+```
+
+Which is what the report is for: `#2` scores 109.1, well past the merge threshold, on a manufacturer ID
+shared by every beacon in the batch and a payload that differs by one byte — and it is refused anyway,
+because it advertised a different name. The score line and the veto line are printed together so the
+near-miss is visible, not just the answer.
+
+Mean coverage is the number to read first: it is how much of the 185-point scoring model the stored
+rows can actually feed, and on a capture that stored no advertisement bytes it is low because the
+features genuinely are not there — the run says so instead of scoring their absence as disagreement.
+
+`--write` populates four derived tables — `device_identities`, `device_address_links`,
+`co_occurrence_events`, `association_edges` — and nothing else. Rows are keyed by a feature
+fingerprint rather than by any identifier, so re-running a window converges on the rows the previous
+run wrote instead of appending a second opinion; `occurrences` themselves are never touched, because
+those rows are signed assertions by a node. `--min-evidence-ratio` and `--merge-threshold` tune the
+resolver for the pass (`0.35` and `40` by default).
+
+The batch is deliberately not wired into `monitor`: merges need to be reviewed before anything
+downstream depends on them. The first pass over live data produced exactly the finding the review step
+exists for — five identically-provisioned mock beacons merged into a single identity by the run whose
+rows carried advertisement structures — and that finding is now closed in `bt_iden`, where an advertised
+name that is neither the identity's name nor a truncation of it is one of the four Direct-quality vetoes
+that refuse a merge. The same window resolves five identities where it resolved one. What remains for
+review is the other half of the same data: the batch that stored no advertisement bytes resolves the same
+five beacons at coverage 0.32 — carried by exact address match, name, time continuity and RSSI — so each
+beacon is currently two rows reachable through `device_address_links` rather than one. See [B12 and B13](../GAP_ANALYSIS.md#81-blocking).
 
 ## Data Storage
 

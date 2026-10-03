@@ -100,17 +100,16 @@ impl GpsdTransport {
             })?;
 
         let (read_half, mut write_half) = stream.into_split();
-        write_half
-            .write_all(WATCH_REQUEST)
-            .await
-            .map_err(|error| {
-                PositionError::Transport(format!("could not subscribe to gpsd reports: {}", error))
-            })?;
+        write_half.write_all(WATCH_REQUEST).await.map_err(|error| {
+            PositionError::Transport(format!("could not subscribe to gpsd reports: {}", error))
+        })?;
 
         let mut lines = BufReader::new(read_half).lines();
-        while let Some(line) = lines.next_line().await.map_err(|error| {
-            PositionError::Transport(format!("gpsd stream failed: {}", error))
-        })? {
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|error| PositionError::Transport(format!("gpsd stream failed: {}", error)))?
+        {
             match parse_report(&line) {
                 Ok(Some(fix)) => return Ok(fix),
                 Ok(None) => continue,
@@ -226,7 +225,9 @@ pub fn parse_report(line: &str) -> Result<Option<GpsFix>, PositionError> {
 
     match message.class.as_deref() {
         Some("ERROR") => Err(PositionError::Protocol(
-            message.message.unwrap_or_else(|| "gpsd reported an error".to_string()),
+            message
+                .message
+                .unwrap_or_else(|| "gpsd reported an error".to_string()),
         )),
         Some("TPV") => Ok(tpv_to_fix(&message)),
         _ => Ok(None),
@@ -281,7 +282,11 @@ mod tests {
         assert_eq!(fix.altitude_m, Some(4.2));
         assert_eq!(
             fix.acquired_at,
-            Some(DateTime::parse_from_rfc3339("2026-08-29T10:11:12.000Z").unwrap().with_timezone(&Utc))
+            Some(
+                DateTime::parse_from_rfc3339("2026-08-29T10:11:12.000Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
         );
     }
 
@@ -303,7 +308,10 @@ mod tests {
         let line = r#"{"class":"TPV","mode":2,"lat":1.0,"lon":2.0,"timestamp":1700000000.5}"#;
         let fix = parse_report(line).unwrap().unwrap();
 
-        assert_eq!(fix.acquired_at, Some(epoch() + chrono::Duration::milliseconds(500)));
+        assert_eq!(
+            fix.acquired_at,
+            Some(epoch() + chrono::Duration::milliseconds(500))
+        );
     }
 
     #[test]
@@ -330,7 +338,9 @@ mod tests {
         let line = r#"{"class":"ERROR","message":"No DOF for these devices"}"#;
 
         let error = parse_report(line).unwrap_err();
-        assert!(matches!(&error, PositionError::Protocol(text) if text == "No DOF for these devices"));
+        assert!(
+            matches!(&error, PositionError::Protocol(text) if text == "No DOF for these devices")
+        );
     }
 
     #[test]
@@ -370,10 +380,8 @@ mod tests {
 
     #[tokio::test]
     async fn transport_errors_pass_through() {
-        let source = GpsPositionSource::with_transport(
-            ScriptedTransport(vec![]),
-            Duration::from_millis(50),
-        );
+        let source =
+            GpsPositionSource::with_transport(ScriptedTransport(vec![]), Duration::from_millis(50));
 
         assert!(matches!(
             source.current_position().await.unwrap_err(),

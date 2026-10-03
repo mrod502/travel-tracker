@@ -26,7 +26,7 @@
 //! // If this returns Ok, the signature is valid
 //! ```
 
-use ed25519_dalek::{ed25519::signature::Verifier, VerifyingKey, Signature};
+use ed25519_dalek::{ed25519::signature::Verifier, Signature, VerifyingKey};
 
 /// Error type for verification operations.
 #[derive(Debug, Clone, PartialEq)]

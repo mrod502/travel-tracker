@@ -12,6 +12,7 @@
 //! # Implementation
 //!
 //! - [`full::FullNode`] - The Phase 0 full node implementation
+//! - [`device_id`] - Device identifier normalization across backends
 //! - [`identity::NodeIdentity`] - Node key management
 //! - [`rate_limiter::RateLimiter`] - Rate limiting for occurrence storage
 //!
@@ -26,11 +27,13 @@
 //! node.run().await?;
 //! ```
 
+pub mod device_id;
 pub mod full;
 pub mod identity;
 pub mod rate_limiter;
 
 // Re-export commonly used types
+pub use device_id::{derive_device_identity, DeviceIdentity};
 pub use full::FullNode;
 pub use identity::NodeIdentity;
 pub use rate_limiter::{RateLimiter, RateLimiterConfig, RateLimiterStats};
@@ -69,7 +72,11 @@ pub trait Node: Send + Sync {
     ///
     /// * `Ok(())` - If the signature is valid
     /// * `Err(VerifyError)` - If verification fails
-    fn verify(&self, _payload: &[u8], _signature: &ed25519_dalek::Signature) -> crate::provenance::verify::Result<()> {
+    fn verify(
+        &self,
+        _payload: &[u8],
+        _signature: &ed25519_dalek::Signature,
+    ) -> crate::provenance::verify::Result<()> {
         // Default implementation: verify using node's own key
         Ok(())
     }
@@ -89,6 +96,16 @@ pub trait Clock: Send + Sync {
     fn now_local(&self) -> chrono::DateTime<chrono::Utc> {
         self.now()
     }
+
+    /// The `(observed_at, observed_at_node_local)` pair for one observation.
+    ///
+    /// Those two columns exist so a later audit can measure how far a node's
+    /// clock was from UTC at the moment it observed the signal. Read twice, the
+    /// difference between them measures the sampling gap instead — so a clock
+    /// with no separate local notion has to fill both from a single reading.
+    fn now_pair(&self) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+        (self.now(), self.now_local())
+    }
 }
 
 /// System clock implementation using the system time.
@@ -99,8 +116,9 @@ impl Clock for SystemClock {
         chrono::Utc::now()
     }
 
-    fn now_local(&self) -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc::now()
+    fn now_pair(&self) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+        let observed = chrono::Utc::now();
+        (observed, observed)
     }
 }
 
@@ -134,7 +152,13 @@ mod tests {
     fn test_now_equals_now_local_phase0() {
         let clock = SystemClock;
 
-        // Phase 0: no distinction between now() and now_local()
-        assert_eq!(clock.now(), clock.now_local());
+        // Phase 0: no distinction between now() and now_local(). Repeated,
+        // because a single pass only fails when the two readings happen to
+        // straddle a clock tick — which is exactly how this assertion was
+        // flaky while the pair came from two reads.
+        for _ in 0..10_000 {
+            let (observed_at, observed_at_node_local) = clock.now_pair();
+            assert_eq!(observed_at, observed_at_node_local);
+        }
     }
 }

@@ -53,7 +53,10 @@ impl PositionSource for FallbackPositionSource {
                 Ok(Some(position)) => return Ok(Some(position)),
                 Ok(None) => {}
                 Err(error) => {
-                    debug!("position source unavailable, trying the next one: {}", error);
+                    debug!(
+                        "position source unavailable, trying the next one: {}",
+                        error
+                    );
                     if first_error.is_none() {
                         first_error = Some(error);
                     }

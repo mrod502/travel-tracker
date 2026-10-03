@@ -68,12 +68,14 @@ impl CachedPositionSource {
     fn lock(&self) -> MutexGuard<'_, State> {
         // A poisoned lock only means something panicked while updating a cached
         // fix; the fix itself is still fine to read.
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn backoff_deadline(&self, now: DateTime<Utc>) -> DateTime<Utc> {
-        let offset = ChronoDuration::from_std(self.retry_backoff)
-            .unwrap_or_else(|_| ChronoDuration::zero());
+        let offset =
+            ChronoDuration::from_std(self.retry_backoff).unwrap_or_else(|_| ChronoDuration::zero());
         now + offset
     }
 }
@@ -179,7 +181,10 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_fix_is_served_without_querying_the_source() {
-        let h = harness(vec![MockOutcome::Position(gps_fix(10.0))], Duration::from_secs(60));
+        let h = harness(
+            vec![MockOutcome::Position(gps_fix(10.0))],
+            Duration::from_secs(60),
+        );
 
         for _ in 0..3 {
             let got = h.source.current_position().await.unwrap().unwrap();
@@ -200,9 +205,15 @@ mod tests {
             Duration::from_secs(60),
         );
 
-        assert_eq!(h.source.current_position().await.unwrap().unwrap().latitude, 10.0);
+        assert_eq!(
+            h.source.current_position().await.unwrap().unwrap().latitude,
+            10.0
+        );
         h.clock.advance_ms(61_000);
-        assert_eq!(h.source.current_position().await.unwrap().unwrap().latitude, 11.0);
+        assert_eq!(
+            h.source.current_position().await.unwrap().unwrap().latitude,
+            11.0
+        );
         assert_eq!(h.inner.calls(), 2);
     }
 
@@ -218,7 +229,10 @@ mod tests {
 
         let error = h.source.current_position().await.unwrap_err();
         assert!(matches!(error, PositionError::StaleFix { .. }));
-        assert!(h.source.cached_fix().is_none(), "a rejected fix is not remembered");
+        assert!(
+            h.source.cached_fix().is_none(),
+            "a rejected fix is not remembered"
+        );
 
         // Once the backoff expires, the rejected report must not be the fallback.
         h.clock.advance_ms(30_001);
@@ -263,6 +277,10 @@ mod tests {
 
         assert!(h.source.current_position().await.unwrap().is_none());
         assert!(h.source.current_position().await.unwrap().is_none());
-        assert_eq!(h.inner.calls(), 1, "silence is worth retrying, just not yet");
+        assert_eq!(
+            h.inner.calls(),
+            1,
+            "silence is worth retrying, just not yet"
+        );
     }
 }

@@ -274,8 +274,8 @@ impl RateLimiter {
 
     /// Get statistics about the rate limiter.
     pub fn stats(&self) -> RateLimiterStats {
-        let total = self.allow_count.load(Ordering::SeqCst)
-            + self.deny_count.load(Ordering::SeqCst);
+        let total =
+            self.allow_count.load(Ordering::SeqCst) + self.deny_count.load(Ordering::SeqCst);
 
         let hit_rate = if total > 0 {
             (self.deny_count.load(Ordering::SeqCst) as f64) / (total as f64) * 100.0
@@ -329,7 +329,9 @@ pub struct RateLimiterStats {
 
 impl std::fmt::Display for RateLimiterStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RateLimiterStats {{
+        write!(
+            f,
+            "RateLimiterStats {{
   cache_size: {},
   allow_count: {},
   deny_count: {},
@@ -454,8 +456,7 @@ mod tests {
     #[test]
     fn test_max_cache_size_eviction() {
         let limiter = RateLimiter::with_config(
-            RateLimiterConfig::with_threshold(Duration::from_secs(60))
-                .with_max_cache_size(3),
+            RateLimiterConfig::with_threshold(Duration::from_secs(60)).with_max_cache_size(3),
         );
 
         // Add 3 devices
@@ -487,9 +488,8 @@ mod tests {
 
     #[test]
     fn test_time_since_last() {
-        let limiter = RateLimiter::with_config(RateLimiterConfig::with_threshold(
-            Duration::from_secs(60),
-        ));
+        let limiter =
+            RateLimiter::with_config(RateLimiterConfig::with_threshold(Duration::from_secs(60)));
         let device_hash = vec![0x01; 32];
 
         // Not seen yet

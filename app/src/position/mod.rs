@@ -51,8 +51,10 @@ pub mod mock;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use log::{debug, warn};
 use repo::models::LocationSource;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -231,6 +233,42 @@ impl PositionSource for NoPositionSource {
     }
 }
 
+/// Acquires a position for one occurrence without ever failing the caller.
+///
+/// A location is something an occurrence can do without: a node whose receiver
+/// has been unplugged must keep storing observations rather than stop. The first
+/// failure is logged at warn because it is news; later ones at debug because a
+/// node at scan rate turns a per-occurrence warning into a wall of text that
+/// hides everything else.
+pub struct BestEffortPositionSource {
+    inner: Arc<dyn PositionSource>,
+    already_reported: AtomicBool,
+}
+
+impl BestEffortPositionSource {
+    pub fn new(inner: Arc<dyn PositionSource>) -> Self {
+        Self {
+            inner,
+            already_reported: AtomicBool::new(false),
+        }
+    }
+
+    /// The current position, or `None` when there is no usable one.
+    pub async fn locate(&self) -> Option<Position> {
+        match self.inner.current_position().await {
+            Ok(position) => position,
+            Err(e) => {
+                if self.already_reported.swap(true, Ordering::Relaxed) {
+                    debug!("still no position for this occurrence: {e}");
+                } else {
+                    warn!("{e} — occurrences will carry a NULL location until the source recovers");
+                }
+                None
+            }
+        }
+    }
+}
+
 /// How the node should acquire its position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -322,7 +360,9 @@ impl PositionConfig {
 
 /// Parse a `"lat,lon"` coordinate pair.
 pub fn parse_coordinates(raw: &str) -> Result<(f64, f64), PositionError> {
-    let invalid = || PositionError::InvalidCoordinateString { raw: raw.to_string() };
+    let invalid = || PositionError::InvalidCoordinateString {
+        raw: raw.to_string(),
+    };
 
     let mut parts = raw.split(',');
     let latitude = parts.next().and_then(|p| p.trim().parse::<f64>().ok());

@@ -60,6 +60,7 @@ RUN mkdir -p $NVM_DIR \
     && nvm alias default 24.13.1 \
     && npm install -g @qwen-code/qwen-code@latest \
     && npm install -g @mermaid-js/mermaid-cli \
+    && npm install -g ripgrep \
     && rm -rf "$NVM_DIR/.cache"
 
 RUN apt-get clean \

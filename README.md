@@ -137,7 +137,42 @@ cargo run --bin app -- ca ca-verify --node-id <hex>
 cargo run --bin app -- ca ca-revoke
 cargo run --bin app -- ca ca-info
 cargo run --bin app -- ca ca-generate-rsl
+cargo run --bin app -- ca ca-export-anchor # publishes the CA public key for other nodes
+cargo run --bin app -- ca ca-migrate-key --from root_key.hex   # legacy hex key → PKCS#8
 ```
+
+Both key files are standard formats rather than one of this project's own: the root key is
+PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`, mode `0600`) and the published anchor is that same
+key as SubjectPublicKeyInfo PEM (`-----BEGIN PUBLIC KEY-----`, world-readable, since its whole
+use is being copied onto other machines). `openssl pkey` reads either. A root key written as
+bare hex by an earlier release is refused at load rather than guessed at, and the error names
+the command above; the conversion leaves the CA's id alone, so every credential and revocation
+list it published beforehand still verifies.
+
+### How a key is represented
+
+| Where | Representation |
+|-------|----------------|
+| In the program | Raw bytes (`[u8; 32]`, `Vec<u8>`, `VerifyingKey`) |
+| In the database | `BYTEA` — no hex, no JSON string |
+| In a file | A standard envelope: PKCS#8 v1 PEM private, SPKI PEM public |
+| Inside a JSON document | base64 (`ca::jsonbytes`), the JWK/COSE convention |
+| For a human to read | lowercase hex, in CLI output and error text |
+
+Hex is a display format and nothing else, which is why no wire format in this project uses
+it: a signed document that embeds an identifier as one tool's spelling of its bytes is
+signing the spelling. Node keys follow the same rule — `node_identity.pem` (PKCS#8, `0600`)
+and `node_identity.pub.pem` (SPKI, written on every start so it cannot outlive the secret it
+belongs to) — and the JSON-with-hex file an earlier release wrote is converted on first start:
+same secret, same node id, old file renamed to `node_identity.json.bak` for you to delete.
+
+Enroll a node by handing the CA the public file rather than retyping its contents:
+
+```bash
+cargo run --bin app -- ca ca-enroll --public-key-file /var/lib/btmon/node_identity.pub.pem
+```
+
+`--public-key <hex>` still works for scripts.
 
 A node refuses to scan until it has a row in `nodes`; run `ca ca-enroll` against that node's
 database first.
@@ -151,6 +186,44 @@ adapter the monitor opens (startup fails if it matches none, or more than one), 
 `BT_SCAN_INTERVAL_MS` is how often that continuous scan is re-armed — and how often the mock
 radio advertises. `BT_STORE_RAW_PAYLOAD` decides whether each occurrence keeps the radio's own
 advertisement bytes in `signal_payload.ble.raw_payload_hex`, inside the signature.
+
+### Revocation checking
+
+Off by default. Turn it on when there is a CA whose lists this node should believe:
+
+```bash
+cargo run --bin app -- ca ca-export-anchor                 # /var/lib/btmon/ca/root_key.pub.pem
+cargo run --bin app -- ca ca-revoke --node-id <hex>        # if there is anyone to revoke
+cargo run --bin app -- ca ca-generate-rsl                  # publish the list
+# then [revocation].enabled = true, with anchor_path pointing at the file above
+```
+
+With it on, the node loads its CA's list at startup, re-reads it every
+`[revocation].refresh_secs`, and asks it before storing an occurrence. A revocation only takes
+effect on the next refresh, and a failed refresh keeps the last list that verified — the CA
+being briefly unreachable is not a reason to forget the revocations it already published.
+
+Enabled but unusable is a startup error, not a warning. No anchor configured, no list
+published, a list that does not verify under the configured anchor, one whose validity window
+has closed, or one older than `[revocation].max_staleness_secs`: each leaves the node unable to
+tell a revoked node from a valid one, and a node that keeps storing anyway is producing rows
+whose provenance it cannot support while looking perfectly healthy. The error names both ways
+out — publish a current list, or switch checking off.
+
+Two rules apply that are easy to get backwards:
+
+- **The list speaks for a window.** Past `max_staleness_secs` its silence about a node is no
+  longer evidence, so an unlisted node is refused rather than assumed valid. The revocations it
+  *does* name stay in force however old it is. A list that ages past the bound while running —
+  the CA unreachable for a day, say — stops the node recording until it can read a current one.
+- **Handshakes are stricter than recording.** A node the list does not name has its data
+  recorded with a warning — one more row from an unestablished node costs a row — but is refused
+  a session, which costs everything that session touches.
+
+A node whose own key has been revoked stops recording at the next refresh, including its own
+observations: the check is on the id the row will be attributed to, not on the sender's claim.
+Revoke a node's key with `ca ca-revoke`, publish with `ca ca-generate-rsl`, and the deployment
+that was told about it stops accepting its data.
 
 ## Architecture Overview
 
@@ -167,12 +240,12 @@ advertisement bytes in `signal_payload.ble.raw_payload_hex`, inside the signatur
 
 | Crate | Purpose | State |
 |-------|---------|-------|
-| `app` | FullNode binary: scan → rate-limit → sign → store, plus the CA CLI | Implemented; verification and revocation not wired into the runtime |
+| `app` | FullNode binary: scan → rate-limit → sign → store, plus the CA CLI | Implemented; verification and revocation are wired into the runtime but never exercised over a network (no P2P transport) |
 | `bt_mon` | BLE scanning library (btleplug / bluer / mock) | Working; raw advertisement payload not yet exposed |
 | `repo` | sqlx models, repositories, and the client-side H3 module | Aligned with the schema |
-| `db` | Migration tool (`new-migration`, `up`, `down`, `reset`) | Seven migrations; none ever executed |
-| `ca` | CA root, credentials, revocation status lists, policies | Library complete; nothing consults it at runtime |
-| `bt_iden` | Probabilistic device identity resolution | Standalone library; no consumer yet |
+| `db` | Migration tool (`new-migration`, `up`, `down`, `reset`) | 14 migrations; applied by every `#[sqlx::test]` database and by `db up` against a real server |
+| `ca` | CA root, credentials, revocation status lists, policies | Library complete; the node consults it at runtime for its key and its revocation list |
+| `bt_iden` | Probabilistic device identity resolution | Library; driven offline by `app identity-replay`, which writes the derived tables |
 
 ## Development Workflow
 

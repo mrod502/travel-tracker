@@ -173,7 +173,7 @@ impl RevocationRepository {
     /// * `Ok(Some(i64))` - Latest sequence number
     /// * `Ok(None)` - No RSLs issued yet
     /// * `Err(RepoError)` - If the query failed
-    pub async fn get_latest_rsl_sequence<'e, E>(executor: E, ca_id: &str) -> Result<Option<i64>>
+    pub async fn get_latest_rsl_sequence<'e, E>(executor: E, ca_id: &[u8]) -> Result<Option<i64>>
     where
         E: Executor<'e, Database = sqlx::Postgres>,
     {
@@ -334,7 +334,7 @@ mod tests {
         let entry = RevokedNode {
             node_id: node_id.clone(),
             revoked_at: Utc::now(),
-            revoked_by: "ca-test".to_string(),
+            revoked_by: Some(b"ca-test".to_vec()),
             reason: 1,
             signing_public_key: vec![0x5bu8; 32],
             ca_credential: b"ca-credential".to_vec(),

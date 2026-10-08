@@ -105,13 +105,15 @@ Any party can verify an occurrence's authenticity without live CA access:
   on 2026-09-14: `ca-generate-rsl` numbers, signs and stores every list in `revocation_status_lists`,
   so the anti-replay sequence outlives the process that issued it, and a checker holding no list, an
   expired list, or one older than its staleness bound answers `Unknown` instead of `Valid`
-  (`ca/tests/rsl_persistence.rs`). What remains is the consumption side — `FullNode::new` still builds
-  an **empty** `InMemoryRslChecker`, `enable_revocation_checking` only logs, and nothing calls
-  `verify_rsl` when a stored list is loaded, so no runtime rejection is possible yet. See
+  (`ca/tests/rsl_persistence.rs`). The consumption side became real on 2026-10-08
+  ([GAP_ANALYSIS B11](../../GAP_ANALYSIS.md)): `ca::verified_checker` verifies a list against the
+  anchor in `[revocation].anchor_path` as it is loaded, `RevocationWatch` keeps it current, and
+  `FullNode` refuses to record what it revokes or can no longer vouch for. `enable_revocation_checking`
+  and the empty checker are gone. See
   `.knowledge/architecture/specifications/revocation-scheme.md` and
   [`provenance-status.md`](provenance-status.md).
 - **BLOCKER for production:** credentials are issued and verifiable, but nothing verifies them
-  on the receive path, so the trust anchor is currently decorative.
+  on the receive path, so the anchor is load-bearing for lists and still decorative for credentials.
 - **BLOCKER for Phase 1:** node sync must propagate CA credentials, and there is no transport.
 - **Security critical:** this is the foundation of the entire trust model.
 

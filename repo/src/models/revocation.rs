@@ -14,8 +14,11 @@ pub struct RevokedNode {
     /// When the node was revoked.
     pub revoked_at: DateTime<Utc>,
 
-    /// The CA identifier that issued the revocation.
-    pub revoked_by: String,
+    /// The CA identifier that issued the revocation: `SHA-256(its public key)`,
+    /// raw bytes. NULL while a revocation has been recorded but no signed list
+    /// carrying it has been published — the ledger row exists, and no CA has
+    /// attributed itself to it yet.
+    pub revoked_by: Option<Vec<u8>>,
 
     /// Revocation reason code (0-6 per RFC 5280 adaptation).
     /// 0 = unspecified, 1 = key_compromise, 2 = ca_compromise,
@@ -71,7 +74,7 @@ impl RevokedNode {
 pub struct RevokedNodeBuilder {
     node_id: Option<Vec<u8>>,
     revoked_at: Option<DateTime<Utc>>,
-    revoked_by: Option<String>,
+    revoked_by: Option<Vec<u8>>,
     reason: Option<i32>,
     signing_public_key: Option<Vec<u8>>,
     ca_credential: Option<Vec<u8>>,
@@ -92,9 +95,9 @@ impl RevokedNodeBuilder {
         self
     }
 
-    /// Set the revoked by (CA identifier).
-    pub fn revoked_by(mut self, ca_id: impl Into<String>) -> Self {
-        self.revoked_by = Some(ca_id.into());
+    /// Set the revoked by (CA identifier, raw bytes).
+    pub fn revoked_by(mut self, ca_id: &[u8]) -> Self {
+        self.revoked_by = Some(ca_id.to_vec());
         self
     }
 
@@ -133,7 +136,7 @@ impl RevokedNodeBuilder {
         RevokedNode {
             node_id: self.node_id.expect("node_id is required"),
             revoked_at: self.revoked_at.unwrap_or_else(Utc::now),
-            revoked_by: self.revoked_by.expect("revoked_by is required"),
+            revoked_by: self.revoked_by,
             reason: self.reason.expect("reason is required"),
             signing_public_key: self
                 .signing_public_key

@@ -34,3 +34,4 @@
 202609141353_ensure_occurrence_partition_on_demand.sql	up=8/51cac840d2ea98a5	down=4/479cf1354affdc6c
 202609142142_create_revocation_status_lists.sql	up=5/be595524ab01c141	down=1/41d02c36a8477688
 202609271430_create_device_identity_tables.sql	up=23/c7df670fd69337e5	down=5/2ad0754d3144a6da
+202610071500_identifiers_as_raw_bytes.sql	up=7/7e6ea0339f382e23	down=4/2a699230e2530e30

@@ -69,7 +69,7 @@ use tokio::time;
 
 use crate::error::{Error, Result};
 use crate::monitor::events::{
-    DeviceEvent, DeviceEventStream, NotificationEvent, NotificationStream,
+    report_event, DeviceEvent, DeviceEventStream, NotificationEvent, NotificationStream,
     DEVICE_EVENT_CHANNEL_CAPACITY,
 };
 use crate::monitor::{DeviceMonitor, GattClient};
@@ -899,12 +899,52 @@ impl MockMonitor {
         publish_event(&self.event_senders, event);
     }
 
+    /// Put a device on the simulated air, once, and return what the listeners saw.
+    ///
+    /// This is the one place the mock decides what a report means: a device nobody
+    /// has heard of is a discovery, a device whose tracked properties moved is an
+    /// update naming them, and a device that merely turned up again is an
+    /// [`DeviceEvent::Advertisement`] sighting. The self-advertising loop and any
+    /// test driving a particular report both come through here, so the mock cannot
+    /// mean one thing in the loop and another in the test.
+    ///
+    /// GATT state attached to the address (services, subscriptions) survives; only
+    /// the advertisement snapshot is replaced.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bt_mon::backends::mock::MockMonitor;
+    /// use bt_mon::{BluetoothDevice, DeviceEvent, DeviceId, UpdateField};
+    ///
+    /// let monitor = MockMonitor::new();
+    /// let device = BluetoothDevice::new(DeviceId::new("AA:BB:CC:DD:EE:FF"),
+    ///     "AA:BB:CC:DD:EE:FF".to_string()).with_rssi(-70);
+    ///
+    /// // First heard: a discovery.
+    /// assert!(matches!(monitor.advertise(device.clone()),
+    ///     DeviceEvent::DeviceAdded { .. }));
+    /// // Heard again with the same contents: still a sighting, not silence.
+    /// assert!(matches!(monitor.advertise(device.clone()),
+    ///     DeviceEvent::Advertisement { .. }));
+    /// // Heard again with a different signal: an update that says so.
+    /// let moved = monitor.advertise(device.with_rssi(-52));
+    /// assert!(matches!(moved, DeviceEvent::DeviceUpdated { ref changed_fields, .. }
+    ///     if changed_fields == &vec![UpdateField::Rssi]));
+    /// ```
+    pub fn advertise(&self, device: BluetoothDevice) -> DeviceEvent {
+        let event = announce(&self.devices, device);
+        self.broadcast_event(&event);
+        event
+    }
+
     /// Puts the configured advertisers on the air until the scan stops.
     ///
-    /// Each tick re-advertises every device, as a real radio does; the node's
-    /// rate limiter is what decides whether a repeat sighting is worth a row.
-    /// The device is registered with the monitor too, so `devices()` and the
-    /// event stream agree.
+    /// Each tick re-advertises every device, as a real radio does. The first tick
+    /// is a discovery and every tick after it is a sighting of a device that is
+    /// still there; the node's sampling policy is what decides whether a sighting
+    /// is worth a row. The device is registered with the monitor too, so
+    /// `devices()` and the event stream agree.
     fn spawn_advertisers(&self) {
         let devices = self.devices.clone();
         let senders = self.event_senders.clone();
@@ -924,20 +964,29 @@ impl MockMonitor {
                     .with_rssi(advertiser.rssi)
                     .with_raw_payload(advertiser.advertisement_bytes());
 
-                    // An existing entry is left alone: a scan must not wipe the
-                    // services or connection state something else attached to the
-                    // same address.
-                    devices
-                        .entry(advertiser.id.clone())
-                        .or_insert_with(|| SimulatedDevice::new(device.clone()));
-
-                    publish_event(&senders, &DeviceEvent::DeviceAdded { device });
+                    publish_event(&senders, &announce(&devices, device));
                 }
 
                 time::sleep(interval).await;
             }
         });
     }
+}
+
+/// Record one advertisement of `device` and say what the listeners should see.
+///
+/// Keeps any GATT state already attached to the address: a scan must not wipe the
+/// services or connection state something else put there.
+fn announce(devices: &DashMap<DeviceId, SimulatedDevice>, device: BluetoothDevice) -> DeviceEvent {
+    let id = device.id.clone();
+    if let Some(mut entry) = devices.get_mut(&id) {
+        let previous = entry.value().device.clone();
+        entry.value_mut().device = device.clone();
+        return report_event(&previous, device);
+    }
+
+    devices.insert(id, SimulatedDevice::new(device.clone()));
+    DeviceEvent::DeviceAdded { device }
 }
 
 /// Delivers an event to every open subscriber, pruning the disconnected ones.
@@ -1313,6 +1362,7 @@ impl GattClient for MockMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::events::UpdateField;
     use futures::{Stream, StreamExt};
     use std::pin::Pin;
 
@@ -1798,6 +1848,135 @@ mod tests {
                 .await
                 .is_err(),
             "a monitor without advertisers should advertise nothing"
+        );
+    }
+
+    fn beacon() -> BluetoothDevice {
+        BluetoothDevice::new(
+            DeviceId::new("F0:EE:00:00:01:02"),
+            "F0:EE:00:00:01:02".to_string(),
+        )
+        .with_name("Meter Beacon")
+        .with_rssi(-67)
+        .with_manufacturer_data(0x004C, vec![0x01])
+    }
+
+    #[test]
+    fn a_beacon_heard_twice_with_nothing_said_is_still_heard() {
+        // The B14 case at the radio's own level: a beacon that has not moved,
+        // whose signal strength and payload are identical, used to disappear
+        // from the event stream after its first advertisement.
+        let monitor = MockMonitor::new();
+        assert!(
+            matches!(monitor.advertise(beacon()), DeviceEvent::DeviceAdded { .. }),
+            "the first report of a device is a discovery"
+        );
+
+        match monitor.advertise(beacon()) {
+            DeviceEvent::Advertisement { device } => {
+                assert_eq!(device.id.as_str(), "F0:EE:00:00:01:02");
+            }
+            other => panic!("a repeat report should be a sighting, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_beacon_that_changes_its_advertisement_changes_the_report() {
+        // A sensor that puts a new reading into its manufacturer data is news.
+        // It used to update the cache and emit nothing, so a device saying
+        // something new produced exactly the same silence as one saying nothing.
+        let monitor = MockMonitor::new();
+        monitor.advertise(beacon());
+
+        let reading = beacon().with_manufacturer_data(0x004C, vec![0x02]);
+        match monitor.advertise(reading) {
+            DeviceEvent::DeviceUpdated {
+                device,
+                changed_fields,
+            } => {
+                assert_eq!(changed_fields, vec![UpdateField::ManufacturerData]);
+                assert_eq!(
+                    device.manufacturer_data.get(&0x004C),
+                    Some(&vec![0x02]),
+                    "the report carries the new reading, not the cached one"
+                );
+            }
+            other => panic!("a changed advertisement should be an update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn advertising_keeps_the_gatt_state_attached_to_an_address() {
+        // Replacing the advertisement snapshot must not wipe the services
+        // something else attached to the same device.
+        let monitor = MockMonitor::new();
+        monitor.advertise(beacon());
+
+        let id = DeviceId::new("F0:EE:00:00:01:02");
+        let uuid = ServiceUuid::parse_str("0000180f-0000-1000-8000-00805f9b34fb").unwrap();
+        monitor
+            .devices
+            .get_mut(&id)
+            .expect("the advertisement registered the device")
+            .value_mut()
+            .services
+            .push(GattService::new(uuid, true));
+
+        monitor.advertise(beacon().with_rssi(-55));
+
+        let entry = monitor.devices.get(&id).expect("device still known");
+        assert_eq!(
+            entry.value().services.len(),
+            1,
+            "the service survived the re-advertisement"
+        );
+        assert_eq!(
+            entry.value().device.rssi,
+            Some(-55),
+            "and the advertisement snapshot moved"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stationary_beacon_keeps_being_heard_by_an_open_stream() {
+        // What B14 looks like from the consumer's side: one beacon, nothing
+        // changing about it, and a stream that keeps saying it is there.
+        let monitor = MockMonitor::with_config(
+            MockConfig::default()
+                .with_scan_delay_ms(0)
+                .with_advertisers(vec![SimulatedAdvertiser::new(
+                    "F0:EE:00:00:03:03",
+                    "Still Here",
+                )])
+                .with_advertise_interval_ms(20),
+        );
+        let mut events = monitor.device_events().await.unwrap();
+        monitor.start_scan().await.unwrap();
+
+        let mut kinds = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await {
+            kinds.push(match event {
+                DeviceEvent::DeviceAdded { .. } => "added",
+                DeviceEvent::Advertisement { .. } => "advertisement",
+                DeviceEvent::DeviceUpdated { .. } => "updated",
+                DeviceEvent::DeviceRemoved { .. } => "removed",
+            });
+        }
+
+        assert!(
+            kinds.len() >= 3,
+            "a beacon advertising every 20 ms should be heard repeatedly, heard {kinds:?}"
+        );
+        assert_eq!(
+            kinds.first().copied(),
+            Some("added"),
+            "the first report of a device is a discovery"
+        );
+        assert!(
+            kinds[1..].iter().all(|kind| *kind == "advertisement"),
+            "nothing about the beacon moves, so every report after the first is \
+             a sighting rather than an update or a repeat discovery: {kinds:?}"
         );
     }
 }

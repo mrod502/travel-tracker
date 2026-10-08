@@ -19,7 +19,8 @@ use tokio::time;
 use crate::config::{adapter_matches, MonitorConfig};
 use crate::error::{BackendKind, Error, Result};
 use crate::monitor::events::{
-    DeviceEvent, DeviceEventStream, NotificationStream, UpdateField, DEVICE_EVENT_CHANNEL_CAPACITY,
+    report_event, DeviceEvent, DeviceEventStream, NotificationStream, UpdateField,
+    DEVICE_EVENT_CHANNEL_CAPACITY,
 };
 use crate::monitor::{DeviceMonitor, GattClient};
 use crate::types::ValueNotification;
@@ -557,7 +558,7 @@ impl BtleplugMonitor {
                 match Self::fetch_and_cache_device(adapter, devices, &id).await {
                     Some(device) => match old {
                         None => vec![DeviceEvent::DeviceAdded { device }],
-                        Some(old) => Self::diff_events(old, device),
+                        Some(old) => vec![report_event(&old, device)],
                     },
                     None => {
                         // The device is no longer known to the adapter
@@ -568,28 +569,16 @@ impl BtleplugMonitor {
                 }
             }
 
+            // btleplug asks BlueZ for `duplicate_data`, so an RSSI report arrives
+            // with every advertisement — including for a device that has not moved
+            // and whose signal strength has not budged. It used to be dropped when
+            // the number was unchanged, which is how a beacon held next to the node
+            // came to produce one sighting and then silence (GAP_ANALYSIS B14).
             CentralEvent::RssiUpdate { id, rssi } => {
-                let rssi = Some(rssi as i32);
-                let device_id = Self::peripheral_id_to_device_id(&id);
-                match devices.get(&device_id).map(|e| e.value().device.clone()) {
-                    Some(device) if device.rssi == rssi => Vec::new(),
-                    Some(mut device) => {
-                        device.rssi = rssi;
-                        if let Some(mut entry) = devices.get_mut(&device_id) {
-                            entry.value_mut().device.rssi = rssi;
-                        }
-                        vec![DeviceEvent::DeviceUpdated {
-                            device,
-                            changed_fields: vec![UpdateField::Rssi],
-                        }]
-                    }
-                    // RSSI update for an unknown device: fetch full info so
-                    // the discovery is not lost.
-                    None => match Self::fetch_and_cache_device(adapter, devices, &id).await {
-                        Some(device) => vec![DeviceEvent::DeviceAdded { device }],
-                        None => Vec::new(),
-                    },
-                }
+                Self::report_advertisement(adapter, devices, &id, |device| {
+                    device.rssi = Some(rssi as i32);
+                })
+                .await
             }
 
             CentralEvent::DeviceConnected(id) => Self::update_connected(devices, id, true),
@@ -599,36 +588,33 @@ impl BtleplugMonitor {
                 id,
                 manufacturer_data,
             } => {
-                let device_id = Self::peripheral_id_to_device_id(&id);
-                if let Some(mut entry) = devices.get_mut(&device_id) {
-                    entry.value_mut().device.manufacturer_data = manufacturer_data;
-                }
-                debug!("Manufacturer data advertisement from {}", device_id);
-                Vec::new()
+                Self::report_advertisement(adapter, devices, &id, |device| {
+                    device.manufacturer_data = manufacturer_data;
+                })
+                .await
             }
 
             CentralEvent::ServiceDataAdvertisement { id, service_data } => {
-                let device_id = Self::peripheral_id_to_device_id(&id);
-                if let Some(mut entry) = devices.get_mut(&device_id) {
-                    entry.value_mut().device.service_data = service_data
+                Self::report_advertisement(adapter, devices, &id, |device| {
+                    device.service_data = service_data
                         .into_iter()
                         .map(|(uuid, data)| (ServiceUuid(uuid), data))
                         .collect();
-                }
-                debug!("Service data advertisement from {}", device_id);
-                Vec::new()
+                })
+                .await
             }
 
+            // The advertised service *list* has no field on `BluetoothDevice` to
+            // land in, so this report cannot move any tracked property
+            // (GAP_ANALYSIS M27, and M31 for why `services_resolved` is not it).
+            // It is still the device being heard, which is worth more than the
+            // debug line it used to end at.
             CentralEvent::ServicesAdvertisement { id, .. } => {
-                let device_id = Self::peripheral_id_to_device_id(&id);
-                debug!("Services advertisement from {}", device_id);
-                Vec::new()
+                Self::report_advertisement(adapter, devices, &id, |_| {}).await
             }
 
             CentralEvent::DeviceServicesModified(id) => {
-                let device_id = Self::peripheral_id_to_device_id(&id);
-                debug!("Device services modified: {}", device_id);
-                Vec::new()
+                Self::report_advertisement(adapter, devices, &id, |_| {}).await
             }
 
             CentralEvent::StateUpdate(state) => {
@@ -715,36 +701,56 @@ impl BtleplugMonitor {
         Some(device)
     }
 
-    /// Build a [`DeviceEvent::DeviceUpdated`] for the fields that changed
-    /// between `old` and `new`, or an empty vec when nothing changed.
-    fn diff_events(old: BluetoothDevice, new: BluetoothDevice) -> Vec<DeviceEvent> {
-        let changed_fields = Self::changed_fields(&old, &new);
-        if changed_fields.is_empty() {
-            Vec::new()
-        } else {
-            vec![DeviceEvent::DeviceUpdated {
-                device: new,
-                changed_fields,
-            }]
-        }
-    }
+    /// Deliver one advertisement report about a device the cache already holds,
+    /// or turn it into a discovery when the cache has never seen that device.
+    ///
+    /// `apply` writes the contents this report carried onto the cached snapshot.
+    /// The report always produces an event: [`report_event`] names what moved,
+    /// and reports the device as heard again when nothing did. Returning nothing
+    /// for an unchanged report is what made a stationary beacon produce one
+    /// sighting and then silence (GAP_ANALYSIS B14), because "no event" is
+    /// indistinguishable at the consumer from "the device left".
+    ///
+    /// An advertisement from a device the monitor never saw is the only evidence
+    /// of it there is, so it is fetched and reported as a discovery — the same
+    /// reasoning the RSSI arm applies to an unknown device.
+    async fn report_advertisement<F>(
+        adapter: &btleplug::platform::Adapter,
+        devices: &DashMap<DeviceId, DiscoveredDevice>,
+        id: &btleplug::platform::PeripheralId,
+        apply: F,
+    ) -> Vec<DeviceEvent>
+    where
+        F: FnOnce(&mut BluetoothDevice),
+    {
+        let device_id = Self::peripheral_id_to_device_id(id);
 
-    /// Compute which tracked fields changed between two snapshots.
-    fn changed_fields(old: &BluetoothDevice, new: &BluetoothDevice) -> Vec<UpdateField> {
-        let mut changed = Vec::new();
-        if old.name != new.name {
-            changed.push(UpdateField::Name);
+        if let Some(mut entry) = devices.get_mut(&device_id) {
+            let old = entry.value().device.clone();
+            let peripheral = entry.value().peripheral.clone();
+            let mut reported = old.clone();
+            apply(&mut reported);
+            let event = report_event(&old, reported.clone());
+            *entry.value_mut() = DiscoveredDevice {
+                device: reported,
+                peripheral,
+            };
+            return vec![event];
         }
-        if old.rssi != new.rssi {
-            changed.push(UpdateField::Rssi);
+
+        match Self::fetch_and_cache_device(adapter, devices, id).await {
+            Some(device) => {
+                debug!(
+                    "Advertisement from unknown device {} became a discovery",
+                    device_id
+                );
+                vec![DeviceEvent::DeviceAdded { device }]
+            }
+            None => {
+                debug!("Advertisement from {} could not be resolved", device_id);
+                Vec::new()
+            }
         }
-        if old.services_resolved != new.services_resolved {
-            changed.push(UpdateField::ServicesResolved);
-        }
-        if old.is_connected != new.is_connected {
-            changed.push(UpdateField::Connected);
-        }
-        changed
     }
 }
 

@@ -1,4 +1,12 @@
 //! CA credential types and structures.
+//!
+//! A credential is the CA's signature over a node's signing key. Every key,
+//! signature and identifier in it is raw bytes; the JSON form that goes into
+//! `nodes.ca_credential` writes those fields as base64 (see
+//! [`crate::jsonbytes`]), because JSON has no byte type of its own. There is no
+//! hex form of a credential — an earlier `to_hex`/`from_hex` pair concatenated
+//! fields into one hex string, could not round-trip `expires_at` or `issuer_id`,
+//! and was never used for storage.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -31,12 +39,15 @@ use crate::error::{CaError, Result};
 pub struct Credential {
     /// Node ID (SHA-256 of signing_public_key).
     /// This is self-certifying - anyone can recompute it.
+    #[serde(with = "crate::jsonbytes::base64_bytes")]
     pub node_id: Vec<u8>,
 
     /// Node's Ed25519 public key (32 bytes).
+    #[serde(with = "crate::jsonbytes::base64_bytes")]
     pub signing_public_key: Vec<u8>,
 
     /// CA's Ed25519 signature over the credential payload.
+    #[serde(with = "crate::jsonbytes::base64_bytes")]
     pub ca_signature: Vec<u8>,
 
     /// When the credential was issued (UTC).
@@ -46,9 +57,13 @@ pub struct Credential {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
 
-    /// Optional: Issuer identifier (for multi-CA setups).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub issuer_id: Option<String>,
+    /// Optional: Issuer identifier (for multi-CA setups), raw bytes.
+    #[serde(
+        with = "crate::jsonbytes::optional_base64_bytes",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub issuer_id: Option<Vec<u8>>,
 }
 
 impl Credential {
@@ -62,7 +77,11 @@ impl Credential {
     /// * `ca_signature` - The CA's signature over the credential payload
     /// * `issued_at` - When the credential was issued
     /// * `expires_at` - Optional expiration time
-    /// * `issuer_id` - Optional issuer identifier
+    /// * `issuer_id` - Which CA signed it, as `SHA-256(its public key)`. Nothing
+    ///   in the signed payload carries it, so it is a pointer to an anchor rather
+    ///   than a claim about one: [`crate::TrustAnchor::verify_credential`] checks
+    ///   the signature against the key it was handed and reports whether that key
+    ///   is the one this field names.
     ///
     /// # Returns
     ///
@@ -72,7 +91,7 @@ impl Credential {
         ca_signature: Vec<u8>,
         issued_at: DateTime<Utc>,
         expires_at: Option<DateTime<Utc>>,
-        issuer_id: Option<String>,
+        issuer_id: Option<Vec<u8>>,
     ) -> Result<Self> {
         // Validate signing public key length (Ed25519 public keys are 32 bytes)
         if signing_public_key.len() != 32 {
@@ -152,48 +171,6 @@ impl Credential {
         self.expires_at
             .map(|expires_at| (expires_at - self.issued_at).num_days() as u64)
     }
-
-    /// Encode the credential as hex for storage/display.
-    pub fn to_hex(&self) -> String {
-        hex::encode(&self.ca_signature)
-            + &hex::encode(&self.signing_public_key)
-            + &hex::encode(&self.issued_at.to_rfc3339())
-    }
-
-    /// Decode a credential from hex encoding.
-    pub fn from_hex(hex_str: &str) -> Result<Self> {
-        let bytes = hex::decode(hex_str)
-            .map_err(|e| CaError::Serialization(format!("Hex decode failed: {}", e)))?;
-
-        // Minimum length: 64 (signature) + 32 (public key) + variable (timestamp)
-        if bytes.len() < 96 {
-            return Err(CaError::InvalidCredential(
-                "Hex string too short for valid credential".to_string(),
-            ));
-        }
-
-        let ca_signature = bytes[0..64].to_vec();
-        let signing_public_key = bytes[64..96].to_vec();
-        let timestamp_bytes = &bytes[96..];
-
-        let timestamp_str = String::from_utf8(timestamp_bytes.to_vec())
-            .map_err(|e| CaError::Serialization(format!("Invalid timestamp: {}", e)))?;
-
-        let issued_at = DateTime::parse_from_rfc3339(&timestamp_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .map_err(|e| CaError::Serialization(format!("Invalid timestamp format: {}", e)))?;
-
-        let node_id = Sha256::digest(&signing_public_key).to_vec();
-
-        Ok(Credential {
-            node_id,
-            signing_public_key,
-            ca_signature,
-            issued_at,
-            expires_at: None,
-            issuer_id: None,
-        })
-    }
 }
 
 /// Credential request from a node to the CA.
@@ -264,15 +241,38 @@ mod tests {
     }
 
     #[test]
-    fn test_credential_hex_encoding() {
-        let public_key = vec![1u8; 32];
+    fn a_credential_round_trips_through_its_json_document() {
+        let public_key = vec![2u8; 32];
+        let credential = Credential::new(
+            public_key,
+            vec![3u8; 64],
+            Utc::now(),
+            Some(Utc::now() + chrono::Duration::days(90)),
+            Some(vec![7u8; 32]),
+        )
+        .unwrap();
+
+        // The hex pair this replaced dropped `expires_at` and `issuer_id` on the
+        // floor, which silently changed what the credential claimed. The JSON form
+        // keeps every field, so a credential read back is the credential issued.
+        let decoded: Credential =
+            serde_json::from_str(&serde_json::to_string(&credential).unwrap()).unwrap();
+        assert_eq!(decoded, credential);
+    }
+
+    #[test]
+    fn a_credentials_keys_are_base64_in_its_document() {
         let credential =
-            Credential::new(public_key, vec![2u8; 64], Utc::now(), None, None).unwrap();
+            Credential::new(vec![1u8; 32], vec![0u8; 64], Utc::now(), None, None).unwrap();
 
-        let hex = credential.to_hex();
-        let decoded = Credential::from_hex(&hex).unwrap();
-
-        assert_eq!(credential.signing_public_key, decoded.signing_public_key);
-        assert_eq!(credential.ca_signature, decoded.ca_signature);
+        let document = serde_json::to_value(&credential).unwrap();
+        assert_eq!(
+            document["signing_public_key"],
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+        );
+        assert_eq!(
+            document["ca_signature"],
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+        );
     }
 }

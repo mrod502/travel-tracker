@@ -11,6 +11,11 @@
 //! 3. **Credential verification** - Validating that a credential was issued by this CA
 //! 4. **Revocation management** - Tracking which nodes have been revoked
 //!
+//! A consumer on the other side of that relationship holds a [`TrustAnchor`] — the
+//! CA's public key and nothing else — and verifies credentials and revocation
+//! lists with it. See the [`anchor`] module for why that is possible and what it
+//! cannot do.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -50,13 +55,17 @@
 //! - Consider using HSM for production deployments
 //! - Rotate CA root key periodically (see key rotation policy)
 
+pub mod anchor;
 pub mod credential;
 pub mod error;
+pub mod jsonbytes;
+pub mod pemkeys;
 pub mod revocation;
 pub mod root;
 pub mod rsl_manager;
 pub mod signing;
 
+pub use anchor::TrustAnchor;
 pub use credential::Credential;
 pub use error::CaError;
 pub use revocation::{
@@ -65,11 +74,12 @@ pub use revocation::{
     RevocationStatusList, RevokedNode, RslBuilder,
 };
 pub use root::CaRoot;
+pub use rsl_manager::verified_checker;
 #[cfg(feature = "database")]
 pub use rsl_manager::DatabaseRslManager;
 pub use rsl_manager::InMemoryRslManager;
 pub use rsl_manager::RslManager;
-pub use signing::sign_credential;
+pub use signing::{sign_credential, verify_credential_signature, verify_rsl_signature};
 
 /// Default validity period for credentials (90 days).
 pub const DEFAULT_CREDENTIAL_VALIDITY_DAYS: u64 = 90;

@@ -52,6 +52,23 @@ pub enum CaError {
     #[error("RSL from {0} is not signed")]
     UnsignedRsl(String),
 
+    /// The CA in question has published no revocation list at all.
+    ///
+    /// Separate from "the list says this node is fine" because it is the absence
+    /// of evidence, and a consumer that cannot tell the two apart turns an outage
+    /// at the CA into a clean bill of health for every node in the federation.
+    #[error("CA {0} has published no revocation status list")]
+    RslNotFound(String),
+
+    /// The newest list a CA published is past its `expires_at`.
+    ///
+    /// An expired list is no longer evidence about anything: it is a statement
+    /// about a window that has closed, so the absence of a node from it cannot be
+    /// read as "not revoked". Loaders refuse one rather than answering
+    /// `Valid` from stale data.
+    #[error("RSL expired at {0}, so it can no longer say anything about a node's status")]
+    RslExpired(chrono::DateTime<chrono::Utc>),
+
     /// Invalid key format or length.
     #[error("Invalid key: {0}")]
     InvalidKey(String),

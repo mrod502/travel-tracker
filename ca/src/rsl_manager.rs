@@ -21,7 +21,19 @@
 //! A list therefore starts at 1, and 0 means "this CA has never published
 //! one" — which is also what `revocation_status_lists`' CHECK constraint
 //! enforces.
+//!
+//! # Reading a list
+//!
+//! A published list reaches a consumer as a JSON document in a column: the same
+//! row an operator can `UPDATE`, a replica can replay, a migration can rewrite.
+//! What makes it the CA's statement rather than anybody's is the signature over
+//! its bytes, so the only supported way to read one is
+//! [`verified_checker`], which refuses a list whose signature does not come from
+//! the configured anchor's key. There is deliberately no unverified accessor:
+//! a checker built from an edited document answers `Valid` for exactly the nodes
+//! the edit removed, which is the failure revocation exists to prevent.
 
+use crate::anchor::TrustAnchor;
 use crate::error::{CaError, Result};
 use crate::revocation::{InMemoryRslChecker, RevocationStatus, RevocationStatusList, RevokedNode};
 use async_trait::async_trait;
@@ -34,10 +46,59 @@ use chrono::Utc;
 /// the CA's, so it has to happen before the list is handed to a manager.
 fn ensure_signed(rsl: &RevocationStatusList) -> Result<()> {
     if rsl.signature.is_empty() {
-        return Err(CaError::UnsignedRsl(rsl.issuer_id.clone()));
+        return Err(CaError::UnsignedRsl(hex::encode(&rsl.issuer_id)));
     }
 
     Ok(())
+}
+
+/// Turn a CA's published revocation data into a checker, verifying it first.
+///
+/// The issuer is not a parameter: `anchor` names the CA, and "give me the list
+/// from someone else" is not a question this answers — the id is derived from the
+/// key and compared against the document, so an anchor for CA A can never be used
+/// to bless a list claiming to be from CA B.
+///
+/// # Errors
+///
+/// * [`CaError::RslNotFound`] — this CA has published nothing. That is the absence
+///   of evidence, not a clean bill of health, and a caller that reads it as one
+///   turns an outage at the CA into `Valid` for every node in the federation.
+/// * [`CaError::Verification`] — the signature is not this key's, or the document
+///   names a different CA. Tampering and misconfiguration both land here, and the
+///   message says so rather than reporting an empty list.
+/// * [`CaError::RslExpired`] — the newest list's validity window has closed, so
+///   its silence about a node no longer means anything.
+///
+/// A list that verifies but is *stale* is returned as loaded: how much staleness
+/// to tolerate is the caller's policy, expressed through `max_staleness` and acted
+/// on by the [`crate::RevocationPolicy`]s, not a fact about authenticity.
+///
+/// [`crate::RevocationPolicy`]: crate::revocation::RevocationPolicy
+pub async fn verified_checker(
+    manager: &dyn RslManager,
+    anchor: &TrustAnchor,
+    max_staleness: chrono::Duration,
+) -> Result<InMemoryRslChecker> {
+    let rsl = manager
+        .get_latest_rsl(anchor.ca_id())
+        .await?
+        .ok_or_else(|| CaError::RslNotFound(anchor.ca_id_hex()))?;
+
+    if !anchor.verify_rsl(&rsl)? {
+        return Err(CaError::Verification(format!(
+            "the revocation list published for CA {} does not verify under that CA's key: it \
+             was edited after publication, signed by someone else, or is not that CA's list at \
+             all",
+            anchor.ca_id_hex()
+        )));
+    }
+
+    if rsl.is_expired() {
+        return Err(CaError::RslExpired(rsl.expires_at));
+    }
+
+    Ok(InMemoryRslChecker::from_rsl(rsl, max_staleness))
 }
 
 /// Trait for managing Revocation Status Lists.
@@ -57,14 +118,16 @@ pub trait RslManager: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `ca_id` - The CA identifier that will issue the RSL
+    /// * `ca_id` - The CA identifier that will issue the RSL, as
+    ///   `SHA-256(its public key)` — raw bytes, the same value
+    ///   [`crate::TrustAnchor::ca_id`] returns
     /// * `validity_days` - How long the RSL should be valid
     ///
     /// # Returns
     ///
     /// * `Ok(RevocationStatusList)` - The generated (unsigned) RSL
     /// * `Err(CaError)` - If generation failed
-    async fn generate_rsl(&self, ca_id: &str, validity_days: u64) -> Result<RevocationStatusList>;
+    async fn generate_rsl(&self, ca_id: &[u8], validity_days: u64) -> Result<RevocationStatusList>;
 
     /// Store an RSL after it has been signed.
     ///
@@ -101,7 +164,7 @@ pub trait RslManager: Send + Sync {
     /// * `Ok(Some(RevocationStatusList))` - The latest RSL
     /// * `Ok(None)` - No RSL found
     /// * `Err(CaError)` - If lookup failed
-    async fn get_latest_rsl(&self, ca_id: &str) -> Result<Option<RevocationStatusList>>;
+    async fn get_latest_rsl(&self, ca_id: &[u8]) -> Result<Option<RevocationStatusList>>;
 
     /// Get the sequence number for the next RSL.
     ///
@@ -113,7 +176,7 @@ pub trait RslManager: Send + Sync {
     ///
     /// * `Ok(u64)` - The next sequence number
     /// * `Err(CaError)` - If lookup failed
-    async fn next_sequence_number(&self, ca_id: &str) -> Result<u64>;
+    async fn next_sequence_number(&self, ca_id: &[u8]) -> Result<u64>;
 
     /// Record a node revocation.
     ///
@@ -147,28 +210,6 @@ pub trait RslManager: Send + Sync {
     /// - `Ok(RevocationStatus::Unknown)` - Cannot determine status
     /// - `Err(CaError)` - If check failed
     async fn is_revoked(&self, node_id: &[u8]) -> Result<RevocationStatus>;
-
-    /// Get a revocation checker that can be used for fast in-memory checks.
-    ///
-    /// This loads the latest published RSL into memory for efficient lookup.
-    /// A CA that has never published one yields a checker that answers
-    /// [`RevocationStatus::Unknown`] for every node: no list means no
-    /// evidence, not a clean bill of health.
-    ///
-    /// # Arguments
-    ///
-    /// * `ca_id` - The CA identifier
-    /// * `max_staleness` - Maximum acceptable age of the cache
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(InMemoryRslChecker)` - The in-memory checker
-    /// * `Err(CaError)` - If loading failed
-    async fn get_checker(
-        &self,
-        ca_id: &str,
-        max_staleness: chrono::Duration,
-    ) -> Result<InMemoryRslChecker>;
 }
 
 /// Database-backed RSL manager.
@@ -181,15 +222,15 @@ pub struct DatabaseRslManager {
     pool: sqlx::PgPool,
 }
 
-/// Recorded on a revocation that has been stored but not yet published in a
-/// signed list, and replaced with the real CA identifier when
-/// [`store_rsl`] attributes it. It is deliberately not a CA identifier of its
-/// own: `MAX(sequence_number)` reads only published rows, so a pending
-/// revocation cannot influence the counter.
+/// NULL in `node_revocations.revoked_by`, for a revocation recorded but not yet
+/// published in a signed list: there is no CA identifier to write yet, and
+/// [`store_rsl`] attributes the row when a list carrying it is published. A
+/// placeholder id of our own inventing would be a value in a column typed to hold
+/// a real one, that every later reader has to know to exclude.
 ///
 /// [`store_rsl`]: RslManager::store_rsl
 #[cfg(feature = "database")]
-const UNPUBLISHED_ISSUER: &str = "pending";
+const UNPUBLISHED_ISSUER: Option<&[u8]> = None;
 
 /// One row of `node_revocations`, as the read below needs it.
 ///
@@ -254,7 +295,7 @@ impl DatabaseRslManager {
     /// revocation ledger records one number per *node*, so it cannot express
     /// "list 4 was published" on its own — and a CA with nothing to revoke
     /// would have no rows to read and could never move past its first list.
-    async fn latest_published_sequence(&self, ca_id: &str) -> Result<u64> {
+    async fn latest_published_sequence(&self, ca_id: &[u8]) -> Result<u64> {
         let seq: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence_number), 0) FROM revocation_status_lists WHERE issuer_id = $1",
         )
@@ -270,7 +311,7 @@ impl DatabaseRslManager {
 #[cfg(feature = "database")]
 #[async_trait]
 impl RslManager for DatabaseRslManager {
-    async fn generate_rsl(&self, ca_id: &str, validity_days: u64) -> Result<RevocationStatusList> {
+    async fn generate_rsl(&self, ca_id: &[u8], validity_days: u64) -> Result<RevocationStatusList> {
         let revoked_nodes = self.get_all_revoked().await?;
         let sequence_number = self.latest_published_sequence(ca_id).await? + 1;
 
@@ -294,7 +335,7 @@ impl RslManager for DatabaseRslManager {
         let published = self.latest_published_sequence(&rsl.issuer_id).await?;
         if rsl.sequence_number <= published {
             return Err(CaError::RslNotNewer {
-                issuer_id: rsl.issuer_id.clone(),
+                issuer_id: hex::encode(&rsl.issuer_id),
                 incoming: rsl.sequence_number,
                 current: published,
             });
@@ -382,7 +423,7 @@ impl RslManager for DatabaseRslManager {
         Ok(())
     }
 
-    async fn get_latest_rsl(&self, ca_id: &str) -> Result<Option<RevocationStatusList>> {
+    async fn get_latest_rsl(&self, ca_id: &[u8]) -> Result<Option<RevocationStatusList>> {
         let stored = sqlx::query_scalar::<_, sqlx::types::Json<RevocationStatusList>>(
             r#"
             SELECT rsl
@@ -400,7 +441,7 @@ impl RslManager for DatabaseRslManager {
         Ok(stored.map(|stored| stored.0))
     }
 
-    async fn next_sequence_number(&self, ca_id: &str) -> Result<u64> {
+    async fn next_sequence_number(&self, ca_id: &[u8]) -> Result<u64> {
         Ok(self.latest_published_sequence(ca_id).await? + 1)
     }
 
@@ -478,17 +519,6 @@ impl RslManager for DatabaseRslManager {
             RevocationStatus::Valid
         })
     }
-
-    async fn get_checker(
-        &self,
-        ca_id: &str,
-        max_staleness: chrono::Duration,
-    ) -> Result<InMemoryRslChecker> {
-        Ok(match self.get_latest_rsl(ca_id).await? {
-            Some(rsl) => InMemoryRslChecker::from_rsl(rsl, max_staleness),
-            None => InMemoryRslChecker::new(max_staleness),
-        })
-    }
 }
 
 /// In-memory RSL manager (for testing and single-node deployments).
@@ -508,7 +538,7 @@ pub struct InMemoryRslManager {
     /// `revocation_status_lists`. Holding a separate counter would be a second
     /// answer to the same question, and the two disagreeing is exactly how a
     /// replayed list gets through.
-    published: std::sync::RwLock<std::collections::HashMap<String, RevocationStatusList>>,
+    published: std::sync::RwLock<std::collections::HashMap<Vec<u8>, RevocationStatusList>>,
 }
 
 impl InMemoryRslManager {
@@ -521,7 +551,7 @@ impl InMemoryRslManager {
     }
 
     /// Highest sequence number published for `ca_id`, 0 if none.
-    fn highest_published(&self, ca_id: &str) -> u64 {
+    fn highest_published(&self, ca_id: &[u8]) -> u64 {
         self.published
             .read()
             .unwrap()
@@ -539,7 +569,7 @@ impl Default for InMemoryRslManager {
 
 #[async_trait]
 impl RslManager for InMemoryRslManager {
-    async fn generate_rsl(&self, ca_id: &str, validity_days: u64) -> Result<RevocationStatusList> {
+    async fn generate_rsl(&self, ca_id: &[u8], validity_days: u64) -> Result<RevocationStatusList> {
         let revoked_nodes: Vec<RevokedNode> = {
             let guard = self.revoked.read().unwrap();
             guard.values().cloned().collect()
@@ -568,7 +598,7 @@ impl RslManager for InMemoryRslManager {
         let current = self.highest_published(&rsl.issuer_id);
         if rsl.sequence_number <= current {
             return Err(CaError::RslNotNewer {
-                issuer_id: rsl.issuer_id.clone(),
+                issuer_id: hex::encode(&rsl.issuer_id),
                 incoming: rsl.sequence_number,
                 current,
             });
@@ -589,11 +619,11 @@ impl RslManager for InMemoryRslManager {
         Ok(())
     }
 
-    async fn get_latest_rsl(&self, ca_id: &str) -> Result<Option<RevocationStatusList>> {
+    async fn get_latest_rsl(&self, ca_id: &[u8]) -> Result<Option<RevocationStatusList>> {
         Ok(self.published.read().unwrap().get(ca_id).cloned())
     }
 
-    async fn next_sequence_number(&self, ca_id: &str) -> Result<u64> {
+    async fn next_sequence_number(&self, ca_id: &[u8]) -> Result<u64> {
         Ok(self.highest_published(ca_id) + 1)
     }
 
@@ -628,17 +658,6 @@ impl RslManager for InMemoryRslManager {
             RevocationStatus::Revoked
         } else {
             RevocationStatus::Valid
-        })
-    }
-
-    async fn get_checker(
-        &self,
-        ca_id: &str,
-        max_staleness: chrono::Duration,
-    ) -> Result<InMemoryRslChecker> {
-        Ok(match self.get_latest_rsl(ca_id).await? {
-            Some(rsl) => InMemoryRslChecker::from_rsl(rsl, max_staleness),
-            None => InMemoryRslChecker::new(max_staleness),
         })
     }
 }
@@ -676,7 +695,7 @@ mod tests {
         assert_eq!(status, RevocationStatus::Revoked);
 
         // Generate RSL
-        let rsl = manager.generate_rsl("test-ca", 1).await.unwrap();
+        let rsl = manager.generate_rsl(b"test-ca", 1).await.unwrap();
         assert_eq!(rsl.revocation_count(), 1);
         assert!(rsl.is_node_revoked(&node_id));
     }
@@ -698,7 +717,7 @@ mod tests {
         }
 
         // Generate RSL
-        let rsl = manager.generate_rsl("test-ca", 1).await.unwrap();
+        let rsl = manager.generate_rsl(b"test-ca", 1).await.unwrap();
         assert_eq!(rsl.revocation_count(), 5);
 
         // Check each node
@@ -772,30 +791,30 @@ mod tests {
     async fn an_unsigned_list_cannot_be_stored() {
         let manager = InMemoryRslManager::new();
 
-        let unsigned = manager.generate_rsl("test-ca", 1).await.unwrap();
+        let unsigned = manager.generate_rsl(b"test-ca", 1).await.unwrap();
         let err = manager.store_rsl(&unsigned).await.unwrap_err();
 
         assert!(
-            matches!(err, CaError::UnsignedRsl(issuer) if issuer == "test-ca"),
+            matches!(err, CaError::UnsignedRsl(issuer) if issuer == hex::encode(b"test-ca")),
             "an unsigned list must not become the record of revocations"
         );
     }
 
     #[tokio::test]
-    async fn checker_is_unknown_until_a_list_is_published() {
+    async fn a_checker_needs_a_list_that_verifies() {
         let ca = crate::CaRoot::generate();
         let manager = InMemoryRslManager::new();
+        let anchor = crate::TrustAnchor::from_public_key(ca.public_key_slice()).unwrap();
         let ca_id = ca.ca_id();
 
-        // Nothing published yet: the checker must not claim anyone is valid.
-        let empty = manager
-            .get_checker(&ca_id, chrono::Duration::hours(24))
+        // Nothing published yet. This is an error rather than a checker that
+        // answers `Unknown`, because handing out an empty checker lets a caller
+        // mistake "no data" for data — and the CA being down then reads as an
+        // all-clear.
+        let err = verified_checker(&manager, &anchor, chrono::Duration::hours(24))
             .await
-            .unwrap();
-        assert_eq!(
-            empty.is_revoked(&[1u8; 32]).unwrap(),
-            RevocationStatus::Unknown
-        );
+            .expect_err("there is no list to load yet");
+        assert!(matches!(err, CaError::RslNotFound(_)), "{err}");
 
         let node_id = vec![7u8; 32];
         manager
@@ -805,10 +824,9 @@ mod tests {
         let published = publish(&ca, manager.generate_rsl(&ca_id, 7).await.unwrap());
         manager.store_rsl(&published).await.unwrap();
 
-        let checker = manager
-            .get_checker(&ca_id, chrono::Duration::hours(24))
+        let checker = verified_checker(&manager, &anchor, chrono::Duration::hours(24))
             .await
-            .unwrap();
+            .expect("a list this CA signed verifies under its own anchor");
         assert_eq!(
             checker.is_revoked(&node_id).unwrap(),
             RevocationStatus::Revoked
@@ -818,6 +836,19 @@ mod tests {
         assert_eq!(
             checker.is_revoked(&[9u8; 32]).unwrap(),
             RevocationStatus::Valid
+        );
+
+        // The same manager read under a different CA's anchor finds nothing to
+        // load: the issuer comes from the key, so one CA's list is never offered
+        // as another's answer.
+        let other = crate::CaRoot::generate();
+        let other_anchor = crate::TrustAnchor::from_public_key(other.public_key_slice()).unwrap();
+        let err = verified_checker(&manager, &other_anchor, chrono::Duration::hours(24))
+            .await
+            .expect_err("this anchor speaks for a CA that has published nothing");
+        assert!(
+            matches!(err, CaError::RslNotFound(ref id) if *id == other.ca_id_hex()),
+            "{err}"
         );
     }
 }

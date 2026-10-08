@@ -7,13 +7,25 @@ license = "MIT"
 
 [dependencies]
 # Cryptographic signing
-ed25519-dalek = { version = "2.0", features = ["rand_core"] }
+# `pkcs8` + `pem`: CA root keys are stored as PKCS#8 PEM and published trust anchors
+# as SPKI PEM, so both are ordinary standard-format files rather than something only
+# this repo can read — and no key material has to live in source.
+ed25519-dalek = { version = "2.0", features = ["rand_core", "pkcs8", "pem"] }
+# The envelope itself. `LineEnding` and the PEM label handling live on the `pkcs8`
+# crate, not on the narrow re-export `ed25519-dalek` carries.
+pkcs8 = { version = "0.10", features = ["pem"] }
+# PEM reading (PKCS#8 private keys, SPKI public keys), pure Rust, no C dependency.
+rustls-pemfile = "2.2.0"
 sha2 = "0.10"
 rand = "0.8"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
+# Hex survives only where a human reads an identifier (error text, CLI output).
+# Keys, signatures and ids are raw bytes everywhere else, and inside a JSON
+# document they travel as base64 — which is what `base64` is here for.
 hex = "0.4"
+base64 = "0.22"
 
 # Timestamps
 chrono = { version = "0.4", features = ["serde"] }
@@ -53,3 +65,4 @@ tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
 # because sqlx reads whole files and does not know what `--migrate:` means.
 # See db/src/forward.rs.
 db = { path = "../db" }
+serde_json = "1.0.151"

@@ -77,7 +77,8 @@ impl RevocationReason {
 /// Individual revocation entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevokedNode {
-    /// The node's identifier (SHA-256 of signing public key).
+    /// The node's identifier (SHA-256 of signing public key), raw bytes.
+    #[serde(with = "crate::jsonbytes::base64_bytes")]
     pub node_id: Vec<u8>,
 
     /// When the node was revoked.
@@ -87,6 +88,7 @@ pub struct RevokedNode {
     pub reason: RevocationReason,
 
     /// The node's signing public key (for verification).
+    #[serde(with = "crate::jsonbytes::base64_bytes")]
     pub signing_public_key: Vec<u8>,
 
     /// Optional notes about the revocation (for auditing).
@@ -138,8 +140,15 @@ impl RevokedNode {
 /// published" has to mean.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RevocationStatusList {
-    /// CA identifier that issued this RSL.
-    pub issuer_id: String,
+    /// CA identifier that issued this RSL: `SHA-256(CA public key)`, raw bytes.
+    ///
+    /// Not hex, and not trusted: whatever verifies this list derives the same
+    /// bytes from the key it was given and compares
+    /// ([`crate::signing::verify_rsl_signature`]), so a list naming some other CA
+    /// fails rather than being checked against whichever key a lookup happened to
+    /// return.
+    #[serde(with = "crate::jsonbytes::base64_bytes")]
+    pub issuer_id: Vec<u8>,
 
     /// When this RSL was signed.
     pub issued_at: DateTime<Utc>,
@@ -154,12 +163,13 @@ pub struct RevocationStatusList {
     pub revocations: Vec<RevokedNode>,
 
     /// CA signature over the entire structure.
+    #[serde(with = "crate::jsonbytes::base64_bytes")]
     pub signature: Vec<u8>,
 }
 
 impl RevocationStatusList {
     /// Create a new RSL builder.
-    pub fn builder(issuer_id: impl Into<String>) -> RslBuilder {
+    pub fn builder(issuer_id: impl Into<Vec<u8>>) -> RslBuilder {
         RslBuilder::new(issuer_id)
     }
 
@@ -197,7 +207,7 @@ impl RevocationStatusList {
 
 /// Builder for creating RevocationStatusList instances.
 pub struct RslBuilder {
-    issuer_id: String,
+    issuer_id: Vec<u8>,
     sequence_number: u64,
     revocations: Vec<RevokedNode>,
     validity_days: u64,
@@ -205,7 +215,7 @@ pub struct RslBuilder {
 
 impl RslBuilder {
     /// Create a new RSL builder.
-    pub fn new(issuer_id: impl Into<String>) -> Self {
+    pub fn new(issuer_id: impl Into<Vec<u8>>) -> Self {
         Self {
             issuer_id: issuer_id.into(),
             sequence_number: 0,
@@ -530,7 +540,7 @@ impl InMemoryRslChecker {
         if let Some(current) = &self.current_rsl {
             if rsl.sequence_number <= current.sequence_number {
                 return Err(CaError::RslNotNewer {
-                    issuer_id: rsl.issuer_id,
+                    issuer_id: hex::encode(&rsl.issuer_id),
                     incoming: rsl.sequence_number,
                     current: current.sequence_number,
                 });
@@ -539,7 +549,8 @@ impl InMemoryRslChecker {
             if rsl.issuer_id != current.issuer_id {
                 return Err(CaError::InvalidCredential(format!(
                     "checker holds a list from {} and cannot adopt one from {}",
-                    current.issuer_id, rsl.issuer_id
+                    hex::encode(&current.issuer_id),
+                    hex::encode(&rsl.issuer_id)
                 )));
             }
         }
@@ -635,13 +646,13 @@ mod tests {
             vec![2u8; 32],
         );
 
-        let rsl = RevocationStatusList::builder("test-ca")
+        let rsl = RevocationStatusList::builder(b"test-ca".to_vec())
             .sequence_number(1)
             .add_revocation(revoked_node)
             .validity_days(7)
             .build_unsigned();
 
-        assert_eq!(rsl.issuer_id, "test-ca");
+        assert_eq!(rsl.issuer_id, b"test-ca".to_vec());
         assert_eq!(rsl.sequence_number, 1);
         assert_eq!(rsl.revocation_count(), 1);
         assert!(rsl.is_valid_now());
@@ -659,7 +670,7 @@ mod tests {
             vec![3u8; 32],
         );
 
-        let rsl = RevocationStatusList::builder("test-ca")
+        let rsl = RevocationStatusList::builder(b"test-ca".to_vec())
             .add_revocation(revoked_node)
             .build_unsigned();
 
@@ -724,7 +735,7 @@ mod tests {
             vec![2u8; 32],
         );
 
-        let rsl = RevocationStatusList::builder("test-ca")
+        let rsl = RevocationStatusList::builder(b"test-ca".to_vec())
             .sequence_number(1)
             .add_revocation(revoked_node)
             .build_unsigned();

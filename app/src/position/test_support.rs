@@ -9,12 +9,19 @@ use crate::node::Clock;
 /// Clock the tests move by hand, so caching and staleness need no sleeping.
 pub struct ManualClock {
     now_ms: AtomicI64,
+    /// Where `new` started, so the monotonic reading can advance by the same
+    /// amount the wall reading does.
+    start_ms: i64,
+    base: std::time::Instant,
 }
 
 impl ManualClock {
     pub fn new(now: DateTime<Utc>) -> Self {
+        let now_ms = now.timestamp_millis();
         Self {
-            now_ms: AtomicI64::new(now.timestamp_millis()),
+            now_ms: AtomicI64::new(now_ms),
+            start_ms: now_ms,
+            base: std::time::Instant::now(),
         }
     }
 
@@ -27,6 +34,22 @@ impl Clock for ManualClock {
     fn now(&self) -> DateTime<Utc> {
         Utc.timestamp_millis_opt(self.now_ms.load(Ordering::SeqCst))
             .unwrap()
+    }
+
+    /// Advances with [`ManualClock::advance_ms`], so a test that moves time once
+    /// moves both readings together.
+    ///
+    /// Sampling windows are intervals and are deliberately not measured on the wall
+    /// clock, which is why the trait separates the two. A test clock that left
+    /// `monotonic` at its default would move the node's timestamps while its windows
+    /// stood still, and no amount of advancing would ever make a device due.
+    fn monotonic(&self) -> std::time::Instant {
+        let elapsed_ms = self
+            .now_ms
+            .load(Ordering::SeqCst)
+            .saturating_sub(self.start_ms)
+            .max(0);
+        self.base + std::time::Duration::from_millis(elapsed_ms as u64)
     }
 }
 

@@ -95,7 +95,7 @@ async fn test_revocation_workflow_full() {
 #[tokio::test]
 async fn test_revocation_workflow_multiple_nodes() {
     let rsl_manager = InMemoryRslManager::new();
-    let ca_id = "test-multiple-nodes";
+    let ca_id = b"test-multiple-nodes".to_vec();
 
     // Create multiple nodes
     let mut nodes = vec![];
@@ -192,7 +192,7 @@ async fn test_connection_policy_stricter_than_data_policy() {
     // The same node against a current list from the CA is genuinely Valid, and
     // both policies then accept it.
     let rsl_manager = InMemoryRslManager::new();
-    let ca_id = "test-policy";
+    let ca_id = b"test-policy".to_vec();
     let clean_rsl = rsl_manager.generate_rsl(&ca_id, 1).await.unwrap();
     let clean_checker = InMemoryRslChecker::from_rsl(clean_rsl, chrono::Duration::hours(24));
 
@@ -216,7 +216,7 @@ async fn test_connection_policy_stricter_than_data_policy() {
     let revoked_node_id = vec![99u8; 32];
     let revoked_signing_key = vec![100u8; 32];
     let rsl_manager = InMemoryRslManager::new();
-    let ca_id = "test-policy";
+    let ca_id = b"test-policy".to_vec();
 
     rsl_manager
         .revoke_node(
@@ -276,7 +276,7 @@ async fn test_rsl_sequence_number_increment() {
 #[tokio::test]
 async fn test_revocation_reason_codes() {
     let rsl_manager = InMemoryRslManager::new();
-    let ca_id = "test-reasons";
+    let ca_id = b"test-reasons".to_vec();
 
     // Revoke nodes with different reasons
     let reasons = vec![
@@ -367,7 +367,7 @@ async fn test_ca_signs_and_verifies_rsl() {
 
     // Verify tampered RSL fails
     let mut tampered_rsl = signed_rsl.clone();
-    tampered_rsl.issuer_id = "tampered".to_string();
+    tampered_rsl.issuer_id = b"tampered".to_vec();
     assert!(
         ca_root.verify_rsl(&tampered_rsl).is_err() || !ca_root.verify_rsl(&tampered_rsl).unwrap()
     );
@@ -383,7 +383,7 @@ async fn test_in_memory_checker_cache_age() {
     // Create RSL and load it
     let node_id = vec![1u8; 32];
     let rsl_manager = InMemoryRslManager::new();
-    let ca_id = "test-cache";
+    let ca_id = b"test-cache".to_vec();
 
     rsl_manager
         .revoke_node(&node_id, 1, &vec![2u8; 32], &vec![0u8; 100], None)

@@ -29,7 +29,10 @@
 
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::node::{Clock, SystemClock};
 
 /// Configuration for the rate limiter.
 #[derive(Debug, Clone)]
@@ -72,6 +75,12 @@ impl RateLimiterConfig {
 /// The rate limiter tracks when each device was last seen and prevents
 /// storage if the device has been observed within the threshold period.
 ///
+/// The threshold is an *interval*, so it is measured with
+/// [`Clock::monotonic`] rather than with the wall clock: an NTP correction or a
+/// suspended VM moves wall time by minutes in either direction, and a window
+/// measured against it would either freeze a node's writes or let it write twice
+/// for one device.
+///
 /// # Thread Safety
 ///
 /// This struct is thread-safe and can be shared across threads using `Arc`.
@@ -85,7 +94,6 @@ impl RateLimiterConfig {
 ///
 /// For 100,000 devices: ~10 MB
 /// For 1,000,000 devices: ~100 MB
-#[derive(Debug)]
 pub struct RateLimiter {
     /// device_hash → last_seen timestamp
     cache: DashMap<Vec<u8>, Instant>,
@@ -96,11 +104,28 @@ pub struct RateLimiter {
     /// Optional max cache size
     max_cache_size: Option<usize>,
 
+    /// Where the window's "now" comes from. [`SystemClock`] in a running node;
+    /// a test passes a clock it can move, so a window is advanced rather than
+    /// slept through.
+    clock: Arc<dyn Clock>,
+
     /// Statistics: number of events allowed
     allow_count: AtomicUsize,
 
     /// Statistics: number of events rate-limited
     deny_count: AtomicUsize,
+}
+
+impl std::fmt::Debug for RateLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RateLimiter")
+            .field("cache_size", &self.cache.len())
+            .field("threshold", &self.threshold)
+            .field("max_cache_size", &self.max_cache_size)
+            .field("allow_count", &self.allow_count.load(Ordering::SeqCst))
+            .field("deny_count", &self.deny_count.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
+    }
 }
 
 impl RateLimiter {
@@ -127,13 +152,34 @@ impl RateLimiter {
     /// let limiter = RateLimiter::with_config(config);
     /// ```
     pub fn with_config(config: RateLimiterConfig) -> Self {
+        Self::with_clock(config, Arc::new(SystemClock))
+    }
+
+    /// Create a rate limiter that measures its window with `clock`.
+    ///
+    /// The node passes its own clock so the window it stores occurrences on is
+    /// the same reading every other timing decision uses, and so a test can move
+    /// time instead of sleeping through a 15-second threshold.
+    pub fn with_clock(config: RateLimiterConfig, clock: Arc<dyn Clock>) -> Self {
         Self {
             cache: DashMap::new(),
             threshold: config.threshold,
             max_cache_size: config.max_cache_size,
+            clock,
             allow_count: AtomicUsize::new(0),
             deny_count: AtomicUsize::new(0),
         }
+    }
+
+    /// The window's "now": monotonic, so a wall-clock jump cannot open or close a
+    /// threshold.
+    ///
+    /// Crate-visible rather than private because
+    /// [`ObservationPolicy`](crate::node::observation::ObservationPolicy) ages
+    /// presence on the same reading — two notions of "now" inside one node would
+    /// put the window and the presence trust on different clocks.
+    pub(crate) fn now(&self) -> Instant {
+        self.clock.monotonic()
     }
 
     /// Check if an event should be rate-limited (DROPPED).
@@ -163,7 +209,7 @@ impl RateLimiter {
     pub fn is_rate_limited(&self, device_hash: &[u8]) -> bool {
         match self.cache.get(device_hash) {
             Some(last_seen) => {
-                let elapsed = Instant::now().duration_since(*last_seen);
+                let elapsed = self.now().duration_since(*last_seen);
                 elapsed < self.threshold
             }
             None => false, // First time seeing this device - allow
@@ -201,7 +247,22 @@ impl RateLimiter {
             }
         }
 
-        self.cache.insert(device_hash.to_vec(), Instant::now());
+        self.cache.insert(device_hash.to_vec(), self.now());
+    }
+
+    /// Forget a device, so the next observation of it starts a fresh window.
+    ///
+    /// The threshold measures the interval between observations of a device that
+    /// is *there*. Once a device is reported gone, the interval that matters is
+    /// the one that has just elapsed, not the one the cache is holding: a device
+    /// that leaves and returns two seconds later is a second co-presence, and a
+    /// node still inside the old window would record nothing for it.
+    ///
+    /// This is deliberately not called on a device that merely stopped being
+    /// reported — only on one reported absent. Without a removal to act on, the
+    /// cache ages out on its own, which is what the threshold is for.
+    pub fn forget(&self, device_hash: &[u8]) -> bool {
+        self.cache.remove(device_hash).is_some()
     }
 
     /// Combined check-and-record (atomic from caller's perspective).
@@ -253,12 +314,12 @@ impl RateLimiter {
     pub fn time_since_last(&self, device_hash: &[u8]) -> Option<Duration> {
         self.cache
             .get(device_hash)
-            .map(|last_seen| Instant::now().duration_since(*last_seen))
+            .map(|last_seen| self.now().duration_since(*last_seen))
     }
 
     /// Find the oldest entry in the cache (for eviction).
     fn find_oldest_entry(&self) -> Option<Vec<u8>> {
-        let mut oldest_time = Instant::now();
+        let mut oldest_time = self.now();
         let mut oldest_key: Option<Vec<u8>> = None;
 
         for entry in self.cache.iter() {

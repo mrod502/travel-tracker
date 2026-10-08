@@ -14,7 +14,9 @@
 //! - [`full::FullNode`] - The Phase 0 full node implementation
 //! - [`device_id`] - Device identifier normalization across backends
 //! - [`identity::NodeIdentity`] - Node key management
+//! - [`observation`] - When to record an occurrence for a device in range
 //! - [`rate_limiter::RateLimiter`] - Rate limiting for occurrence storage
+//! - [`revocation::RevocationWatch`] - The CA's revocation list, kept current and asked
 //!
 //! # Example
 //!
@@ -30,12 +32,13 @@
 pub mod device_id;
 pub mod full;
 pub mod identity;
+pub mod observation;
 pub mod rate_limiter;
+pub mod revocation;
 
 // Re-export commonly used types
 pub use device_id::{derive_device_identity, DeviceIdentity};
-pub use full::FullNode;
-pub use identity::NodeIdentity;
+pub use observation::{AdvertisementContent, Decision, ObservationPolicy, ObservationStats};
 pub use rate_limiter::{RateLimiter, RateLimiterConfig, RateLimiterStats};
 
 /// Core Node trait defining identity and signing capabilities.
@@ -105,6 +108,19 @@ pub trait Clock: Send + Sync {
     /// with no separate local notion has to fill both from a single reading.
     fn now_pair(&self) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
         (self.now(), self.now_local())
+    }
+
+    /// A reading for measuring *intervals*, not for stamping rows.
+    ///
+    /// Sampling windows are intervals, and a wall clock is not a quantity you can
+    /// subtract reliably: an NTP correction, a manual change, or a VM resuming
+    /// moves it by minutes in either direction. Measured against `now()`, a jump
+    /// backwards would freeze a node's sampling and a jump forwards would let it
+    /// write twice for one device. `monotonic` cannot be stored in a row and is
+    /// not comparable across processes, which is exactly why it is kept apart
+    /// from the two timestamps that have to be both.
+    fn monotonic(&self) -> std::time::Instant {
+        std::time::Instant::now()
     }
 }
 

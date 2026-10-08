@@ -87,7 +87,7 @@
 //!
 //! Defaults for the `ca` subcommands, each of which still takes its own flag:
 //!
-//! - `[ca].key_path` / `CA_ROOT_KEY_PATH`: default: /var/lib/btmon/ca/root_key.hex
+//! - `[ca].key_path` / `CA_ROOT_KEY_PATH`: default: /var/lib/btmon/ca/root_key.pem
 //! - `[ca].validity_days` / `CA_VALIDITY_DAYS`: default: 90
 //! - `[ca].node_type` / `CA_NODE_TYPE` / default: full
 //!

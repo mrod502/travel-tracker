@@ -47,10 +47,5 @@ pub mod encode;
 pub mod payload;
 pub mod sign;
 pub mod verify;
-pub mod verify_with_revocation;
 
 // Re-export for convenience
-pub use verify_with_revocation::{
-    should_allow_connection, should_record_data, verify_occurrence_with_revocation,
-    verify_signature_only, RevResult, RevocationVerificationError, VerificationContext,
-};

@@ -5,19 +5,27 @@
 //! 2. Signs occurrences with node identity
 //! 3. Rate-limits storage to avoid duplicates
 //! 4. Stores signed occurrences in the database
-//! 5. Checks revocation status for received occurrences (P2P mode)
 //!
-//! # Revocation Checking
+//! # Revocation checking
 //!
-//! The FullNode supports revocation checking for verifying occurrences from other nodes:
+//! With `[revocation].enabled = true` the node loads its CA's list at startup,
+//! refreshes it in the background, and asks it before recording an occurrence —
+//! [`crate::node::revocation::RevocationWatch`] for what a list can and cannot say,
+//! and `FullNode::authorize_store` for the gate. Enabled but unusable — no anchor,
+//! no published list, a list that does not verify under the anchor, one whose window
+//! has closed, one older than `[revocation].max_staleness_secs` — is a startup error
+//! rather than a degraded node.
 //!
-//! 1. **Data Recording** (lenient policy): Accept occurrences from unknown nodes with warning
-//!    - Use `verify_received_occurrence()` when storing occurrences received via P2P
+//! With it off, occurrences are stored without asking anyone, which is what the
+//! setting means. It is off by default because it requires a CA that publishes
+//! lists, and a node configured to consult one that does not exist is a node that
+//! does not run.
 //!
-//! 2. **Peer Connections** (strict policy): Reject connections from unknown/revoked nodes
-//!    - Use `should_allow_peer_connection()` during P2P handshake
-//!
-//! To enable revocation checking, set `enable_revocation_checking: true` in `FullNodeConfig`.
+//! [`FullNode::verify_received_occurrence`] and
+//! [`FullNode::should_allow_peer_connection`] exist and still have no caller —
+//! there is no transport to receive either an occurrence or a handshake. They are
+//! written against the watch rather than against a checker that holds nothing, so
+//! the day a transport lands the revocation path is already there.
 //!
 //! # Architecture
 //!
@@ -62,28 +70,30 @@
 //! node.run().await?;
 //! ```
 
-use bt_mon::monitor::events::UpdateField;
-use bt_mon::{BluetoothDevice, DeviceEvent, DeviceMonitor};
+use bt_mon::{BluetoothDevice, DeviceEvent, DeviceId, DeviceMonitor};
 use chrono::{DateTime, Utc};
 use futures_util::stream::StreamExt;
 use log::{debug, error, info, warn};
 use repo::models::LocationSource;
 use repo::{NodeRepository, Occurrence, OccurrenceRepository, Pool, SignalType};
+use sha2::Digest;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::config::RevocationConfig;
 use crate::error::{AppError, Result};
 use crate::node::identity::NodeIdentity;
+use crate::node::revocation::RevocationWatch;
 use crate::node::{
-    derive_device_identity, Clock, DeviceIdentity, Node, RateLimiter, RateLimiterConfig,
-    RateLimiterStats, SystemClock,
+    derive_device_identity, AdvertisementContent, Clock, Decision, DeviceIdentity, Node,
+    ObservationPolicy, ObservationStats, RateLimiterStats, SystemClock,
 };
 use crate::position::{BestEffortPositionSource, NoPositionSource, Position, PositionSource};
 use crate::provenance::encode::encode_payload;
 use crate::provenance::payload::{truncate_to_micros, PayloadV2, CURRENT_VERSION};
-use ca::{InMemoryRslChecker, RevocationChecker};
 
 /// CoreBluetooth (and any other backend that hides the MAC address) yields
 /// host-local identifiers, which changes what `device_hash` means. Worth saying
@@ -94,6 +104,27 @@ static NON_MAC_IDENTIFIER_WARNED: Once = Once::new();
 /// them has to say so out loud, once, instead of storing a payload that quietly
 /// lacks the key the operator turned on.
 static RAW_PAYLOAD_ABSENT_WARNED: Once = Once::new();
+
+/// How many sampling windows a device is trusted to stay present for, when
+/// nothing was configured.
+///
+/// The trust has to be measured in windows because re-observation is what it
+/// exists for: a device is only sampled again while present, and the sample is
+/// due after one window. Anything under that and a node never re-observes at all.
+/// Four lets a backend miss three reports in a row — a scan that pauses, an
+/// adapter that resets, a beacon whose interval does not line up with ours —
+/// before the node concludes the device has gone, and it keeps the lie short:
+/// a device that left range without anyone noticing is sampled for at most four
+/// windows more, from a reading no older than the last report.
+const PRESENCE_TIMEOUT_WINDOWS: u32 = 4;
+
+/// Floor on the re-observation tick, so a node sampling on a short window does
+/// not spend its main loop asking itself who is due.
+const MIN_SAMPLING_TICK: Duration = Duration::from_millis(250);
+
+/// Ceiling on it, so a node sampling on a long window still re-observes near the
+/// window boundary rather than a quarter of a window after it.
+const MAX_SAMPLING_TICK: Duration = Duration::from_secs(5);
 
 /// Configuration for FullNode.
 #[derive(Clone)]
@@ -144,13 +175,43 @@ pub struct FullNodeConfig {
     /// says.
     pub expected_node_id: Option<Vec<u8>>,
 
+    /// How long a device is trusted to still be in range after the last report
+    /// for it, and so how long the node keeps re-observing it.
+    ///
+    /// `None` derives it as [`PRESENCE_TIMEOUT_WINDOWS`] sampling windows, which is
+    /// what the value has to be measured in: re-observation is what this exists
+    /// for, and a sample is only due after a window. Long enough and a device whose
+    /// backend reports sparsely is not declared absent between two reports; short
+    /// enough and one that left range without saying so stops being sampled.
+    ///
+    /// Deliberately not an operator setting. Its sensible value is a multiple of
+    /// the window the operator already chose, and a knob here is a second number
+    /// that can contradict the first — which is what the check in
+    /// [`FullNode::new`] would then exist to catch.
+    ///
+    /// A value below the window makes presence expire before a sample is ever due,
+    /// which turns re-observation off; startup rejects it.
+    pub(crate) presence_timeout_ms: Option<u64>,
+
+    /// Where the node reads time. `None` is the system clock.
+    ///
+    /// Not operator-configurable — it exists so a test can move time instead of
+    /// sleeping through a window, and so the node's timestamps and its sampling
+    /// intervals cannot come from two different places.
+    pub(crate) clock: Option<Arc<dyn Clock>>,
+
     /// Use mock backend for testing/development (no physical Bluetooth required).
     #[cfg(feature = "mock")]
     pub use_mock_backend: bool,
 
-    /// Enable revocation checking (default: false).
-    /// When true, occurrences from revoked nodes will be rejected.
-    pub enable_revocation_checking: bool,
+    /// Revocation checking, from `[revocation]`.
+    ///
+    /// Default-disabled, and when enabled it is a hard requirement:
+    /// [`FullNode::new`] fails if the node cannot load a current, verified list
+    /// from the configured CA, because a node that stores occurrences it cannot
+    /// attest to is worse than one that is visibly not running. See
+    /// [`crate::node::revocation::RevocationWatch`].
+    pub revocation: RevocationConfig,
 }
 
 impl std::fmt::Debug for FullNodeConfig {
@@ -167,6 +228,7 @@ impl std::fmt::Debug for FullNodeConfig {
                 "expected_node_id",
                 &self.expected_node_id.as_deref().map(hex::encode),
             )
+            .field("revocation", &self.revocation)
             .finish()
     }
 }
@@ -183,9 +245,11 @@ impl FullNodeConfig {
             stream_reopen_delay_ms: 1_000, // 1 second default
             store_raw_payload: true,
             expected_node_id: None,
+            presence_timeout_ms: None,
+            clock: None,
             #[cfg(feature = "mock")]
             use_mock_backend: false,
-            enable_revocation_checking: false, // Disabled by default for backwards compatibility
+            revocation: RevocationConfig::default(),
         }
     }
 
@@ -214,15 +278,23 @@ impl FullNodeConfig {
         self
     }
 
-    /// Enable or disable revocation checking.
-    pub fn with_revocation_checking(mut self, enabled: bool) -> Self {
-        self.enable_revocation_checking = enabled;
-        self
-    }
-
     /// Store (or drop) the radio's advertisement bytes in `signal_payload`.
     pub fn with_store_raw_payload(mut self, enabled: bool) -> Self {
         self.store_raw_payload = enabled;
+        self
+    }
+
+    /// Trust a device present for `ms` after the last report for it.
+    ///
+    /// See [`FullNodeConfig::presence_timeout_ms`].
+    pub(crate) fn with_presence_timeout(mut self, ms: u64) -> Self {
+        self.presence_timeout_ms = Some(ms);
+        self
+    }
+
+    /// Read time from `clock` rather than from the system.
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = Some(clock);
         self
     }
 
@@ -297,7 +369,8 @@ pub struct FullNodeStats {
     /// Number of occurrences stored.
     pub occurrences_stored: usize,
 
-    /// Number of occurrences rate-limited.
+    /// Number of reports the sampling policy declined for being inside a device's
+    /// window.
     pub occurrences_rate_limited: usize,
 
     /// Number of storage errors.
@@ -306,7 +379,11 @@ pub struct FullNodeStats {
     /// Number of times the device event stream was (re)opened after closing.
     pub stream_reopens: usize,
 
-    /// Rate limiter statistics.
+    /// What the sampling policy has decided, including how many rows came from
+    /// the re-observation timer rather than from a report.
+    pub sampling: ObservationStats,
+
+    /// The window's own counters.
     pub rate_limiter_stats: RateLimiterStats,
 }
 
@@ -317,7 +394,11 @@ pub struct FullNodeStats {
 /// - Signs all occurrences with its node identity
 /// - Rate-limits storage to avoid duplicates
 /// - Stores signed occurrences in its local database
-/// - Checks revocation status before storing occurrences
+///
+/// It does *not* check revocation status before storing. The node holds a checker,
+/// but no list is ever loaded into it — it answers `Unknown` for every node id —
+/// and no code path consults it on the way to storage. See the module
+/// documentation: that gap is GAP_ANALYSIS B11.
 ///
 /// # Thread Safety
 ///
@@ -330,8 +411,15 @@ pub struct FullNode {
     /// Database connection pool.
     pool: Pool,
 
-    /// Rate limiter for deduplication.
-    rate_limiter: Arc<RateLimiter>,
+    /// When this node records an occurrence for a device it can see.
+    ///
+    /// Holds the rate limiter, and so the window: it is the only thing in the node
+    /// that decides whether a report is worth a row, and a second limiter with its
+    /// own idea of when a window closed is how a device ends up with two rows or
+    /// none. See the [observation module](crate::node::observation) for why both
+    /// bounds are needed and why a re-observation is a fresh reading, not a
+    /// rewrite.
+    sampling: Arc<ObservationPolicy>,
 
     /// Clock for timestamps.
     clock: Arc<dyn Clock>,
@@ -339,8 +427,13 @@ pub struct FullNode {
     /// Where the node is, acquired per occurrence.
     position: BestEffortPositionSource,
 
-    /// Revocation checker for verifying node authenticity.
-    revocation_checker: Arc<InMemoryRslChecker>,
+    /// The CA's revocation list, kept current, when `[revocation].enabled`.
+    ///
+    /// `None` means the operator turned checking off, which every gate reads as "no
+    /// gate", not as a refusal. When it is on, the two gates that consult it answer
+    /// differently for a node the list does not name — see
+    /// [`Self::authorize_store`] and [`Self::should_allow_peer_connection`].
+    revocation: Option<Arc<RevocationWatch>>,
 
     /// Delay before reopening a closed device event stream.
     stream_reopen_delay_ms: u64,
@@ -404,32 +497,62 @@ impl FullNode {
             &config.data_dir,
         )?;
 
-        // Create rate limiter
-        let rate_limiter_config = RateLimiterConfig::with_threshold(Duration::from_millis(
-            config.rate_limit_threshold_ms,
-        ))
-        .with_max_cache_size(config.rate_limit_max_cache_size.unwrap_or(usize::MAX));
-        let rate_limiter = Arc::new(RateLimiter::with_config(rate_limiter_config));
+        // The clock every interval in this node is measured on, and every
+        // timestamp in every row is read from. One object, so the two can never
+        // disagree about what "now" means.
+        let clock: Arc<dyn Clock> = config
+            .clock
+            .clone()
+            .unwrap_or_else(|| Arc::new(SystemClock));
 
-        // Revocation checker with no list loaded. It answers Unknown for every
-        // node until an RSL is loaded into it — which nothing does yet, because
-        // there is no trust anchor to verify an RSL against (GAP_ANALYSIS B11,
-        // B12) — so `Unknown` here means "the CA has not been asked", never
-        // "this node is valid".
-        let revocation_checker = Arc::new(InMemoryRslChecker::new(chrono::Duration::hours(24)));
-        if config.enable_revocation_checking {
-            info!("Revocation checking enabled");
-        } else {
-            info!("Revocation checking disabled");
+        // The sampling window, and how long a device is trusted to stay present
+        // inside it. Both go to the policy, which owns the window from here on.
+        let window = Duration::from_millis(config.rate_limit_threshold_ms);
+        let presence_timeout = Duration::from_millis(
+            config
+                .presence_timeout_ms
+                .unwrap_or(config.rate_limit_threshold_ms * u64::from(PRESENCE_TIMEOUT_WINDOWS)),
+        );
+        if presence_timeout < window {
+            return Err(AppError::Config(format!(
+                "presence timeout {}ms is shorter than the sampling window {}ms: a device's \
+                 presence would expire before its first re-observation is due, so the node would \
+                 record each device once and never sample it again. Set presence_timeout_ms to at \
+                 least {}, or leave it unset.",
+                presence_timeout.as_millis(),
+                window.as_millis(),
+                config.rate_limit_threshold_ms,
+            )));
         }
+
+        let sampling = Arc::new(ObservationPolicy::new(
+            window,
+            presence_timeout,
+            clock.clone(),
+        ));
+
+        // The CA's revocation list, loaded before the node does anything with it.
+        // Enabled and unusable is a startup error rather than a degraded node: see
+        // RevocationWatch::start for what it refuses and why.
+        let revocation = if config.revocation.enabled {
+            let watch = RevocationWatch::start(&config.revocation, &config.pool).await?;
+            info!("Revocation checking enabled — {}", watch.describe());
+            Some(Arc::new(watch))
+        } else {
+            info!(
+                "Revocation checking disabled: occurrences are stored without checking the \
+                 reporting node against a revocation list"
+            );
+            None
+        };
 
         Ok(Self {
             identity,
             pool: config.pool,
-            rate_limiter,
-            clock: Arc::new(SystemClock),
+            sampling,
+            clock,
             position: BestEffortPositionSource::new(config.position),
-            revocation_checker,
+            revocation,
             stream_reopen_delay_ms: config.stream_reopen_delay_ms,
             store_raw_payload: config.store_raw_payload,
             total_events: std::sync::atomic::AtomicUsize::new(0),
@@ -457,8 +580,11 @@ impl FullNode {
             Ok(false) => Err(AppError::NodeNotRegistered(format!(
                 "{} has no row in the nodes table, so its occurrences would be rejected by the \
                  origin_node_id foreign key. Enroll it against this node's database with:\n  \
-                 app ca ca-enroll --public-key {}",
+                 app ca ca-enroll --public-key-file <data dir>/{}\nwhich reads the public half \
+                 this node wrote beside its key, or copy the key itself:\n  app ca ca-enroll \
+                 --public-key {}",
                 hex::encode(self.identity.node_id()),
+                NodeIdentity::PUBLIC_KEY_FILENAME,
                 hex::encode(self.identity.verifying_key().as_bytes()),
             ))),
             Err(e) => {
@@ -505,6 +631,36 @@ impl FullNode {
 
         self.ensure_node_registered().await?;
 
+        // Keep the CA's list current on its own task rather than alongside the
+        // Bluetooth events. The two fail independently: a radio outage silences the
+        // event stream while the list keeps ageing, so a node that only refreshed
+        // while its radio was healthy would lose its revocation knowledge exactly
+        // when it was busiest retrying the adapter.
+        if let Some(watch) = self.revocation.clone() {
+            tokio::spawn(async move {
+                // The watch was loaded during startup, so the first refresh is due
+                // one interval from now, not immediately.
+                let every = watch.refresh_interval();
+                let mut ticker =
+                    tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+                loop {
+                    ticker.tick().await;
+                    if let Err(e) = watch.refresh().await {
+                        // The previous list stays in place: it is still the newest
+                        // thing the CA actually signed, and its own age — not this
+                        // failure — decides how far it can be trusted. A CA that
+                        // stays unreachable past that bound stops the node recording
+                        // through the data policy, which is the only reason a
+                        // refresh failure should ever cost data.
+                        warn!(
+                            "Revocation list refresh failed, keeping list #{}: {e}",
+                            watch.sequence_number()
+                        );
+                    }
+                }
+            });
+        }
+
         // Check if adapter is powered
         let powered = monitor.is_powered().await.map_err(AppError::Bluetooth)?;
         if !powered {
@@ -518,9 +674,22 @@ impl FullNode {
         info!("Scan started");
 
         let reopen_delay = Duration::from_millis(self.stream_reopen_delay_ms);
+        // How often to look for devices whose window elapsed without a report. A
+        // quarter of the window puts a re-observation at most that far behind the
+        // window it belongs to, floored so a small window cannot turn the node's
+        // main loop into a busy poll, and capped so a large one still samples on
+        // time rather than a quarter of a window late.
+        let sampling_tick =
+            (self.sampling.window() / 4).clamp(MIN_SAMPLING_TICK, MAX_SAMPLING_TICK);
         info!(
             "Listening for Bluetooth events (press Ctrl+C to stop; a closed event stream will be reopened after {:?})",
             reopen_delay
+        );
+        info!(
+            "Sampling window {:?}, presence trusted for {:?}, re-observation check every {:?}",
+            self.sampling.window(),
+            self.sampling.presence_timeout(),
+            sampling_tick
         );
 
         let mut reopens = 0usize;
@@ -565,23 +734,38 @@ impl FullNode {
                 }
             };
 
-            // Consume events until the stream closes.
-            while let Some(event) = events.next().await {
+            // Consume events until the stream closes. The sampling tick runs
+            // alongside them: a backend that reports a device only when something
+            // changes would otherwise leave a stationary device recorded once and
+            // then never again, which is the defect this closes. The rate at which
+            // present devices are observed is the node's to guarantee, not the
+            // radio's to provide.
+            let mut ticker = tokio::time::interval(sampling_tick);
+            loop {
+                let event = tokio::select! {
+                    event = events.next() => event,
+                    _ = ticker.tick() => {
+                        self.sample_present_devices(&*monitor).await;
+                        continue;
+                    }
+                };
+
+                let Some(event) = event else {
+                    break;
+                };
+
                 self.total_events
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                 match event {
                     DeviceEvent::DeviceAdded { device } => {
                         info!("Discovered device: {}", device.id);
-                        if let Err(e) = self.store_occurrence(&device).await {
-                            error!("Error storing occurrence: {}", e);
-                            self.storage_errors
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        }
+                        self.observe(&device).await;
                     }
 
                     DeviceEvent::DeviceRemoved { id } => {
                         debug!("Device removed: {}", id);
+                        self.handle_absence(&id);
                     }
 
                     DeviceEvent::DeviceUpdated {
@@ -592,15 +776,15 @@ impl FullNode {
                             "Device updated: {} (changed: {:?})",
                             device.id, changed_fields
                         );
+                        self.observe(&device).await;
+                    }
 
-                        // Handle RSSI updates - store as new occurrence
-                        if changed_fields.contains(&UpdateField::Rssi) {
-                            if let Err(e) = self.store_occurrence(&device).await {
-                                error!("Error storing occurrence: {}", e);
-                                self.storage_errors
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                        }
+                    // The radio reported the device and nothing tracked about it
+                    // moved. This is the bulk of what a radio says, and the reason
+                    // the record rate is the window rather than the event rate:
+                    // it is presence, not news.
+                    DeviceEvent::Advertisement { device } => {
+                        self.observe(&device).await;
                     }
                 }
             }
@@ -613,16 +797,132 @@ impl FullNode {
         }
     }
 
-    /// Store an occurrence for a Bluetooth device.
+    /// Handle one report about a device, whatever kind of report it was.
+    ///
+    /// Every event that says a device is here arrives here — discovery, a property
+    /// change, an advertisement that changed nothing — and the sampling policy
+    /// decides whether it is worth a row. That is the whole of the fix for the
+    /// record rate tracking signal jitter: the node no longer sorts reports by
+    /// which field moved and stores only the ones it finds interesting.
+    async fn observe(&self, device: &BluetoothDevice) {
+        let identity = derive_device_identity(device.id.as_str());
+        if !identity.mac_derived() {
+            NON_MAC_IDENTIFIER_WARNED.call_once(|| {
+                    warn!(
+                        "Backend identifier '{}' is not a MAC address: storing NULL device_address and a \
+                         host-local device_hash that will not match occurrences of the same device seen by other nodes",
+                        device.id
+                    );
+                });
+        }
+
+        let content = advertisement_content(device, self.store_raw_payload);
+        match self
+            .sampling
+            .sighting(&identity.hash, device.id.as_str(), &content)
+        {
+            Decision::Record(reason) => {
+                debug!(
+                    "Recording {} for {} ({})",
+                    reason.label(),
+                    device.id,
+                    content.summary()
+                );
+                if let Err(e) = self.store_occurrence(device, &identity).await {
+                    error!("Error storing occurrence: {}", e);
+                    self.storage_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            Decision::Suppress { reason, until } => {
+                debug!(
+                    "Not storing {}: {:?}, eligible again in {:?}",
+                    device.id, reason, until
+                );
+                self.occurrences_rate_limited
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Handle a device the backend reports absent.
+    ///
+    /// The window goes with it. The interval a window measures is the co-presence
+    /// that just ended, not the one that starts if the device is back in two
+    /// seconds — and that return is worth a row, which is exactly what a window
+    /// left running would prevent.
+    fn handle_absence(&self, id: &DeviceId) {
+        self.sampling
+            .removed(&derive_device_identity(id.as_str()).hash);
+    }
+
+    /// Re-observe the devices the policy says are due, and expire the ones that
+    /// stopped being reported.
+    ///
+    /// This is the lower bound of the policy — the reason a stationary beacon
+    /// yields a row per window instead of one per visit — and it is a *read*, not a
+    /// replay. The monitor is asked what it knows about the device now; the node
+    /// never writes a cached snapshot with a fresh timestamp, because
+    /// `observed_at` claims the signal was observed then. A device the monitor no
+    /// longer has is dropped from presence and counted, so the absence shows up as
+    /// the absence it is.
+    async fn sample_present_devices(&self, monitor: &(dyn DeviceMonitor + Send + Sync)) {
+        let expired = self.sampling.prune();
+        if expired > 0 {
+            debug!("Presence expired for {expired} devices");
+        }
+
+        for (hash, reported_id) in self.sampling.due() {
+            let id = DeviceId::new(reported_id);
+            let device = match monitor.device(&id).await {
+                Ok(device) => device,
+                Err(e) => {
+                    // No reading means nothing to observe, and the node cannot
+                    // tell "left range" from "backend forgot it" — either way this
+                    // node stops claiming it is present.
+                    self.sampling.reobservation_failed(&hash);
+                    debug!(
+                        "Dropped {} from presence, monitor has no reading: {}",
+                        id, e
+                    );
+                    continue;
+                }
+            };
+
+            let content = advertisement_content(&device, self.store_raw_payload);
+            // The claim is taken here rather than trusted from `due`: an
+            // advertisement may have recorded this device while the monitor was
+            // being read, and two rows in one window is the bound that broke.
+            if !self.sampling.reobservation(&hash, &content).is_record() {
+                continue;
+            }
+
+            let identity = derive_device_identity(device.id.as_str());
+            debug!("Re-observing {}", device.id);
+            if let Err(e) = self.store_occurrence(&device, &identity).await {
+                error!("Error storing re-observation: {}", e);
+                self.storage_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Store an occurrence for a device whose report the sampling policy already
+    /// accepted.
     ///
     /// This method:
     /// 1. Normalizes the backend device identifier into an address and device hash
-    /// 2. Checks the rate limiter (skips if limited)
-    /// 3. Checks revocation status (if enabled)
-    /// 4. Builds a canonical payload
-    /// 5. CBOR encodes the payload
-    /// 6. Signs the encoded bytes
-    /// 7. Inserts the occurrence into the database
+    /// 2. Checks revocation status (if enabled)
+    /// 3. Builds a canonical payload
+    /// 4. CBOR encodes the payload
+    /// 5. Signs the encoded bytes
+    /// 6. Inserts the occurrence into the database
+    ///
+    /// It does **not** decide whether a row is owed. That is
+    /// [`ObservationPolicy`]'s call, and it has to be made once, above both paths
+    /// that get here: an occurrence written without the policy having claimed the
+    /// window would silently break the upper bound, because the policy would go on
+    /// believing the device was recorded at the time it last said so.
     ///
     /// Backends that do not expose a MAC address (CoreBluetooth reports a
     /// host-local UUID) store a NULL `device_address`; the identifier is still
@@ -630,39 +930,28 @@ impl FullNode {
     ///
     /// # Arguments
     ///
-    /// * `device` - The Bluetooth device to store
+    /// * `device` - The device to store
+    /// * `identity` - Its derived identity, from the same identifier the policy
+    ///   decided on
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - The occurrence was stored (or rate-limited)
+    /// * `Ok(())` - The occurrence was stored
     /// * `Err(AppError)` - If storage failed
-    async fn store_occurrence(&self, device: &BluetoothDevice) -> Result<()> {
-        // Normalize the backend identifier: MAC on BlueZ, host-local UUID on
-        // CoreBluetooth. Infallible, so an unrecognized form never drops events.
-        let identity = derive_device_identity(device.id.as_str());
-
-        if !identity.mac_derived() {
-            NON_MAC_IDENTIFIER_WARNED.call_once(|| {
-                warn!(
-                    "Backend identifier '{}' is not a MAC address: storing NULL device_address and a \
-                     host-local device_hash that will not match occurrences of the same device seen by other nodes",
-                    device.id
-                );
-            });
-        }
-
-        // Check rate limiter (keyed on device_hash, which exists for every
-        // identifier source unlike the optional address)
-        if !self.rate_limiter.should_store(&identity.hash) {
-            debug!("Rate limited: {}", device.id);
-            self.occurrences_rate_limited
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return Ok(());
-        }
-
-        // Note: Revocation checking for received occurrences from other nodes
-        // should be done via verify_received_occurrence() before calling this method.
-        // This method only stores locally-generated occurrences.
+    async fn store_occurrence(
+        &self,
+        device: &BluetoothDevice,
+        identity: &DeviceIdentity,
+    ) -> Result<()> {
+        // Ask the CA before building anything, not after. The work below acquires a
+        // position, encodes the payload and signs it, and a refusal throws all of
+        // that away — but more to the point, this is the last moment where dropping
+        // the occurrence is cheap: after this there is a row, and a row is exactly
+        // what a revoked node is trying to produce.
+        //
+        // Received occurrences from a peer are gated separately, by
+        // verify_received_occurrence(); this path is the node's own observations.
+        self.authorize_store(self.identity.node_id())?;
 
         // Generate timestamps. One clock read for both columns: the pair is the
         // drift audit's raw material, and two reads would record the gap between
@@ -731,20 +1020,22 @@ impl FullNode {
             stream_reopens: self
                 .stream_reopens
                 .load(std::sync::atomic::Ordering::SeqCst),
-            rate_limiter_stats: self.rate_limiter.stats(),
+            sampling: self.sampling.stats(),
+            rate_limiter_stats: self.sampling.rate_limiter_stats(),
         }
     }
 
     /// Get the rate limit threshold in milliseconds.
     pub fn rate_limit_threshold_ms(&self) -> u64 {
-        self.rate_limiter.stats().threshold_ms
+        self.sampling.window().as_millis() as u64
     }
 
-    /// Clear the rate limiter cache.
+    /// Clear the node's sampling state: every device's window and presence.
     ///
-    /// This is primarily useful for testing.
+    /// This is primarily useful for testing. A node that forgets its windows
+    /// records every device in range again on its next report for it.
     pub fn clear_rate_limiter(&self) {
-        self.rate_limiter.clear();
+        self.sampling.clear();
     }
 
     /// Verify a signature from this node.
@@ -764,80 +1055,134 @@ impl FullNode {
             .map_err(|e| AppError::Validation(e.to_string()))
     }
 
-    /// Verify a received occurrence from another node, including revocation check.
+    /// The revocation gate for anything this node is about to record.
     ///
-    /// This is used when receiving occurrences via P2P from other nodes.
+    /// Checking off is the operator's decision not to ask the CA, so it is a pass,
+    /// not a refusal: the absence of a gate must not be mistaken for a gate that
+    /// said no. Checking on is the CA's answer, and a refusal there is an error the
+    /// caller has to surface — an occurrence that was observed and then dropped is
+    /// the interesting failure, not a silent `false`.
+    ///
+    /// # Self-attestation
+    ///
+    /// A node checks its *own* id here, which reads oddly until you notice who it
+    /// protects against: not this process, which can bypass anything it holds, but
+    /// a revocation issued against this key and a deployment that was never told. A
+    /// node whose key has been revoked by its own CA stops recording the moment it
+    /// reloads the list, which is the behaviour an operator would assume.
+    fn authorize_store(&self, node_id: &[u8]) -> Result<()> {
+        match &self.revocation {
+            Some(watch) => watch.authorize_data(node_id),
+            None => Ok(()),
+        }
+    }
+
+    /// Verify a received occurrence from another node.
+    ///
+    /// Nothing calls this yet — the node has no P2P transport, so there is no
+    /// receive handler to call it from. It exists for the day one does, and it is
+    /// written for that day rather than for the one before it: a peer's signature
+    /// is checked against **that peer's** key as the registry holds it, never
+    /// against this node's own key (which is what an earlier version did, and which
+    /// would have accepted exactly nothing while looking like authentication).
+    ///
     /// It verifies:
-    /// 1. The signature is valid
-    /// 2. The origin node is not revoked
+    /// 1. The peer is enrolled, so there is a registered key to check against.
+    /// 2. That key hashes to the node id the occurrence claims — otherwise the
+    ///    registry row says nothing about the id being asserted, and a signature
+    ///    under it proves possession of some key, not this node's.
+    /// 3. The signature is valid under that key.
+    /// 4. The CA's list permits recording data from that node
+    ///    ([`Self::authorize_store`]).
+    ///
+    /// What it does *not* establish is that the CA issued the registered key. The
+    /// registry row's `ca_credential` column holds exactly that statement and can be
+    /// checked with [`ca::TrustAnchor`] the way `ca ca-verify-credential` does; this
+    /// cannot, because the anchor is configured under `[revocation]` and
+    /// authentication must not silently depend on a revocation switch. Wiring the
+    /// credential check is GAP_ANALYSIS M14's remaining half and needs the anchor
+    /// promoted to its own setting.
     ///
     /// # Arguments
     ///
     /// * `origin_node_id` - The ID of the node that created the occurrence
-    /// * `_signing_public_key` - The node's signing public key (currently unused, signature verification uses embedded key)
     /// * `signed_payload` - The bytes that were signed
     /// * `signature` - The signature to verify
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - Signature is valid and node is not revoked
+    /// * `Ok(())` - Signature is valid and the node is not revoked
     /// * `Err(AppError)` - If verification or revocation check failed
     pub async fn verify_received_occurrence(
         &self,
         origin_node_id: &[u8],
-        _signing_public_key: &[u8],
         signed_payload: &[u8],
         signature: &[u8],
     ) -> Result<()> {
-        // Verify the signature first
-        self.identity
-            .verify(
-                signed_payload,
-                &ed25519_dalek::Signature::try_from(signature).map_err(|e| {
-                    AppError::Validation(format!("Invalid signature format: {}", e))
-                })?,
-            )
-            .map_err(|e| AppError::Validation(format!("Signature verification failed: {}", e)))?;
+        let peer = NodeRepository::find_by_id(self.pool.as_pool(), origin_node_id)
+            .await
+            .map_err(|e| {
+                AppError::Validation(format!(
+                    "could not look up reporting node {}: {e}",
+                    hex::encode(origin_node_id)
+                ))
+            })?
+            .ok_or_else(|| {
+                AppError::Provenance(format!(
+                    "reporting node {} is not enrolled, so there is no registered key to verify \
+                     its signature against",
+                    hex::encode(origin_node_id)
+                ))
+            })?;
 
-        // Check revocation status (if enabled)
-        let status = self
-            .revocation_checker
-            .is_revoked(origin_node_id)
-            .map_err(|e| AppError::Validation(format!("Revocation check failed: {}", e)))?;
+        let peer_key = ed25519_dalek::VerifyingKey::try_from(peer.signing_public_key.as_slice())
+            .map_err(|e| {
+                AppError::Validation(format!(
+                    "the registered signing key for {} is not a valid Ed25519 public key: {e}",
+                    hex::encode(origin_node_id)
+                ))
+            })?;
 
-        match status {
-            ca::RevocationStatus::Valid => {
-                debug!(
-                    "Node {} is valid for data recording",
-                    hex::encode(origin_node_id)
-                );
-                Ok(())
-            }
-            ca::RevocationStatus::Revoked => {
-                warn!(
-                    "Node {} has been revoked - rejecting occurrence",
-                    hex::encode(origin_node_id)
-                );
-                Err(AppError::Provenance(format!(
-                    "Node {} has been revoked",
-                    hex::encode(origin_node_id)
-                )))
-            }
-            ca::RevocationStatus::Unknown => {
-                // DataRecordingPolicy accepts unknown with warning
-                warn!(
-                    "Node {} revocation status unknown - accepting with warning",
-                    hex::encode(origin_node_id)
-                );
-                Ok(())
-            }
+        // The id *is* SHA-256 of the key, so this is what ties the row to the
+        // identity being claimed. A registry row that fails it is corrupt or
+        // planted, and verifying anything against it would be theatre.
+        let derived = <[u8; 32]>::from(sha2::Sha256::digest(peer_key.as_bytes()));
+        if derived.as_slice() != origin_node_id {
+            return Err(AppError::Provenance(format!(
+                "the signing key registered for {} hashes to {}, so it is not that node's key",
+                hex::encode(origin_node_id),
+                hex::encode(derived)
+            )));
         }
+
+        peer_key
+            .verify_strict(
+                signed_payload,
+                &ed25519_dalek::Signature::try_from(signature)
+                    .map_err(|e| AppError::Validation(format!("Invalid signature format: {e}")))?,
+            )
+            .map_err(|e| {
+                AppError::Provenance(format!(
+                    "signature from {} does not verify under its registered key: {e}",
+                    hex::encode(origin_node_id)
+                ))
+            })?;
+
+        self.authorize_store(origin_node_id)
     }
 
     /// Check if a peer node should be allowed to connect (P2P handshake).
     ///
-    /// This uses a stricter policy than data recording - it rejects nodes
-    /// with revoked or unknown status.
+    /// Nothing calls this either — there is no handshake to hook it into. With
+    /// checking enabled it asks the CA through the connection policy; with checking
+    /// disabled it allows the peer, because "no gate is configured" is a different
+    /// statement from "the gate said no", and answering `false` to every peer was
+    /// the old behaviour's actual effect while reading as a security decision.
+    ///
+    /// This is stricter than data recording while checking *is* enabled: a node the
+    /// list does not name is refused a session but still recorded, on the ground
+    /// that one more row from an unestablished node costs a row, while admitting it
+    /// to a session costs everything that session touches.
     ///
     /// # Arguments
     ///
@@ -849,28 +1194,9 @@ impl FullNode {
     /// * `Ok(false)` - Node should be rejected
     /// * `Err(AppError)` - If check failed
     pub fn should_allow_peer_connection(&self, peer_node_id: &[u8]) -> Result<bool> {
-        let status = self
-            .revocation_checker
-            .is_revoked(peer_node_id)
-            .map_err(|e| AppError::Validation(format!("Revocation check failed: {}", e)))?;
-
-        match status {
-            ca::RevocationStatus::Valid => Ok(true),
-            ca::RevocationStatus::Revoked => {
-                warn!(
-                    "Rejecting connection from revoked node {}",
-                    hex::encode(peer_node_id)
-                );
-                Ok(false)
-            }
-            ca::RevocationStatus::Unknown => {
-                // ConnectionPolicy rejects unknown
-                warn!(
-                    "Rejecting connection from node with unknown status {}",
-                    hex::encode(peer_node_id)
-                );
-                Ok(false)
-            }
+        match &self.revocation {
+            Some(watch) => Ok(watch.authorize_connection(peer_node_id)),
+            None => Ok(true),
         }
     }
 }
@@ -1001,6 +1327,46 @@ fn record_position(payload: &mut serde_json::Value, position: &Position) {
     );
 }
 
+/// What a device is advertising, reduced to what the sampling policy compares.
+///
+/// RSSI is not in here, nor the connection state, nor whether services have been
+/// resolved. Those describe this node's reading and its GATT usage, not what the
+/// device put on the air, and counting them as advertisement content is how a node
+/// came to record a device at whatever rate its signal happened to wobble.
+///
+/// `store_raw_payload` gates the radio's own bytes because the digest is a claim
+/// about what a row would contain: bytes the operator asked not to keep are not
+/// news about the advertisement.
+///
+/// A free function so that what counts as a change can be tested without a
+/// database or a running node.
+fn advertisement_content(
+    device: &BluetoothDevice,
+    store_raw_payload: bool,
+) -> AdvertisementContent {
+    let manufacturer_data: BTreeMap<u16, Vec<u8>> = device
+        .manufacturer_data
+        .iter()
+        .map(|(company, bytes)| (*company, bytes.clone()))
+        .collect();
+    let service_data: BTreeMap<String, Vec<u8>> = device
+        .service_data
+        .iter()
+        .map(|(uuid, bytes)| (uuid.to_string(), bytes.clone()))
+        .collect();
+
+    AdvertisementContent::new(
+        device.name.as_deref(),
+        &manufacturer_data,
+        &service_data,
+        if store_raw_payload {
+            device.raw_payload.as_deref()
+        } else {
+            None
+        },
+    )
+}
+
 /// Build the Bluetooth-specific `signal_payload` for one observation.
 ///
 /// A free function rather than a method so the shape of what gets stored — in
@@ -1124,7 +1490,7 @@ fn ble_signal_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::position::test_support::epoch;
+    use crate::position::test_support::{epoch, ManualClock};
     use crate::position::PositionOrigin;
     use crate::provenance::encode::{canonical_signal_payload, decode_payload};
     use crate::provenance::payload::{
@@ -1783,6 +2149,17 @@ mod tests {
             occurrences_rate_limited: 20,
             storage_errors: 0,
             stream_reopens: 3,
+            sampling: ObservationStats {
+                present: 12,
+                sightings: 100,
+                recorded: 80,
+                suppressed: 20,
+                reobservations: 35,
+                content_changes_held: 2,
+                presence_expired: 1,
+                reobservation_dropped: 0,
+                removed: 4,
+            },
             rate_limiter_stats: RateLimiterStats {
                 cache_size: 50,
                 allow_count: 80,
@@ -1806,6 +2183,17 @@ mod tests {
             occurrences_rate_limited: 20,
             storage_errors: 1,
             stream_reopens: 0,
+            sampling: ObservationStats {
+                present: 12,
+                sightings: 100,
+                recorded: 80,
+                suppressed: 20,
+                reobservations: 35,
+                content_changes_held: 2,
+                presence_expired: 1,
+                reobservation_dropped: 0,
+                removed: 4,
+            },
             rate_limiter_stats: RateLimiterStats {
                 cache_size: 50,
                 allow_count: 80,
@@ -1938,5 +2326,537 @@ mod tests {
                 gap
             );
         }
+    }
+
+    // --------------------------------------------------------------------------------
+    // Sampling: what a node writes for a device it can see (GAP_ANALYSIS B14).
+    // --------------------------------------------------------------------------------
+
+    #[cfg(feature = "mock")]
+    use bt_mon::backends::mock::MockMonitor;
+    #[cfg(feature = "mock")]
+    use repo::models::NodeType;
+
+    /// A timestamp this schema will accept a row for.
+    ///
+    /// `occurrences` is partitioned on `observed_at` and `ensure_occurrence_partition`
+    /// refuses to create a partition outside a rolling window around now, so the
+    /// shared position-test epoch — a perfectly good instant from 2023 — is not a
+    /// usable one for anything that stores.
+    #[cfg(feature = "mock")]
+    fn sampling_epoch() -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap()
+    }
+
+    /// A node writing to the test database, on a clock the test moves, with the
+    /// simulated radio it re-observes from.
+    ///
+    /// The clock matters as much as the database here: a window is fifteen seconds,
+    /// and a test that waited for that would be slow, flaky, and still only proving
+    /// something about how fast the machine running it is.
+    #[cfg(feature = "mock")]
+    async fn sampling_node(
+        pool: sqlx::PgPool,
+        window_ms: u64,
+    ) -> (FullNode, Arc<ManualClock>, MockMonitor, tempfile::TempDir) {
+        let clock = Arc::new(ManualClock::new(sampling_epoch()));
+        let data_dir = tempfile::tempdir().expect("a data directory");
+        let config =
+            FullNodeConfig::new(Pool::from_pool(pool.clone()), data_dir.path().to_path_buf())
+                .with_rate_limit_threshold(window_ms)
+                .with_clock(clock.clone());
+        let node = FullNode::new(config).await.expect("a node");
+
+        // `occurrences.origin_node_id` references `nodes(node_id)`, so nothing can be
+        // stored until this node is enrolled.
+        NodeRepository::register(
+            &pool,
+            node.node_id(),
+            NodeType::Full,
+            node.identity.verifying_key().as_bytes(),
+            b"ca-credential",
+            None,
+            &[],
+        )
+        .await
+        .expect("the node should register");
+
+        (node, clock, MockMonitor::new(), data_dir)
+    }
+
+    /// Every `observed_at` written so far, oldest first — the row count and its
+    /// spacing in one read.
+    #[cfg(feature = "mock")]
+    async fn observed_times(pool: &sqlx::PgPool) -> Vec<DateTime<Utc>> {
+        sqlx::query_scalar("SELECT observed_at FROM occurrences ORDER BY observed_at")
+            .fetch_all(pool)
+            .await
+            .expect("the rows written so far")
+    }
+
+    #[cfg(feature = "mock")]
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_stationary_beacon_yields_one_occurrence_per_window(pool: sqlx::PgPool) {
+        // The exit criterion, end to end: a beacon that never moves and never has
+        // anything new to say. It used to produce exactly one occurrence, because
+        // the node stored on `DeviceAdded` and on an RSSI change, and a device at
+        // rest supplies neither after the first moment.
+        let (node, clock, _monitor, _dir) = sampling_node(pool.clone(), 15_000).await;
+        let beacon = beacon("iBeacon", -59);
+
+        // Sixty seconds of reports, ten a second.
+        for _ in 0..600 {
+            node.observe(&beacon).await;
+            clock.advance_ms(100);
+        }
+
+        let rows = observed_times(&pool).await;
+        assert_eq!(
+            rows.len(),
+            4,
+            "one at discovery plus one per elapsed window in fifty-nine seconds"
+        );
+        for pair in rows.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                chrono::Duration::seconds(15),
+                "the rows are one window apart, not one per report"
+            );
+        }
+    }
+
+    #[cfg(feature = "mock")]
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn signal_jitter_no_longer_drives_the_record_rate(pool: sqlx::PgPool) {
+        // The same sixty seconds with a device held at arm's length: a different
+        // RSSI in every report. Those used to be the only reports the node stored,
+        // so this device used to be the busy one. It now costs the same four rows as
+        // the beacon that never moved.
+        let (node, clock, _monitor, _dir) = sampling_node(pool.clone(), 15_000).await;
+
+        for tick in 0..600 {
+            node.observe(&beacon("Phone", -40 - (tick % 20))).await;
+            clock.advance_ms(100);
+        }
+
+        assert_eq!(observed_times(&pool).await.len(), 4);
+    }
+
+    #[cfg(feature = "mock")]
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_beacon_nobody_reports_is_still_observed_every_window(pool: sqlx::PgPool) {
+        // The lower bound, which is the half no backend can be trusted to provide:
+        // a radio that says nothing further about a device that is still there.
+        let (node, clock, monitor, _dir) = sampling_node(pool.clone(), 15_000).await;
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF");
+        monitor
+            .add_device(id.clone())
+            .await
+            .expect("simulated device");
+        let device = monitor.device(&id).await.expect("the simulated device");
+
+        node.observe(&device).await;
+        assert_eq!(observed_times(&pool).await.len(), 1, "discovery");
+
+        for window in 1..=3 {
+            clock.advance_ms(15_000);
+            node.sample_present_devices(&monitor).await;
+
+            let rows = observed_times(&pool).await;
+            assert_eq!(rows.len(), window + 1, "window {window} is owed a row");
+            assert_eq!(
+                rows[rows.len() - 1] - rows[rows.len() - 2],
+                chrono::Duration::seconds(15),
+                "each re-observation is stamped when it was read, not when the \
+                 device was first seen"
+            );
+        }
+        assert_eq!(node.stats().sampling.reobservations, 3);
+
+        // Longer than presence is trusted with nobody reporting it, and the node
+        // stops. It has no reading, and a row would claim one.
+        clock.advance_ms(60_000);
+        node.sample_present_devices(&monitor).await;
+        assert_eq!(
+            observed_times(&pool).await.len(),
+            4,
+            "a device nobody reported is not a device observed"
+        );
+        assert_eq!(node.stats().sampling.presence_expired, 1);
+    }
+
+    #[cfg(feature = "mock")]
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_device_the_monitor_lost_is_never_written_from_memory(pool: sqlx::PgPool) {
+        // A cached snapshot and a fresh timestamp is not an observation, it is a
+        // fabrication, so the re-observation path writes nothing at all when the
+        // monitor has nothing to give.
+        let (node, clock, monitor, _dir) = sampling_node(pool.clone(), 15_000).await;
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF");
+        monitor
+            .add_device(id.clone())
+            .await
+            .expect("simulated device");
+        node.observe(&monitor.device(&id).await.expect("the device"))
+            .await;
+        assert_eq!(observed_times(&pool).await.len(), 1);
+
+        // The adapter forgets the device without anyone reporting it absent.
+        assert!(monitor.remove_device(&id).await, "the device was there");
+        for _ in 0..4 {
+            clock.advance_ms(15_000);
+            node.sample_present_devices(&monitor).await;
+        }
+
+        assert_eq!(observed_times(&pool).await.len(), 1, "no reading, no row");
+        let sampling = node.stats().sampling;
+        assert_eq!(
+            sampling.reobservation_dropped, 1,
+            "dropped once, not per tick"
+        );
+        assert_eq!(sampling.reobservations, 0);
+    }
+
+    #[cfg(feature = "mock")]
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_device_reported_absent_stops_being_sampled(pool: sqlx::PgPool) {
+        let (node, clock, monitor, _dir) = sampling_node(pool.clone(), 15_000).await;
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF");
+        monitor
+            .add_device(id.clone())
+            .await
+            .expect("simulated device");
+        let device = monitor.device(&id).await.expect("the simulated device");
+        node.observe(&device).await;
+
+        // The backend reports it gone: the window it was inside is over.
+        node.handle_absence(&id);
+        clock.advance_ms(1_000);
+
+        // Nothing is owed for a device nobody reports, whether it is trusted present
+        // or not.
+        node.sample_present_devices(&monitor).await;
+        assert_eq!(observed_times(&pool).await.len(), 1);
+
+        // Coming back one second after it was recorded is a new co-presence, and is
+        // recorded — inside what would still have been the old window had the absence
+        // not closed it.
+        monitor.add_device(id.clone()).await.expect("device back");
+        node.observe(&monitor.device(&id).await.expect("the device"))
+            .await;
+        let rows = observed_times(&pool).await;
+        assert_eq!(rows.len(), 2, "a return is worth a row");
+        assert_eq!(
+            rows[1] - rows[0],
+            chrono::Duration::seconds(1),
+            "one second after the first record, which the window would otherwise \
+             have suppressed"
+        );
+
+        // And a second report a second after that is suppressed again: dropping the
+        // window on absence is not the same as dropping the window.
+        clock.advance_ms(1_000);
+        node.observe(&monitor.device(&id).await.expect("the device"))
+            .await;
+        assert_eq!(observed_times(&pool).await.len(), 2);
+    }
+
+    #[cfg(feature = "mock")]
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_content_change_waits_for_the_window_like_everything_else(pool: sqlx::PgPool) {
+        // A beacon that rewrites its payload every second is the device the window
+        // exists to bound. The change is not lost — the next record says it was a
+        // change — but it does not buy a row on its own.
+        let (node, clock, _monitor, _dir) = sampling_node(pool.clone(), 15_000).await;
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF");
+
+        for second in 0..30 {
+            let mut device = BluetoothDevice::new(id.clone(), id.as_str().to_string())
+                .with_name("Sensor")
+                .with_rssi(-60);
+            device.manufacturer_data.insert(0x004C, vec![second as u8]);
+            node.observe(&device).await;
+            clock.advance_ms(1_000);
+        }
+
+        let rows = observed_times(&pool).await;
+        assert_eq!(
+            rows.len(),
+            2,
+            "thirty different payloads over thirty seconds still cost one row per window: \
+             discovery and the window that closed at fifteen seconds"
+        );
+
+        // Each row carries the payload current when it was written, not the one the
+        // device was first seen with — the change is held, not discarded.
+        let payloads: Vec<String> = sqlx::query_scalar(
+            "SELECT signal_payload->'ble'->'manufacturer_data'->>'payload' \
+             FROM occurrences ORDER BY observed_at",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("the payloads written");
+        assert_eq!(
+            payloads,
+            vec!["00".to_string(), "0f".to_string()],
+            "the second row is the report from second 15, when the window reopened"
+        );
+    }
+
+    /// Rows in `occurrences`, however they got there.
+    async fn occurrence_count(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM occurrences")
+            .fetch_one(pool)
+            .await
+            .expect("a row count")
+    }
+
+    /// A node with `[revocation]` switched on, against a CA that publishes to this
+    /// database and whose anchor file the node was pointed at.
+    ///
+    /// `build_list` is handed the fresh CA and the node's own node id, because the
+    /// cases worth distinguishing are "this node is on the list" and "this node is
+    /// not", and that id is only known once the identity exists in the data
+    /// directory the node will load.
+    ///
+    /// Returns `Err` when the node refused to start, which is itself behaviour under
+    /// test.
+    async fn revocation_node(
+        pool: sqlx::PgPool,
+        max_staleness_secs: u64,
+        build_list: impl FnOnce(&ca::CaRoot, &[u8]) -> ca::RevocationStatusList,
+    ) -> std::result::Result<(FullNode, ca::CaRoot, tempfile::TempDir), AppError> {
+        use ca::RslManager;
+
+        let dir = tempfile::tempdir().expect("a data directory");
+        let identity = NodeIdentity::load_or_create(dir.path()).expect("an identity to revoke");
+
+        let ca = ca::CaRoot::generate();
+        ca::DatabaseRslManager::new(pool.clone())
+            .store_rsl(&build_list(&ca, identity.node_id()))
+            .await
+            .expect("publish the list");
+
+        let anchor_path = dir.path().join("anchor.pem");
+        ca.trust_anchor()
+            .save_to_file(&anchor_path)
+            .expect("write the anchor");
+
+        let config = FullNodeConfig {
+            revocation: RevocationConfig {
+                enabled: true,
+                anchor_path: Some(anchor_path.display().to_string()),
+                max_staleness_secs,
+                refresh_secs: 15 * 60,
+            },
+            ..FullNodeConfig::new(Pool::from_pool(pool.clone()), dir.path().to_path_buf())
+        };
+
+        let node = FullNode::new(config).await?;
+
+        // `occurrences.origin_node_id` references `nodes(node_id)`, so without this
+        // row a test that saw nothing stored could not tell the revocation gate's
+        // refusal from a foreign key's.
+        NodeRepository::register(
+            &pool,
+            node.node_id(),
+            repo::models::NodeType::Full,
+            node.identity.verifying_key().as_bytes(),
+            b"ca-credential",
+            None,
+            &[],
+        )
+        .await
+        .expect("the node should register");
+
+        Ok((node, ca, dir))
+    }
+
+    /// A node with no CA configured, for the checks that must not depend on one.
+    async fn plain_node(pool: sqlx::PgPool) -> (FullNode, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("a data directory");
+        let config = FullNodeConfig::new(Pool::from_pool(pool), dir.path().to_path_buf());
+        let node = FullNode::new(config).await.expect("a node");
+        (node, dir)
+    }
+
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_revoked_node_records_nothing(pool: sqlx::PgPool) {
+        // B11's exit criterion as an operator would state it: a node whose key its CA
+        // has revoked stores nothing — even though its radio keeps hearing devices
+        // and its own sampling policy says to record them.
+        let (node, _ca, _dir) = revocation_node(pool.clone(), 60 * 60, |ca, node_id| {
+            crate::node::revocation::list_revoking(ca, node_id, 1, 0, 7)
+        })
+        .await
+        .expect("a current list, so the node starts");
+
+        node.observe(&observed_device()).await;
+
+        assert_eq!(occurrence_count(&pool).await, 0, "nothing stored");
+        let stats = node.stats();
+        assert_eq!(stats.occurrences_stored, 0);
+        assert_eq!(
+            stats.storage_errors, 1,
+            "the refusal is reported rather than swallowed: a node that quietly stores nothing \
+             looks exactly like one that heard nothing"
+        );
+        assert_eq!(
+            stats.occurrences_rate_limited, 0,
+            "the observation reached the store path rather than being suppressed by a window"
+        );
+    }
+
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_node_its_ca_has_not_revoked_records_as_usual(pool: sqlx::PgPool) {
+        // The control. Without it the test above proves only that this harness stores
+        // nothing: the list here is current, verifies under the anchor, and simply
+        // does not name this node.
+        let (node, _ca, _dir) = revocation_node(pool.clone(), 60 * 60, |ca, _node_id| {
+            crate::node::revocation::list_revoking(ca, &[0x77u8; 32], 1, 0, 7)
+        })
+        .await
+        .expect("a current list naming somebody else");
+
+        node.observe(&observed_device()).await;
+
+        assert_eq!(occurrence_count(&pool).await, 1, "recorded as ever");
+        assert_eq!(node.stats().storage_errors, 0);
+    }
+
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_list_past_its_staleness_bound_stops_the_node_starting(pool: sqlx::PgPool) {
+        // Issued three days ago and still inside its validity window, so it verifies:
+        // the staleness bound is the only thing between this node and reading a
+        // three-day-old silence as an all-clear. Running with that would mean storing
+        // occurrences whose reporting node the CA may have revoked yesterday, so the
+        // node declines to start instead.
+        let err = match revocation_node(pool.clone(), 60 * 60, |ca, _node_id| {
+            crate::node::revocation::list_revoking(ca, &[0x77u8; 32], 1, 3, 7)
+        })
+        .await
+        {
+            Ok((_node, _ca, _dir)) => {
+                panic!("a node that cannot trust its list must not start and store anyway")
+            }
+            Err(e) => e,
+        };
+
+        let message = err.to_string();
+        assert!(
+            message.contains("revocation checking is enabled but unusable"),
+            "{message}"
+        );
+        assert!(
+            message.contains("ca-generate-rsl"),
+            "the error names the fix, not just the failure: {message}"
+        );
+        assert_eq!(occurrence_count(&pool).await, 0);
+    }
+
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_peer_is_verified_against_its_own_key(pool: sqlx::PgPool) {
+        // GAP_ANALYSIS M17. Verification used to run against *this* node's key, which
+        // means a peer could never pass and anyone holding this node's key could. Both
+        // halves are pinned, because "it rejects things" is not the property —
+        // rejecting the wrong things is the bug.
+        let (node, _dir) = plain_node(pool.clone()).await;
+
+        let peer_dir = tempfile::tempdir().expect("a peer data directory");
+        let peer = NodeIdentity::load_or_create(peer_dir.path()).expect("a peer identity");
+        NodeRepository::register(
+            &pool,
+            peer.node_id(),
+            repo::models::NodeType::Full,
+            peer.verifying_key().as_bytes(),
+            b"ca-credential",
+            None,
+            &[],
+        )
+        .await
+        .expect("register the peer");
+
+        let payload = b"an occurrence attributed to the peer";
+
+        let theirs = peer.sign(payload);
+        node.verify_received_occurrence(peer.node_id(), payload, &theirs.to_bytes())
+            .await
+            .expect("a peer signing with its own key verifies");
+
+        let ours = node.identity.sign(payload);
+        let err = node
+            .verify_received_occurrence(peer.node_id(), payload, &ours.to_bytes())
+            .await
+            .expect_err("this node's own key must not vouch for a peer");
+        assert!(
+            err.to_string()
+                .contains("does not verify under its registered key"),
+            "{err}"
+        );
+
+        // And the peer's key does not make any bytes at all valid.
+        let elsewhere = peer.sign(b"a different occurrence entirely");
+        assert!(node
+            .verify_received_occurrence(peer.node_id(), payload, &elsewhere.to_bytes())
+            .await
+            .is_err());
+    }
+
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_peer_that_is_not_enrolled_has_no_key_to_verify(pool: sqlx::PgPool) {
+        // A signature is verified against the registry's key or not at all, so an
+        // unknown node id has no key and is refused before anyone asks whether the
+        // bytes are well formed.
+        let (node, _dir) = plain_node(pool.clone()).await;
+
+        let err = node
+            .verify_received_occurrence(&[0x5au8; 32], b"anything at all", &[0u8; 64])
+            .await
+            .expect_err("no registry row, no key");
+        assert!(err.to_string().contains("not enrolled"), "{err}");
+    }
+
+    #[sqlx::test(migrator = "db::SQLX_FORWARD_MIGRATOR")]
+    async fn a_registry_row_whose_key_is_not_its_node_id_verifies_nothing(pool: sqlx::PgPool) {
+        // The registry is trusted, but not blindly: a node id *is* SHA-256 of its
+        // signing key, so a row that breaks that is either corrupt or planted, and a
+        // signature checked under its key would prove possession of some key while
+        // being reported as proof about the id the occurrence carried.
+        let (node, _dir) = plain_node(pool.clone()).await;
+
+        let honest =
+            NodeIdentity::load_or_create(tempfile::tempdir().expect("a data directory").path())
+                .expect("an identity to register inconsistently");
+        let someone_else =
+            NodeIdentity::load_or_create(tempfile::tempdir().expect("a data directory").path())
+                .expect("a second identity");
+
+        // The id of one node, the key of another.
+        NodeRepository::register(
+            &pool,
+            honest.node_id(),
+            repo::models::NodeType::Full,
+            someone_else.verifying_key().as_bytes(),
+            b"ca-credential",
+            None,
+            &[],
+        )
+        .await
+        .expect("register the mismatched row");
+
+        // Signed by the key the row holds, so the signature itself is fine — which is
+        // exactly why the id has to be checked before it is believed.
+        let payload = b"an occurrence attributed to the first node";
+        let signature = someone_else.sign(payload);
+
+        let err = node
+            .verify_received_occurrence(honest.node_id(), payload, &signature.to_bytes())
+            .await
+            .expect_err("a key that is not the node it claims");
+        assert!(
+            err.to_string().contains("is not that node's key"),
+            "the message should say which of the two does not match: {err}"
+        );
     }
 }

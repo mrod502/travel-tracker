@@ -24,12 +24,13 @@ use std::str::FromStr;
 use crate::position::{GpsBackend, GpsSettings, PositionConfig, PositionMode};
 
 use super::env_file::EnvLayer;
-use super::file::{BluetoothSection, ConfigFile, GpsSection, LocationSection};
+use super::file::{BluetoothSection, ConfigFile, GpsSection, LocationSection, RevocationSection};
 use super::flags::Flags;
 use super::{
-    AppConfig, BluetoothConfig, CaConfig, DatabaseConfig, LogConfig, NodeConfig,
+    AppConfig, BluetoothConfig, CaConfig, DatabaseConfig, LogConfig, NodeConfig, RevocationConfig,
     DEFAULT_CA_KEY_PATH, DEFAULT_CA_NODE_TYPE, DEFAULT_CA_VALIDITY_DAYS, DEFAULT_LOG_LEVEL,
-    DEFAULT_RATE_LIMIT_MS, DEFAULT_SCAN_INTERVAL_MS, DEFAULT_STREAM_REOPEN_DELAY_MS,
+    DEFAULT_RATE_LIMIT_MS, DEFAULT_REVOCATION_MAX_STALENESS_SECS, DEFAULT_REVOCATION_REFRESH_SECS,
+    DEFAULT_SCAN_INTERVAL_MS, DEFAULT_STREAM_REOPEN_DELAY_MS,
 };
 
 /// Environment variables read by the env layer.
@@ -72,6 +73,11 @@ pub mod env_keys {
     pub const CA_ROOT_KEY_PATH: &str = "CA_ROOT_KEY_PATH";
     pub const CA_VALIDITY_DAYS: &str = "CA_VALIDITY_DAYS";
     pub const CA_NODE_TYPE: &str = "CA_NODE_TYPE";
+
+    pub const REVOCATION_ENABLED: &str = "REVOCATION_ENABLED";
+    pub const REVOCATION_ANCHOR_PATH: &str = "REVOCATION_ANCHOR_PATH";
+    pub const REVOCATION_MAX_STALENESS_SECS: &str = "REVOCATION_MAX_STALENESS_SECS";
+    pub const REVOCATION_REFRESH_SECS: &str = "REVOCATION_REFRESH_SECS";
 }
 
 /// A resolved configuration plus anything the operator should be told about how
@@ -367,6 +373,7 @@ impl<'a> Resolver<'a> {
                     )
                     .unwrap_or_else(|| DEFAULT_CA_NODE_TYPE.to_string()),
             },
+            revocation: self.revocation(file.revocation.as_ref()),
         };
 
         // A coordinate pair is only useful if it parses, and a typo in a config
@@ -377,6 +384,45 @@ impl<'a> Resolver<'a> {
         }
 
         config
+    }
+
+    /// `[revocation]`.
+    ///
+    /// No CLI flags, like `[ca]`: which CA a node believes and whether it checks
+    /// revocation at all are properties of the deployment, not of one invocation,
+    /// and a `--revocation-enabled` flag would let a node start in a mode nobody
+    /// configured the anchor for.
+    fn revocation(&mut self, section: Option<&RevocationSection>) -> RevocationConfig {
+        let defaults = RevocationConfig::default();
+
+        RevocationConfig {
+            enabled: self
+                .boolean(
+                    None,
+                    section.and_then(|r| r.enabled),
+                    env_keys::REVOCATION_ENABLED,
+                )
+                .unwrap_or(defaults.enabled),
+            anchor_path: self.text(
+                None,
+                section.and_then(|r| r.anchor_path.clone()),
+                env_keys::REVOCATION_ANCHOR_PATH,
+            ),
+            max_staleness_secs: self
+                .number(
+                    None,
+                    section.and_then(|r| r.max_staleness_secs),
+                    env_keys::REVOCATION_MAX_STALENESS_SECS,
+                )
+                .unwrap_or(defaults.max_staleness_secs),
+            refresh_secs: self
+                .number(
+                    None,
+                    section.and_then(|r| r.refresh_secs),
+                    env_keys::REVOCATION_REFRESH_SECS,
+                )
+                .unwrap_or(defaults.refresh_secs),
+        }
     }
 
     /// `[location]`, folding in the deprecated `[bluetooth].fixed_location`.
@@ -617,6 +663,76 @@ mod tests {
         assert_eq!(config.ca.key_path, DEFAULT_CA_KEY_PATH);
         assert!(config.node.id.is_none());
         assert!(config.node.owns_cells.is_empty());
+
+        // Revocation is off until an operator asks for it, and the two intervals
+        // have a default even then — a node that never reads a list should still
+        // say what it would have done with one.
+        assert!(!config.revocation.enabled);
+        assert_eq!(config.revocation.anchor_path, None);
+        assert_eq!(
+            config.revocation.max_staleness_secs,
+            DEFAULT_REVOCATION_MAX_STALENESS_SECS
+        );
+        assert_eq!(
+            config.revocation.refresh_secs,
+            DEFAULT_REVOCATION_REFRESH_SECS
+        );
+    }
+
+    /// The whole section from the file, which is how an operator actually sets it:
+    /// an anchor path with no way to name it is not a usable configuration.
+    #[test]
+    fn the_revocation_section_is_read_from_the_file() {
+        let config = resolved(
+            &Flags::default(),
+            "[revocation]\nenabled = true\nanchor_path = \"/etc/btmon/ca.pub.pem\"\nmax_staleness_secs = 600\nrefresh_secs = 30\n",
+            &[],
+        )
+        .unwrap()
+        .config;
+
+        assert!(config.revocation.enabled);
+        assert_eq!(
+            config.revocation.anchor_path.as_deref(),
+            Some("/etc/btmon/ca.pub.pem")
+        );
+        assert_eq!(config.revocation.max_staleness_secs, 600);
+        assert_eq!(config.revocation.refresh_secs, 30);
+    }
+
+    #[test]
+    fn revocation_can_be_turned_on_by_the_environment_alone() {
+        let config = resolved(
+            &Flags::default(),
+            "",
+            &[
+                ("REVOCATION_ENABLED", "true"),
+                ("REVOCATION_ANCHOR_PATH", "/etc/btmon/ca.pub.pem"),
+            ],
+        )
+        .unwrap()
+        .config;
+
+        assert!(config.revocation.enabled);
+        assert_eq!(
+            config.revocation.anchor_path.as_deref(),
+            Some("/etc/btmon/ca.pub.pem")
+        );
+    }
+
+    /// A setting a deployment depends on must not be overridable by whatever is in
+    /// the shell of whoever restarted the service.
+    #[test]
+    fn the_file_revocation_settings_beat_the_environment() {
+        let config = resolved(
+            &Flags::default(),
+            "[revocation]\nenabled = false\n",
+            &[("REVOCATION_ENABLED", "true")],
+        )
+        .unwrap()
+        .config;
+
+        assert!(!config.revocation.enabled, "the file stated false");
     }
 
     #[test]
@@ -985,13 +1101,13 @@ mod tests {
     fn the_ca_section_fills_what_a_subcommand_would_otherwise_default() {
         let config = resolved(
             &Flags::default(),
-            "[ca]\nkey_path = \"/etc/btmon/root.hex\"\nvalidity_days = 30\nnode_type = \"aggregator\"\n",
+            "[ca]\nkey_path = \"/etc/btmon/root.pem\"\nvalidity_days = 30\nnode_type = \"aggregator\"\n",
             &[],
         )
         .unwrap()
         .config;
 
-        assert_eq!(config.ca.key_path, "/etc/btmon/root.hex");
+        assert_eq!(config.ca.key_path, "/etc/btmon/root.pem");
         assert_eq!(config.ca.validity_days, 30);
         assert_eq!(config.ca.node_type, "aggregator");
     }

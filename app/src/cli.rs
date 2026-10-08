@@ -10,7 +10,6 @@ use clap::{Parser, Subcommand};
 use log::debug;
 use repo::models::NodeType;
 use repo::{CellIndex, NodeRepository, Resolution, SignalType};
-use sha2::Digest;
 use sqlx::postgres::PgPoolOptions;
 use std::path::PathBuf;
 
@@ -145,9 +144,17 @@ pub enum CaCommands {
     /// Occurrences reference `nodes(node_id)`, so a node cannot store anything
     /// until it is enrolled.
     CaEnroll {
-        /// Node's Ed25519 public key (hex-encoded, 32 bytes)
+        /// Node's Ed25519 signing key, hex-encoded (32 bytes)
+        ///
+        /// Kept for scripts. A node writes its key as `node_identity.pub.pem`, and
+        /// `--public-key-file` reads that file instead of asking an operator to copy
+        /// 64 characters out of it by hand.
+        #[arg(long, conflicts_with = "public_key_file")]
+        public_key: Option<String>,
+
+        /// Node's signing key as an SPKI PEM file (`node_identity.pub.pem`)
         #[arg(long)]
-        public_key: String,
+        public_key_file: Option<String>,
 
         /// Node's display name (optional, for logging)
         #[arg(long)]
@@ -206,16 +213,24 @@ pub enum CaCommands {
     },
 
     /// Revoke a node's credentials
+    ///
+    /// Records the revocation in `node_revocations` and marks the registry row
+    /// revoked. It publishes nothing: other nodes see the revocation when the CA
+    /// publishes a signed list with `ca ca-generate-rsl`, which is also when the
+    /// ledger row becomes attributable to that CA. No root key is read here —
+    /// holding it is what publication proves, and this command stores a revocation
+    /// that is not yet signed by anyone.
     CaRevoke {
         /// Node ID to revoke (hex-encoded, 32 bytes)
         #[arg(long)]
         node_id: String,
 
-        /// Path to CA root key (default: `[ca].key_path`)
-        #[arg(long)]
-        key_path: Option<String>,
+        /// Why: unspecified, key-compromise, ca-compromise, ceased-operation,
+        /// policy-violation, superseded, hold
+        #[arg(long, default_value = "unspecified")]
+        reason: String,
 
-        /// Database URL for storing revocation status
+        /// Database URL holding the nodes registry
         #[arg(long)]
         database_url: Option<String>,
     },
@@ -245,15 +260,49 @@ pub enum CaCommands {
         #[arg(long, default_value = "1")]
         validity_days: u64,
     },
+
+    /// Publish this CA's trust anchor: the public key other nodes verify with
+    ///
+    /// Writes a SubjectPublicKeyInfo PEM document (`-----BEGIN PUBLIC KEY-----`),
+    /// which is the half meant to leave this machine. Distribute it to every node
+    /// that has to check this CA's revocation lists and credentials; it verifies and
+    /// never signs, so copying it costs nothing in secrecy.
+    CaExportAnchor {
+        /// Path to CA root key (default: `[ca].key_path`)
+        #[arg(long)]
+        key_path: Option<String>,
+
+        /// Where to write the anchor (default: the root key's path with a
+        /// `.pub.pem` extension)
+        #[arg(long)]
+        output: Option<String>,
+    },
+
+    /// Convert a pre-PKCS#8 hex root key file into a PKCS#8 PEM key file
+    ///
+    /// Root keys were hex until PKCS#8 arrived. The conversion preserves the CA's
+    /// identity — the id is derived from the public half — so credentials and lists
+    /// this CA already published keep verifying afterwards.
+    CaMigrateKey {
+        /// The legacy key file (64 hex characters, no PEM envelope)
+        #[arg(long)]
+        from: String,
+
+        /// Where to write the PEM (default: `--from` with a `.pem` extension)
+        #[arg(long)]
+        output: Option<String>,
+    },
 }
 
 /// Resolved arguments for `ca enroll`.
 ///
 /// Bundled rather than passed positionally because most fields are the same
 /// type, and swapping `key_path` with `database_url` would fail in a confusing
-/// way.
+/// way — as would swapping `public_key` with `public_key_file`, both of which are
+/// `Option<&str>` and one of which is a key and the other a filename.
 struct EnrollRequest<'a> {
-    public_key: &'a str,
+    public_key: Option<&'a str>,
+    public_key_file: Option<&'a str>,
     display_name: Option<&'a str>,
     validity_days: Option<u64>,
     key_path: Option<&'a str>,
@@ -841,6 +890,7 @@ impl Cli {
             CaCommands::CaInit { key_path, force } => self.ca_init(key_path, force).await,
             CaCommands::CaEnroll {
                 public_key,
+                public_key_file,
                 display_name,
                 validity_days,
                 key_path,
@@ -852,7 +902,8 @@ impl Cli {
                 database_url,
             } => {
                 self.ca_enroll(EnrollRequest {
-                    public_key: &public_key,
+                    public_key: public_key.as_deref(),
+                    public_key_file: public_key_file.as_deref(),
                     display_name: display_name.as_deref(),
                     validity_days,
                     key_path: key_path.as_deref(),
@@ -872,9 +923,9 @@ impl Cli {
             } => self.ca_verify(node_id, key_path, credential_file).await,
             CaCommands::CaRevoke {
                 node_id,
-                key_path,
+                reason,
                 database_url,
-            } => self.ca_revoke(node_id, key_path, database_url).await,
+            } => self.ca_revoke(node_id, reason, database_url).await,
             CaCommands::CaInfo { key_path } => self.ca_info(key_path).await,
             CaCommands::CaGenerateRsl {
                 key_path,
@@ -885,6 +936,10 @@ impl Cli {
                 self.ca_generate_rsl(key_path, database_url, output, validity_days)
                     .await
             }
+            CaCommands::CaExportAnchor { key_path, output } => {
+                self.ca_export_anchor(key_path, output).await
+            }
+            CaCommands::CaMigrateKey { from, output } => self.ca_migrate_key(from, output).await,
         }
     }
 
@@ -921,6 +976,50 @@ impl Cli {
         Ok(())
     }
 
+    /// The node's signing key, from whichever of the two flags named it.
+    ///
+    /// The file form matches how the key actually exists: a node writes
+    /// `node_identity.pub.pem` and hands that over. Hex stays accepted because
+    /// enrollment scripts already pass it — what is not acceptable is a tool that
+    /// speaks *only* hex, which is how a key ends up retyped through a shell history.
+    fn enroll_signing_key(
+        public_key_hex: Option<&str>,
+        public_key_file: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
+        let key = match (public_key_hex, public_key_file) {
+            (Some(hex_form), None) => {
+                hex::decode(hex_form).map_err(|e| format!("Invalid --public-key hex: {e}"))?
+            }
+            (None, Some(path)) => {
+                let contents = std::fs::read_to_string(path)
+                    .map_err(|e| format!("Failed to read --public-key-file {path}: {e}"))?;
+                ca::pemkeys::read_public_key_pem(&contents, path)
+                    .map_err(|e| e.to_string())?
+                    .as_bytes()
+                    .to_vec()
+            }
+            (Some(_), Some(_)) => {
+                return Err("give one of --public-key or --public-key-file, not both".to_string())
+            }
+            (None, None) => {
+                return Err(
+                    "enrollment needs the node's signing key: --public-key <hex> or \
+                     --public-key-file <node_identity.pub.pem>"
+                        .to_string(),
+                )
+            }
+        };
+
+        if key.len() != 32 {
+            return Err(format!(
+                "Public key must be 32 bytes (Ed25519), got {}",
+                key.len()
+            ));
+        }
+
+        Ok(key)
+    }
+
     /// Enroll a node: issue a CA credential and write its `nodes` registry row.
     ///
     /// Both halves are required. `occurrences.origin_node_id` references
@@ -954,16 +1053,7 @@ impl Cli {
         let ca = ca::CaRoot::load_from_file(&key_path)
             .map_err(|e| format!("Failed to load CA root key: {}", e))?;
 
-        // Parse public key
-        let public_key =
-            hex::decode(req.public_key).map_err(|e| format!("Invalid public key hex: {}", e))?;
-
-        if public_key.len() != 32 {
-            return Err(format!(
-                "Public key must be 32 bytes (Ed25519), got {}",
-                public_key.len()
-            ));
-        }
+        let public_key = Self::enroll_signing_key(req.public_key, req.public_key_file)?;
 
         // Issue credential
         let credential = ca
@@ -1112,33 +1202,105 @@ impl Cli {
     }
 
     /// Revoke a node's credentials
+    ///
+    /// The revocation goes into `node_revocations`, which is the ledger
+    /// `ca ca-generate-rsl` reads when it builds a list, and the registry row is
+    /// marked revoked in the same transaction. Marking the registry alone used to be
+    /// the whole command, and it produced a CA that had "revoked" a node while
+    /// publishing lists that never named it: no node can act on a revocation that
+    /// exists only in a column the list builder does not read.
     async fn ca_revoke(
         &self,
         node_id_hex: String,
-        _key_path: Option<String>,
+        reason: String,
         database_url: Option<String>,
     ) -> Result<(), String> {
-        // Parse node ID
         let node_id = decode_node_id(&node_id_hex)?;
+        let reason_code = revocation_reason_code(&reason)?;
 
-        // For now, just update the database
         let db_url = self.database_for(database_url.as_deref())?;
 
         let pool = sqlx::Pool::<sqlx::Postgres>::connect(&db_url)
             .await
             .map_err(|e| format!("Failed to connect to database: {}", e))?;
 
-        // Update node status to revoked
-        repo::RevocationRepository::update_node_status(
+        // Revoking twice is not an error, and the second run must not quietly move the
+        // date either. What an operator asking again needs to know is that the first
+        // one happened, and whether anything has been told about it yet.
+        if let Some(existing) = repo::RevocationRepository::get_revocation(&pool, &node_id)
+            .await
+            .map_err(|e| format!("Failed to read the revocation ledger: {e}"))?
+        {
+            println!(
+                "Node {} was already revoked on {} ({}).",
+                hex::encode(&node_id),
+                existing.revoked_at,
+                existing.reason_description()
+            );
+            if existing.rsl_sequence_number == 0 {
+                println!(
+                    "No node can see it yet: it is in the ledger and in no published list. \
+                     Publish it with:\n  app ca ca-generate-rsl"
+                );
+            } else {
+                println!(
+                    "It has been published in list #{}, so nodes holding that list refuse this \
+                     node's data.",
+                    existing.rsl_sequence_number
+                );
+            }
+            return Ok(());
+        }
+
+        // The ledger row names the key and the credential being revoked, and the
+        // registry is where both live. A node that was never enrolled has nothing to
+        // revoke: no credential is invalidated, and publishing a revocation of a key no
+        // list ever carried is not a thing a node can do anything with.
+        let registered = NodeRepository::find_by_id(&pool, &node_id)
+            .await
+            .map_err(|e| format!("Failed to read the nodes registry: {e}"))?
+            .ok_or_else(|| {
+                format!(
+                    "{} has no row in the nodes table, so there is no credential to revoke. \
+                     Either this node was never enrolled, or the registry is in another \
+                     database — point --database-url at that one.",
+                    hex::encode(&node_id)
+                )
+            })?;
+
+        let recorded = repo::RevocationRepository::revoke_node(
             &pool,
-            &node_id,
-            repo::models::NodeStatus::Revoked,
+            &repo::models::RevokedNode {
+                node_id: node_id.clone(),
+                revoked_at: chrono::Utc::now(),
+                // NULL until a signed list carries it: there is no CA to attribute this
+                // to yet, and publication is the act that attributes it.
+                revoked_by: None,
+                reason: reason_code,
+                signing_public_key: registered.signing_public_key,
+                ca_credential: registered.ca_credential,
+                // 0 means "in no published list"; storing a list stamps the number of
+                // the one that first carries it.
+                rsl_sequence_number: 0,
+                notes: None,
+            },
         )
         .await
-        .map_err(|e| format!("Failed to revoke node: {e}"))?;
+        .map_err(|e| format!("Failed to record the revocation: {e}"))?;
 
-        println!("Node {} revoked", hex::encode(&node_id));
-        println!("Note: Existing credentials will still verify signature-wise, but should be rejected based on node status.");
+        println!(
+            "Node {} revoked ({}), and its registry row marked revoked.",
+            hex::encode(&node_id),
+            recorded.reason_description()
+        );
+        println!(
+            "That reaches nobody yet. A revocation only becomes visible to other nodes inside a \
+             signed list:\n  app ca ca-generate-rsl"
+        );
+        println!(
+            "The node's own signatures still verify — provenance is not authority. It is the \
+             list that makes them untrustworthy."
+        );
 
         Ok(())
     }
@@ -1160,10 +1322,141 @@ impl Cli {
         println!("=== CA Information ===");
         println!("Root key path: {}", key_path.display());
         println!("CA public key (hex): {}", hex::encode(ca.public_key()));
+        println!("CA id (SHA-256 of the public key): {}", ca.ca_id_hex());
         println!(
-            "CA node ID (SHA-256): {}",
-            hex::encode(sha2::Sha256::digest(ca.public_key()))
+            "To publish this CA's public key for other nodes: app ca ca-export-anchor \
+             (writes the anchor as a .pub.pem beside the root key)"
         );
+
+        Ok(())
+    }
+
+    /// Publish this CA's trust anchor beside its root key.
+    ///
+    /// The anchor is the CA public key in SubjectPublicKeyInfo PEM — everything a
+    /// remote node needs to check this CA's credentials and revocation lists, and
+    /// nothing it can forge with. This is the publishing half of M12: until an anchor
+    /// exists, a node has no key to verify an RSL against and revocation cannot be
+    /// turned on at all (B11).
+    async fn ca_export_anchor(
+        &self,
+        key_path: Option<String>,
+        output: Option<String>,
+    ) -> Result<(), String> {
+        let key_path = self.ca_key_path(key_path.as_deref());
+
+        if !key_path.exists() {
+            return Err(format!(
+                "CA root key not found at {}. Run 'app ca ca-init' first.",
+                key_path.display()
+            ));
+        }
+
+        let ca = ca::CaRoot::load_from_file(&key_path)
+            .map_err(|e| format!("Failed to load CA root key: {}", e))?;
+        let anchor = ca.trust_anchor();
+
+        let output = output
+            .map(PathBuf::from)
+            .unwrap_or_else(|| key_path.with_extension("pub.pem"));
+
+        // An anchor file that names a different CA is not a thing to overwrite: every
+        // node configured with it would stop accepting this CA's lists the moment the
+        // file changed under them, and the operator would hear about it as a wave of
+        // verification failures rather than from this command.
+        if output.exists() {
+            return match ca::TrustAnchor::load_from_file(&output) {
+                Ok(existing) if existing == anchor => {
+                    println!(
+                        "Trust anchor at {} is already up to date (CA id {})",
+                        output.display(),
+                        anchor.ca_id_hex()
+                    );
+                    Ok(())
+                }
+                Ok(existing) => Err(format!(
+                    "{} is a trust anchor for {}, not this CA ({}). Refusing to overwrite it; \
+                     pass --output to publish this CA's anchor elsewhere.",
+                    output.display(),
+                    existing.ca_id_hex(),
+                    anchor.ca_id_hex()
+                )),
+                Err(e) => Err(format!(
+                    "{} exists and is not a readable trust anchor: {e}",
+                    output.display()
+                )),
+            };
+        }
+
+        anchor
+            .save_to_file(&output)
+            .map_err(|e| format!("Failed to write trust anchor: {}", e))?;
+
+        println!("=== Trust anchor published ===");
+        println!("CA id: {}", anchor.ca_id_hex());
+        println!(
+            "Wrote: {} (world-readable: this is public material)",
+            output.display()
+        );
+        println!("Give this file to every node that has to check this CA. It verifies and");
+        println!("never signs, so copying it costs nothing in secrecy.");
+
+        Ok(())
+    }
+
+    /// Convert a pre-PKCS#8 hex root key into a PKCS#8 PEM key file.
+    ///
+    /// The CA identity survives, because `ca_id` is derived from the public half:
+    /// credentials and revocation lists published before the conversion still verify
+    /// after it. That is what makes this a conversion rather than a re-enrollment of
+    /// every node on the network.
+    ///
+    /// It does not delete the legacy file and does not touch the configuration. Two
+    /// copies of a CA secret on one machine is exactly the state to avoid, but which
+    /// copy is safe to remove depends on what the running node has loaded, and this
+    /// command cannot know that.
+    async fn ca_migrate_key(&self, from: String, output: Option<String>) -> Result<(), String> {
+        let from = PathBuf::from(&from);
+
+        // Already converted is a different problem from convertible, and needs a
+        // different answer.
+        if ca::CaRoot::load_from_file(&from).is_ok() {
+            return Err(format!(
+                "{} is already a PKCS#8 PEM key; there is nothing to convert. If the node \
+                 will not start, check that [ca].key_path points at it.",
+                from.display()
+            ));
+        }
+
+        let ca = ca::CaRoot::load_legacy_hex_file(&from)
+            .map_err(|e| format!("Failed to read the legacy root key: {}", e))?;
+
+        let output = output
+            .map(PathBuf::from)
+            .unwrap_or_else(|| from.with_extension("pem"));
+
+        if output.exists() {
+            return Err(format!(
+                "{} already exists; not overwriting it with a second copy of the key. Pass \
+                 --output to choose another path.",
+                output.display()
+            ));
+        }
+
+        ca.save_to_file(&output, Some(0o600))
+            .map_err(|e| format!("Failed to write the converted key: {}", e))?;
+
+        println!("=== CA root key converted ===");
+        println!("From:  {}", from.display());
+        println!("To:    {} (PKCS#8 PEM, mode 0600)", output.display());
+        println!("CA id: {} — unchanged by the conversion", ca.ca_id_hex());
+        println!();
+        println!(
+            "Next: point [ca].key_path at {}, then delete {} once the node has started.",
+            output.display(),
+            from.display()
+        );
+        println!("Credentials and lists this CA published before the conversion still verify.");
 
         Ok(())
     }
@@ -1230,7 +1523,7 @@ impl Cli {
             .map_err(|e| format!("Failed to store RSL: {}", e))?;
 
         println!("=== RSL Generated ===");
-        println!("Issuer: {}", rsl.issuer_id);
+        println!("Issuer: {}", hex::encode(&rsl.issuer_id));
         println!("Sequence: {}", rsl.sequence_number);
         println!("Revocations: {}", rsl.revocation_count());
         println!("Issued: {}", rsl.issued_at);
@@ -1294,6 +1587,31 @@ fn decode_node_id(raw: &str) -> Result<Vec<u8>, String> {
     }
 
     Ok(node_id)
+}
+
+/// `--reason` as the ledger's integer code, 0-6 per the RFC 5280 adaptation the
+/// schema documents.
+///
+/// Names rather than numbers because the reason lands in a record other people read
+/// years later, and `4` typed at a terminal is not a considered choice between
+/// policy violation and hold. Hyphens, underscores and case are all accepted; the
+/// number is not, for the same reason.
+fn revocation_reason_code(raw: &str) -> Result<i32, String> {
+    let normalised = raw.trim().replace(['-', ' '], "_").to_lowercase();
+
+    match normalised.as_str() {
+        "unspecified" => Ok(0),
+        "key_compromise" => Ok(1),
+        "ca_compromise" => Ok(2),
+        "ceased_operation" => Ok(3),
+        "policy_violation" => Ok(4),
+        "superseded" => Ok(5),
+        "hold" => Ok(6),
+        other => Err(format!(
+            "unknown revocation reason '{other}'; expected one of: unspecified, key-compromise, \
+             ca-compromise, ceased-operation, policy-violation, superseded, hold"
+        )),
+    }
 }
 
 /// Parse a `--node-type` value into the registry enum.
@@ -1426,6 +1744,68 @@ mod tests {
     fn parse_node_type_rejects_unknown_types() {
         let err = parse_node_type("supernode").unwrap_err();
         assert!(err.contains("supernode"), "unexpected message: {}", err);
+    }
+
+    #[test]
+    fn revocation_reasons_are_named_not_typed() {
+        assert_eq!(revocation_reason_code("unspecified").unwrap(), 0);
+        assert_eq!(revocation_reason_code("key-compromise").unwrap(), 1);
+        assert_eq!(revocation_reason_code("  Policy_Violation ").unwrap(), 4);
+        assert_eq!(revocation_reason_code("HOLD").unwrap(), 6);
+
+        // The reason is stored in a record somebody reads years later, so a bare
+        // number is refused rather than guessed at — and the refusal lists what it
+        // will take, in the same spelling the help uses.
+        let err = revocation_reason_code("4").unwrap_err();
+        assert!(err.contains("key-compromise"), "{err}");
+        assert!(revocation_reason_code("superseded yesterday").is_err());
+    }
+
+    #[test]
+    fn revocation_takes_a_reason_and_no_root_key() {
+        let revoke = |argv: &[&str]| match parse(argv).command {
+            Some(Commands::Ca(CaCommands::CaRevoke {
+                node_id, reason, ..
+            })) => (node_id, reason),
+            other => panic!("expected ca revoke, got {other:?}"),
+        };
+
+        let id = "ab".repeat(32);
+
+        let (_, reason) = revoke(&["app", "ca", "ca-revoke", "--node-id", &id]);
+        assert_eq!(
+            reason, "unspecified",
+            "the command must not invent a reason the operator did not give"
+        );
+
+        let (node_id, reason) = revoke(&[
+            "app",
+            "ca",
+            "ca-revoke",
+            "--node-id",
+            &id,
+            "--reason",
+            "key-compromise",
+        ]);
+        assert_eq!(node_id, id);
+        assert_eq!(reason, "key-compromise");
+
+        // The root key belongs to publication, not to recording. Carrying a `--key-path`
+        // nobody read is how `ca-revoke` could report success while publishing nothing
+        // attributable, so it is now an error rather than an ignored flag.
+        assert!(
+            Args::try_parse_from([
+                "app",
+                "ca",
+                "ca-revoke",
+                "--node-id",
+                &id,
+                "--key-path",
+                "/tmp/root_key.pem"
+            ])
+            .is_err(),
+            "--key-path no longer means anything here"
+        );
     }
 
     #[test]
@@ -1608,18 +1988,49 @@ mod tests {
         match args.command() {
             Commands::Ca(CaCommands::CaEnroll {
                 public_key,
+                public_key_file,
                 validity_days,
                 node_type,
                 key_path,
                 ..
             }) => {
-                assert_eq!(public_key, "abcd");
+                assert_eq!(public_key.as_deref(), Some("abcd"));
+                assert!(public_key_file.is_none());
                 assert_eq!(validity_days, None);
                 assert_eq!(node_type, None);
                 assert_eq!(key_path, None);
             }
             other => panic!("expected ca enroll, got {other:?}"),
         }
+    }
+
+    /// A node writes its key as `node_identity.pub.pem`; that file, not a copy of its
+    /// contents pasted into a terminal, is how it should reach the CA.
+    #[test]
+    fn enrollment_reads_the_node_key_from_a_file_or_from_hex() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let path = dir.path().join("node_identity.pub.pem");
+        std::fs::write(
+            &path,
+            ca::pemkeys::write_public_key_pem(&key.verifying_key()),
+        )
+        .unwrap();
+
+        let from_file = Cli::enroll_signing_key(None, Some(path.to_str().unwrap())).unwrap();
+        assert_eq!(from_file, key.verifying_key().as_bytes().to_vec());
+
+        let from_hex =
+            Cli::enroll_signing_key(Some(&hex::encode(from_file.clone())), None).unwrap();
+        assert_eq!(from_hex, from_file);
+
+        // Two answers is a contradiction, not a tiebreak; no answer is an enrollment
+        // that would otherwise issue a credential for a key nobody named.
+        assert!(Cli::enroll_signing_key(Some("ab"), Some(path.to_str().unwrap())).is_err());
+        assert!(Cli::enroll_signing_key(None, None).is_err());
+        // A short hex string parses, so the length check has to be the one that says
+        // no — the same is not true of the PEM form, which cannot be short.
+        assert!(Cli::enroll_signing_key(Some("abcd"), None).is_err());
     }
 
     #[test]
@@ -1807,5 +2218,70 @@ mod tests {
             message.contains(LIBERTY_MACRO),
             "should suggest the res 6 parent: {message}"
         );
+    }
+
+    #[test]
+    fn an_anchor_export_states_no_paths_unless_it_is_told_both() {
+        // The default output is the root key's path with a `.pub.pem` extension, which
+        // only makes sense once `[ca].key_path` has been resolved — so clap must not
+        // fill it in, or it would outrank the config file the same way any
+        // `default_value` would.
+        match parse(&["app", "ca", "ca-export-anchor"]).command() {
+            Commands::Ca(CaCommands::CaExportAnchor { key_path, output }) => {
+                assert!(key_path.is_none(), "got: {key_path:?}");
+                assert!(output.is_none(), "got: {output:?}");
+            }
+            other => panic!("expected ca export-anchor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_anchor_export_takes_both_paths_when_given() {
+        match parse(&[
+            "app",
+            "ca",
+            "ca-export-anchor",
+            "--key-path",
+            "/etc/btmon/root_key.pem",
+            "--output",
+            "/srv/www/ca.pub.pem",
+        ])
+        .command()
+        {
+            Commands::Ca(CaCommands::CaExportAnchor { key_path, output }) => {
+                assert_eq!(key_path.as_deref(), Some("/etc/btmon/root_key.pem"));
+                assert_eq!(output.as_deref(), Some("/srv/www/ca.pub.pem"));
+            }
+            other => panic!("expected ca export-anchor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_key_conversion_names_the_file_it_converts_and_nothing_else() {
+        let error = Args::try_parse_from(["app", "ca", "ca-migrate-key"])
+            .expect_err("converting without saying what to convert is nothing to do");
+        assert!(
+            error.to_string().contains("--from"),
+            "should name the missing flag: {error}"
+        );
+
+        match parse(&[
+            "app",
+            "ca",
+            "ca-migrate-key",
+            "--from",
+            "/var/lib/ca/root_key.hex",
+        ])
+        .command()
+        {
+            Commands::Ca(CaCommands::CaMigrateKey { from, output }) => {
+                assert_eq!(from, "/var/lib/ca/root_key.hex");
+                assert!(
+                    output.is_none(),
+                    "the .pem beside the input is decided after the config is resolved"
+                );
+            }
+            other => panic!("expected ca migrate-key, got {other:?}"),
+        }
     }
 }

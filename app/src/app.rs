@@ -95,9 +95,18 @@ impl App {
             // by FullNode::new against the identity it loads. Already validated
             // above, so this only parses what validate_monitor accepted.
             expected_node_id: config.expected_node_id().map_err(AppError::Config)?,
+            // Presence is trusted for a multiple of the sampling window rather
+            // than set here: the window is the operator's knob, and how long a
+            // device is worth re-observing is a function of it. See
+            // `FullNodeConfig::presence_timeout_ms`.
+            presence_timeout_ms: None,
+            clock: None,
             #[cfg(feature = "mock")]
             use_mock_backend: config.bluetooth.use_mock_backend,
-            enable_revocation_checking: false, // Disabled by default
+            // `[revocation]` as resolved from flag/file/env. Enabled means the node
+            // must reach a current, verified list from its CA: FullNode::new fails
+            // startup rather than run a node that cannot attest to what it stores.
+            revocation: config.revocation.clone(),
         };
 
         // Which radio to open, and how often to re-arm the scan once it is open.

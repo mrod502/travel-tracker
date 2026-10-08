@@ -29,6 +29,9 @@ pub struct ConfigFile {
     pub location: Option<LocationSection>,
     /// Certificate authority settings, used by the `ca` subcommands.
     pub ca: Option<CaSection>,
+    /// Revocation checking, used by the node when it stores or forwards data.
+    #[serde(default)]
+    pub revocation: Option<RevocationSection>,
 }
 
 /// `[database]`
@@ -119,6 +122,17 @@ pub struct CaSection {
     pub node_type: Option<String>,
 }
 
+/// `[revocation]`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RevocationSection {
+    pub enabled: Option<bool>,
+    /// Trust anchor: the CA's public key as SPKI PEM.
+    pub anchor_path: Option<String>,
+    pub max_staleness_secs: Option<u64>,
+    pub refresh_secs: Option<u64>,
+}
+
 impl ConfigFile {
     /// Parse TOML content.
     pub fn parse(contents: &str) -> Result<Self, String> {
@@ -169,7 +183,7 @@ backend = "gpsd"
 port = 2948
 
 [ca]
-key_path = "/etc/btmon/root_key.hex"
+key_path = "/etc/btmon/root_key.pem"
 validity_days = 90
 node_type = "aggregator"
 "#,
@@ -189,7 +203,7 @@ node_type = "aggregator"
         );
 
         let ca = file.ca.unwrap();
-        assert_eq!(ca.key_path.as_deref(), Some("/etc/btmon/root_key.hex"));
+        assert_eq!(ca.key_path.as_deref(), Some("/etc/btmon/root_key.pem"));
         assert_eq!(ca.validity_days, Some(90));
         assert_eq!(ca.node_type.as_deref(), Some("aggregator"));
     }
@@ -248,5 +262,17 @@ node_type = "aggregator"
         assert_eq!(location.mode, Some(PositionMode::Auto));
         assert!(location.gps.is_some(), "the example shows a receiver");
         assert!(file.ca.expect("the example shows [ca]").key_path.is_some());
+
+        // `[revocation]` rejects unknown keys as well, so a key renamed here while
+        // the example still shows the old name means every operator who copied it
+        // gets a parse error at startup.
+        let revocation = file.revocation.expect("the example shows [revocation]");
+        assert_eq!(revocation.enabled, Some(false));
+        assert!(revocation
+            .anchor_path
+            .expect("the example names an anchor path")
+            .ends_with(".pub.pem"));
+        assert_eq!(revocation.max_staleness_secs, Some(86_400));
+        assert_eq!(revocation.refresh_secs, Some(900));
     }
 }

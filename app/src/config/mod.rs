@@ -58,9 +58,21 @@ pub const DEFAULT_PG_PORT: u16 = 5432;
 pub const DEFAULT_SCAN_INTERVAL_MS: u64 = 1_000;
 pub const DEFAULT_RATE_LIMIT_MS: u64 = 15_000;
 pub const DEFAULT_STREAM_REOPEN_DELAY_MS: u64 = 1_000;
-pub const DEFAULT_CA_KEY_PATH: &str = "/var/lib/btmon/ca/root_key.hex";
+pub const DEFAULT_CA_KEY_PATH: &str = "/var/lib/btmon/ca/root_key.pem";
 pub const DEFAULT_CA_VALIDITY_DAYS: u64 = 90;
 pub const DEFAULT_CA_NODE_TYPE: &str = "full";
+
+/// How old the CA's published revocation list may be before this node stops
+/// trusting what is *not* in it (one day).
+pub const DEFAULT_REVOCATION_MAX_STALENESS_SECS: u64 = 24 * 60 * 60;
+
+/// How often a running node re-reads the published list (fifteen minutes).
+///
+/// The list's own validity window is measured in days, so re-reading more often
+/// than this buys nothing but database queries; re-reading far less often means a
+/// revocation takes an unexpectedly long time to reach a node that is already
+/// running.
+pub const DEFAULT_REVOCATION_REFRESH_SECS: u64 = 15 * 60;
 
 /// Configuration as the application reads it: every layer already collapsed.
 ///
@@ -79,6 +91,8 @@ pub struct AppConfig {
     pub location: crate::position::PositionConfig,
     /// Defaults for the `ca` subcommands.
     pub ca: CaConfig,
+    /// Whether this node consults a CA's revocation list, and which CA it believes.
+    pub revocation: RevocationConfig,
 }
 
 /// `[database]`: either a DSN or the pieces to build one.
@@ -154,6 +168,43 @@ pub struct CaConfig {
     pub node_type: String,
 }
 
+/// `[revocation]`: whether this node consults a CA's revocation list at all.
+///
+/// Off by default, and that default is a decision rather than a placeholder. A
+/// node that turns this on stops recording occurrences the moment it can no
+/// longer prove the CA's list is current — which is the point of revocation, and
+/// also what it feels like the first time a CA is offline for maintenance. An
+/// operator should opt into that trade knowingly, and `[revocation]` is where
+/// they say so.
+///
+/// Enabling it makes the node useless without the other two settings, so
+/// [`validate_monitor`](Self::validate_monitor) refuses the combination at
+/// startup rather than letting it run and quietly store nothing.
+#[derive(Debug, Clone)]
+pub struct RevocationConfig {
+    pub enabled: bool,
+    /// The CA whose lists this node believes, as an SPKI PEM file — the file
+    /// `ca ca-export-anchor` writes. Required when `enabled`: a list with no key
+    /// to check it against is a document anybody could have written.
+    pub anchor_path: Option<String>,
+    /// How old the CA's list may be before this node stops treating a node's
+    /// absence from it as "not revoked".
+    pub max_staleness_secs: u64,
+    /// How often a running node re-reads the published list.
+    pub refresh_secs: u64,
+}
+
+impl Default for RevocationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            anchor_path: None,
+            max_staleness_secs: DEFAULT_REVOCATION_MAX_STALENESS_SECS,
+            refresh_secs: DEFAULT_REVOCATION_REFRESH_SECS,
+        }
+    }
+}
+
 impl AppConfig {
     /// Check what a monitoring session needs: a usable identity assertion, a
     /// reachable-looking database, sane intervals, and a position setup that can
@@ -182,6 +233,47 @@ impl AppConfig {
         // silently storing NULL locations forever.
         self.position_source()
             .map_err(|e| format!("invalid location configuration: {e}"))?;
+
+        self.validate_revocation()?;
+
+        Ok(())
+    }
+
+    /// Check `[revocation]` says something a node can act on.
+    ///
+    /// Only the shape is checkable here — whether the anchor file exists and holds
+    /// a key, and whether its CA has published anything, needs the database, and
+    /// belongs to the node's startup.
+    pub fn validate_revocation(&self) -> Result<(), String> {
+        if !self.revocation.enabled {
+            return Ok(());
+        }
+
+        match self.revocation.anchor_path.as_deref().map(str::trim) {
+            None | Some("") => {
+                return Err("[revocation].enabled is set without a trust anchor: give \
+                     [revocation].anchor_path (or REVOCATION_ANCHOR_PATH) the SPKI PEM file \
+                     `ca ca-export-anchor` writes. A revocation list with no key to check it \
+                     against is a document anybody could have written, so there is nothing this \
+                     node could believe."
+                    .to_string());
+            }
+            Some(_) => {}
+        }
+
+        if self.revocation.max_staleness_secs == 0 {
+            return Err(
+                "[revocation].max_staleness_secs must be greater than 0 — a bound of zero makes \
+                 every list stale the moment it is read, and the node would record nothing."
+                    .to_string(),
+            );
+        }
+
+        // The refresh loop re-arms after this delay, so 0 would spin against the
+        // database.
+        if self.revocation.refresh_secs == 0 {
+            return Err("[revocation].refresh_secs must be greater than 0".to_string());
+        }
 
         Ok(())
     }
@@ -557,12 +649,67 @@ mod tests {
                 validity_days: DEFAULT_CA_VALIDITY_DAYS,
                 node_type: DEFAULT_CA_NODE_TYPE.to_string(),
             },
+            revocation: RevocationConfig::default(),
         }
     }
 
     #[test]
     fn a_plain_configuration_passes_monitor_validation() {
         assert_eq!(config().validate_monitor(), Ok(()));
+    }
+
+    /// Revocation switched on with nothing to check a list against is not a node
+    /// with looser rules — it is a node that will never record anything, because
+    /// every status is unknown and the policies refuse to guess. That is worth a
+    /// startup error rather than a week of an empty database.
+    #[test]
+    fn revocation_without_a_trust_anchor_is_a_startup_error() {
+        let mut config = config();
+        config.revocation.enabled = true;
+
+        let error = config
+            .validate_monitor()
+            .expect_err("no anchor was configured");
+        assert!(error.contains("anchor_path"), "{error}");
+
+        config.revocation.anchor_path = Some("/etc/btmon/ca.pub.pem".to_string());
+        assert_eq!(config.validate_monitor(), Ok(()));
+    }
+
+    #[test]
+    fn intervals_that_would_make_revocation_checking_absurd_are_refused() {
+        let mut config = config();
+        config.revocation = RevocationConfig {
+            enabled: true,
+            anchor_path: Some("/etc/btmon/ca.pub.pem".to_string()),
+            max_staleness_secs: 0,
+            refresh_secs: 60,
+        };
+
+        let error = config
+            .validate_revocation()
+            .expect_err("a zero bound means every list is stale on arrival");
+        assert!(error.contains("max_staleness_secs"), "{error}");
+
+        config.revocation.max_staleness_secs = 3600;
+        config.revocation.refresh_secs = 0;
+        let error = config
+            .validate_revocation()
+            .expect_err("a zero refresh delay would spin against the database");
+        assert!(error.contains("refresh_secs"), "{error}");
+    }
+
+    #[test]
+    fn revocation_settings_are_not_checked_while_switched_off() {
+        let mut config = config();
+        config.revocation = RevocationConfig {
+            enabled: false,
+            anchor_path: None,
+            max_staleness_secs: 0,
+            refresh_secs: 0,
+        };
+
+        assert_eq!(config.validate_revocation(), Ok(()));
     }
 
     #[test]

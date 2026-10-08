@@ -80,7 +80,9 @@ pub use monitor::{DeviceMonitor, GattClient};
 // `UpdateField` re-exports from the events module rather than `types`: it is a
 // property of an event, and it used to live in `types` as a second, distinct
 // enum of the same name.
-pub use monitor::events::{changed_device_fields, report_event, DeviceEvent, NotificationEvent, UpdateField};
+pub use monitor::events::{
+    changed_device_fields, report_event, DeviceEvent, NotificationEvent, UpdateField,
+};
 
 // Backend implementations
 //

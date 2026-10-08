@@ -168,6 +168,7 @@ pub type NotificationStream =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ServiceUuid;
 
     #[test]
     fn test_device_event_added() {
@@ -235,5 +236,209 @@ mod tests {
 
         assert_eq!(event.device_id, device_id);
         assert_eq!(event.notification.as_slice(), &[1, 2, 3]);
+    }
+
+    fn beacon() -> BluetoothDevice {
+        BluetoothDevice::new(
+            DeviceId::new("AA:BB:CC:DD:EE:FF"),
+            "AA:BB:CC:DD:EE:FF".to_string(),
+        )
+        .with_name("Stationary Beacon")
+        .with_rssi(-70)
+        .with_manufacturer_data(0x004C, vec![0x01, 0x02])
+    }
+
+    #[test]
+    fn a_report_where_nothing_moved_is_still_a_sighting() {
+        // The defect this pins: a repeat report of an unchanged device used to
+        // produce no event at all, and "no event" is indistinguishable from "the
+        // device left". A stationary beacon therefore yielded one sighting and
+        // then silence.
+        let old = beacon();
+        let reported = beacon();
+
+        assert_eq!(changed_device_fields(&old, &reported), Vec::new());
+        assert_eq!(
+            report_event(&old, reported.clone()),
+            DeviceEvent::Advertisement { device: reported }
+        );
+    }
+
+    #[test]
+    fn every_tracked_field_moves_a_report_on_its_own() {
+        // Each variant of `UpdateField` must be reachable from exactly the one
+        // datum that owns it, or a consumer cannot tell what the radio changed.
+        type FieldCase = (
+            &'static str,
+            UpdateField,
+            fn(BluetoothDevice) -> BluetoothDevice,
+        );
+
+        let cases: Vec<FieldCase> = vec![
+            ("name", UpdateField::Name, |d| d.with_name("Renamed")),
+            ("rssi", UpdateField::Rssi, |d| d.with_rssi(-51)),
+            (
+                "services_resolved",
+                UpdateField::ServicesResolved,
+                |mut d| {
+                    d.services_resolved = true;
+                    d
+                },
+            ),
+            ("is_connected", UpdateField::Connected, |d| {
+                d.with_connected(true)
+            }),
+            ("manufacturer_data", UpdateField::ManufacturerData, |d| {
+                d.with_manufacturer_data(0x004C, vec![0x01, 0x02, 0x03])
+            }),
+            ("service_data", UpdateField::ServiceData, |d| {
+                d.with_service_data(
+                    ServiceUuid::parse_str("0000fd87-0000-1000-8000-00805f9b34fb")
+                        .expect("a service uuid"),
+                    vec![0xAA],
+                )
+            }),
+            ("raw_payload", UpdateField::RawPayload, |d| {
+                d.with_raw_payload([0x01, 0x09, 0xFF])
+            }),
+        ];
+
+        for (column, expected, change) in cases {
+            let reported = change(beacon());
+            assert_eq!(
+                changed_device_fields(&beacon(), &reported),
+                vec![expected],
+                "changing {column} should report exactly {expected:?}"
+            );
+            assert_eq!(
+                report_event(&beacon(), reported.clone()),
+                DeviceEvent::DeviceUpdated {
+                    device: reported,
+                    changed_fields: vec![expected],
+                },
+                "a lone {column} change should be an update naming it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_names_every_field_that_moved_in_one_packet() {
+        let uuid = ServiceUuid::parse_str("0000fd87-0000-1000-8000-00805f9b34fb").unwrap();
+        let reported = beacon()
+            .with_rssi(-44)
+            .with_manufacturer_data(0x004C, vec![0x09])
+            .with_service_data(uuid, vec![0x01]);
+
+        // The order is the function's declaration order, not the order the
+        // fields were touched: consumers may compare `changed_fields` directly.
+        assert_eq!(
+            changed_device_fields(&beacon(), &reported),
+            vec![
+                UpdateField::Rssi,
+                UpdateField::ManufacturerData,
+                UpdateField::ServiceData,
+            ]
+        );
+    }
+
+    #[test]
+    fn manufacturer_data_that_only_rearrives_is_not_a_change() {
+        let mut old = beacon();
+        old.manufacturer_data
+            .insert(0x00E0, vec![0x10, 0x11, 0x12, 0x13]);
+
+        // Same two companies, same bytes, inserted in the other order.
+        let mut reported = beacon();
+        reported
+            .manufacturer_data
+            .insert(0x00E0, vec![0x10, 0x11, 0x12, 0x13]);
+        reported.manufacturer_data.insert(0x004C, vec![0x01, 0x02]);
+
+        let expected = DeviceEvent::Advertisement {
+            device: reported.clone(),
+        };
+        assert_eq!(
+            report_event(&old, reported),
+            expected,
+            "the same advertisement re-arrived, which is presence, not news"
+        );
+    }
+
+    #[test]
+    fn a_manufacturer_that_stopped_advertising_is_a_change() {
+        let mut old = beacon();
+        old.manufacturer_data
+            .insert(0x00E0, vec![0x10, 0x11, 0x12, 0x13]);
+
+        // The report carries only the 0x004C structure: a company the previous
+        // advertisement had is gone, and that is a content change.
+        let reported = beacon();
+
+        assert_eq!(
+            changed_device_fields(&old, &reported),
+            vec![UpdateField::ManufacturerData]
+        );
+    }
+
+    #[test]
+    fn an_address_is_not_a_tracked_field() {
+        // `id`/`address` pick the device out; they do not describe it. A report
+        // whose address differs is a different device, which the backend handles
+        // as a discovery rather than an update — so the diff says nothing moved.
+        let old = beacon();
+        let reported = BluetoothDevice::new(
+            DeviceId::new("11:22:33:44:55:66"),
+            "11:22:33:44:55:66".to_string(),
+        )
+        .with_name("Stationary Beacon")
+        .with_rssi(-70)
+        .with_manufacturer_data(0x004C, vec![0x01, 0x02]);
+
+        assert_eq!(changed_device_fields(&old, &reported), Vec::new());
+    }
+
+    #[test]
+    fn a_report_carries_the_snapshot_the_radio_just_sent() {
+        // The old snapshot is only there to diff against; what the consumer
+        // stores has to be the new one.
+        let event = report_event(
+            &beacon(),
+            beacon().with_rssi(-33).with_name("Now You See Me"),
+        );
+
+        let DeviceEvent::DeviceUpdated { device, .. } = event else {
+            panic!("a moved field should be an update");
+        };
+        assert_eq!(device.rssi, Some(-33));
+        assert_eq!(device.name.as_deref(), Some("Now You See Me"));
+    }
+
+    #[test]
+    fn a_missing_field_becoming_present_is_a_change() {
+        // `None` to `Some` is the first time the radio said anything about a
+        // property, which is the most informative change there is.
+        let quiet = BluetoothDevice::new(
+            DeviceId::new("AA:BB:CC:DD:EE:FF"),
+            "AA:BB:CC:DD:EE:FF".to_string(),
+        );
+        let speaking = beacon();
+
+        assert_eq!(
+            changed_device_fields(&quiet, &speaking),
+            vec![
+                UpdateField::Name,
+                UpdateField::Rssi,
+                UpdateField::ManufacturerData,
+            ]
+        );
+        // And the other way round: a property that went quiet also moved.
+        assert_eq!(
+            changed_device_fields(&speaking, &quiet),
+            vec![
+                UpdateField::Name,
+                UpdateField::Rssi,
+                UpdateField::ManufacturerData,
+            ]
+        );
     }
 }

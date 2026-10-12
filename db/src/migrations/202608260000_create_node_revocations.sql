@@ -8,7 +8,7 @@
 CREATE TABLE node_revocations (
     node_id                BYTEA PRIMARY KEY,         -- SHA-256(signing_public_key), 32 bytes
     revoked_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-    revoked_by             TEXT NOT NULL,              -- CA identifier that issued the revocation
+    revoked_by             BYTEA,                     -- SHA-256 of the revoking CA key; null until published
     reason                 INT NOT NULL,               -- Revocation reason code (0-6 per RFC 5280)
     signing_public_key     BYTEA NOT NULL,             -- Ed25519 public key (32 bytes)
     ca_credential          BYTEA NOT NULL,             -- CA credential at time of revocation (for audit)
@@ -23,13 +23,20 @@ CREATE INDEX idx_node_revocations_revoked_at ON node_revocations (revoked_at);
 CREATE INDEX idx_node_revocations_reason ON node_revocations (reason);
 CREATE INDEX idx_node_revocations_ca ON node_revocations (revoked_by);
 
+COMMENT ON COLUMN node_revocations.revoked_by IS $$
+SHA-256 of the revoking CA's public key, 32 raw bytes. NULL means the
+revocation is recorded but unpublished: no signed list has attributed it to a
+CA yet, and store_rsl fills this in when one does.
+$$;
+
 COMMENT ON TABLE node_revocations IS $$
 Revocation tracking for node credentials.
 
 When a node's CA credential is revoked, an entry is inserted here with:
 - node_id: The 32-byte SHA-256 hash of the signing public key
 - revoked_at: When the revocation occurred
-- revoked_by: The CA identifier that issued the revocation
+- revoked_by: SHA-256 of the revoking CA's public key, 32 raw bytes; null
+          while the revocation is recorded but not yet on a published list
 - reason: Revocation reason code (0=unspecified, 1=key_compromise, 
           2=ca_compromise, 3=ceased_operation, 4=policy_violation,
           5=superseded, 6=hold)

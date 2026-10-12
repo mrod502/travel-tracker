@@ -15,7 +15,7 @@
 -- ---------------------------------------------------------------------
 
 CREATE TABLE revocation_status_lists (
-    issuer_id        TEXT        NOT NULL,           -- CA identifier (SHA-256 of its public key, hex)
+    issuer_id        BYTEA       NOT NULL,           -- SHA-256 of the CA public key, 32 raw bytes
     sequence_number  BIGINT      NOT NULL,           -- Strictly increasing per issuer
     issued_at        TIMESTAMPTZ NOT NULL,           -- When the CA signed it
     expires_at       TIMESTAMPTZ NOT NULL,           -- Stale for policy after this
@@ -28,6 +28,10 @@ CREATE TABLE revocation_status_lists (
     -- replayed or duplicated sequence number a rejected write rather than
     -- a second row that nobody can tell apart from the first.
     PRIMARY KEY (issuer_id, sequence_number),
+
+    -- An identifier is SHA-256, so anything else is a mistake at the point of
+    -- writing rather than a puzzle for the next reader.
+    CONSTRAINT valid_rsl_issuer CHECK (octet_length(issuer_id) = 32),
 
     -- 0 is reserved for "no RSL has been published yet"; a published list
     -- always carries a real sequence.
@@ -66,13 +70,23 @@ hand back the artifact that was signed rather than a fresh list rebuilt
 from whatever the revocation table says now.
 $$;
 
+COMMENT ON COLUMN revocation_status_lists.issuer_id IS $$
+SHA-256 of the CA's signing public key, 32 raw bytes — the same value
+ca::TrustAnchor::ca_id() returns, which is the key a consumer verifies
+`signature` against. Keys, signatures and identifiers are raw bytes in this
+database; an encoding appears only in a file format that needs one or inside
+the signed JSON document, where a byte field is base64.
+$$;
+
 COMMENT ON COLUMN revocation_status_lists.sequence_number IS $$
 Per-issuer anti-replay counter, starting at 1. 0 means "nothing published
 yet" and is what an empty table reads as; the CHECK rejects storing it.
 $$;
 
 COMMENT ON COLUMN revocation_status_lists.rsl IS $$
-The serialized signed list, including its revocation entries and signature.
+The signed list as distributed: the same fields ca::RevocationStatusList
+carries, with keys, signatures and identifiers base64 because JSON has no
+byte type of its own.
 revocation_count is checked against this document's own array length so the
 indexed header cannot drift from the payload it summarises.
 $$;

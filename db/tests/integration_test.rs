@@ -5,7 +5,7 @@
 //! 2. Migration statement splitting and filtering
 //! 3. Filename parsing edge cases
 //!
-//! Note: Database-dependent tests are skipped in CI/CD environments.
+//! Note: tests that need a live database are skipped when `DATABASE_URL` is absent.
 //! Use the unit tests in src/up.rs for database-agnostic validation.
 
 use chrono::{Local, TimeZone};

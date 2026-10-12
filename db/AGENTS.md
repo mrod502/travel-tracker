@@ -227,7 +227,6 @@ The migration system has comprehensive tests covering:
 - **Unit tests** use no external dependencies (in-memory/file-based)
 - **Integration tests** mock database behavior without requiring a running PostgreSQL instance
 - **No hardcoded secrets** in test files - use environment variables or mocks
-- All tests must pass in CI/CD environments without database access
 
 ## Important Notes
 

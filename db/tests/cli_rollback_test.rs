@@ -85,7 +85,7 @@ impl Target {
 
     /// Release every connection before dropping the database, and be loud if it
     /// survives: `DROP DATABASE` fails while sessions are still attached, and a
-    /// leak nobody notices is a leak that outlives CI.
+    /// leak nobody notices is a leak that outlives the run.
     async fn cleanup(&self, name: &str, pool: PgPool) {
         pool.close().await;
         let admin = PgPool::connect(&self.admin_url)

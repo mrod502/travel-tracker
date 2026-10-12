@@ -60,9 +60,9 @@ pub const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/migra
 /// a broken build, not a runtime condition a caller can recover from, and every
 /// consumer of this static is going to fail anyway; `#[sqlx::test]` in
 /// particular has no way to supply a `Migrator` that returns a `Result`.
-/// `cargo test -p db` covers the corpus on every commit, so in practice the panic
-/// arrives as a parse failure in the test output rather than at an unrelated
-/// consumer's first run.
+/// `cargo test -p db` parses the corpus, so in practice the panic arrives as a
+/// parse failure in the test output rather than at an unrelated consumer's first
+/// run.
 pub static SQLX_FORWARD_MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| {
     forward_migrator(MIGRATIONS_DIR.as_ref())
         .unwrap_or_else(|e| panic!("cannot build the forward migrator from {MIGRATIONS_DIR}: {e}"))

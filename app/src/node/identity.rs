@@ -23,10 +23,9 @@
 //! to get a credential, and being public it is not a secret — but it is kept in sync
 //! with the private key on every start so it can never be an old key's.
 //!
-//! Hex is not used for key material anywhere here. The JSON-with-hex-file this
-//! project wrote before PKCS#8 is converted on load ([`NodeIdentity::load_or_create`])
-//! rather than silently read, because a secret read as the wrong format yields a
-//! confident, entirely different identity.
+//! Hex is not used for key material anywhere here, and a file that is not PKCS#8
+//! PEM is an error rather than a guess: a secret read through the wrong decoder
+//! yields a confident, entirely different identity.
 //!
 //! # Example
 //!
@@ -50,24 +49,12 @@
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::thread_rng;
-use serde::Deserialize;
 use std::fs;
 use std::path::Path;
 
 use crate::error::{AppError, Result};
 use crate::provenance::sign::{compute_node_id, sign_payload as sign_raw_payload};
 use crate::provenance::verify::verify_signature as verify_raw_signature;
-
-/// The on-disk shape of an identity from before PKCS#8.
-///
-/// Read-only and only for [`NodeIdentity::load_or_create`]'s conversion: nothing
-/// writes this format any more, and a private key in a JSON string field is the
-/// thing being retired.
-#[derive(Deserialize, Debug)]
-struct LegacySerializedIdentity {
-    private_key_hex: String,
-    public_key_hex: String,
-}
 
 /// Node identity encapsulating the Ed25519 keypair and derived node ID.
 ///
@@ -99,10 +86,6 @@ impl NodeIdentity {
 
     /// The published public key: SPKI PEM.
     pub const PUBLIC_KEY_FILENAME: &'static str = "node_identity.pub.pem";
-
-    /// The JSON/hex file used before PKCS#8, converted on first start rather than
-    /// read, and renamed to `.bak` once the conversion has been written.
-    const LEGACY_IDENTITY_FILENAME: &'static str = "node_identity.json";
 
     /// Generate a new random node identity.
     ///
@@ -218,12 +201,8 @@ impl NodeIdentity {
     ///
     /// This is the recommended way to get a node identity for production use.
     ///
-    /// A `node_identity.json` from before PKCS#8 is converted here on first start:
-    /// the same secret is written as PEM (so the node ID, and every occurrence this
-    /// node has already signed, are unchanged), the public half is published beside
-    /// it, and the JSON is renamed to `.bak` rather than deleted — it holds a private
-    /// key, and a rename leaves an operator a way back. The `.bak` is then safe to
-    /// remove.
+    /// The public half is written beside the private key on every start, so the file
+    /// an operator hands to the CA can never belong to an older key.
     ///
     /// # Arguments
     ///
@@ -231,7 +210,7 @@ impl NodeIdentity {
     ///
     /// # Returns
     ///
-    /// * `Ok(NodeIdentity)` - The loaded, converted or newly generated identity
+    /// * `Ok(NodeIdentity)` - The loaded or newly generated identity
     /// * `Err(AppError)` - If loading/generating failed
     ///
     /// # Example
@@ -255,83 +234,10 @@ impl NodeIdentity {
             return Ok(identity);
         }
 
-        if let Some(converted) = Self::convert_legacy_file(data_dir)? {
-            converted.save_public_key(&public_path)?;
-            return Ok(converted);
-        }
-
         let identity = Self::generate();
         identity.save(&identity_path)?;
         identity.save_public_key(&public_path)?;
         Ok(identity)
-    }
-
-    /// Read a pre-PKCS#8 `node_identity.json`, write it as PEM, and set it aside.
-    ///
-    /// Returns `Ok(None)` when there is no such file, so the caller can proceed to
-    /// generate a fresh identity.
-    fn convert_legacy_file(data_dir: &Path) -> Result<Option<Self>> {
-        let legacy_path = data_dir.join(Self::LEGACY_IDENTITY_FILENAME);
-        if !legacy_path.exists() {
-            return Ok(None);
-        }
-
-        let content = fs::read_to_string(&legacy_path).map_err(|e| {
-            AppError::Io(format!(
-                "Failed to read legacy identity file {}: {e}",
-                legacy_path.display()
-            ))
-        })?;
-
-        let legacy: LegacySerializedIdentity = serde_json::from_str(&content).map_err(|e| {
-            AppError::Io(format!(
-                "{} is not a PKCS#8 PEM key and could not be read as the older JSON format \
-                     either: {e}",
-                legacy_path.display()
-            ))
-        })?;
-
-        let private_key_bytes = hex::decode(&legacy.private_key_hex).map_err(|e| {
-            AppError::Io(format!(
-                "Legacy identity file {} has an invalid private key: {e}",
-                legacy_path.display()
-            ))
-        })?;
-
-        let secret: [u8; 32] = private_key_bytes.as_slice().try_into().map_err(|_| {
-            AppError::Io(format!(
-                "Legacy identity file {} holds a {}-byte private key, not 32",
-                legacy_path.display(),
-                private_key_bytes.len()
-            ))
-        })?;
-
-        // Only the secret is taken from the old file. The public half — and with it
-        // the node ID — is derived, so a JSON whose two fields disagreed cannot carry
-        // that disagreement into the new format.
-        let identity = Self::from_signing_key(SigningKey::from_bytes(&secret));
-        let pem_path = data_dir.join(Self::IDENTITY_FILENAME);
-        identity.save(&pem_path)?;
-
-        let archived = legacy_path.with_extension("json.bak");
-        fs::rename(&legacy_path, &archived).map_err(|e| {
-            AppError::Io(format!(
-                "Failed to move {} aside to {}: {e}",
-                legacy_path.display(),
-                archived.display()
-            ))
-        })?;
-
-        log::warn!(
-            "converted the node identity from hex JSON to PKCS#8 PEM: {} -> {}; the node ID is \
-             unchanged, so occurrences this node already signed still verify. The old copy of \
-             the secret is at {} — delete it when you are satisfied",
-            legacy_path.display(),
-            pem_path.display(),
-            archived.display()
-        );
-
-        Ok(Some(identity))
     }
 
     /// Get the node ID (SHA-256 hash of the public key).
@@ -488,10 +394,6 @@ mod tests {
             "the node's signing key must be a standard PEM private key, not a bespoke document: \
              {written}"
         );
-        assert!(
-            !written.contains("private_key_hex"),
-            "hex key material is what this format replaced"
-        );
     }
 
     #[test]
@@ -555,40 +457,6 @@ mod tests {
 
         // Should be the same identity
         assert_eq!(identity1.node_id(), identity2.node_id());
-    }
-
-    /// The migration test, with the identity that migration exists to preserve: a
-    /// node that signed occurrences under the old file must still be the same node
-    /// afterwards, or the conversion invalidates its whole history.
-    #[test]
-    fn a_legacy_hex_identity_is_converted_not_dropped() {
-        let temp_dir = TempDir::new().unwrap();
-        let legacy_path = temp_dir.path().join(NodeIdentity::LEGACY_IDENTITY_FILENAME);
-
-        let original = NodeIdentity::generate();
-        let legacy = serde_json::json!({
-            "private_key_hex": hex::encode(original.signing_key.as_bytes()),
-            "public_key_hex": hex::encode(original.verifying_key.as_bytes()),
-        });
-        fs::write(&legacy_path, legacy.to_string()).unwrap();
-
-        let loaded = NodeIdentity::load_or_create(temp_dir.path()).unwrap();
-
-        assert_eq!(
-            loaded.node_id(),
-            original.node_id(),
-            "the same secret must yield the same node id after conversion"
-        );
-        assert!(!legacy_path.exists(), "the old file is set aside");
-        assert!(legacy_path.with_extension("json.bak").exists());
-        assert!(temp_dir
-            .path()
-            .join(NodeIdentity::IDENTITY_FILENAME)
-            .exists());
-
-        // And the next start reads the PEM, rather than converting again.
-        let again = NodeIdentity::load_or_create(temp_dir.path()).unwrap();
-        assert_eq!(again.node_id(), original.node_id());
     }
 
     #[test]

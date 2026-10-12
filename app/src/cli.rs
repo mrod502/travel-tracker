@@ -277,21 +277,6 @@ pub enum CaCommands {
         #[arg(long)]
         output: Option<String>,
     },
-
-    /// Convert a pre-PKCS#8 hex root key file into a PKCS#8 PEM key file
-    ///
-    /// Root keys were hex until PKCS#8 arrived. The conversion preserves the CA's
-    /// identity — the id is derived from the public half — so credentials and lists
-    /// this CA already published keep verifying afterwards.
-    CaMigrateKey {
-        /// The legacy key file (64 hex characters, no PEM envelope)
-        #[arg(long)]
-        from: String,
-
-        /// Where to write the PEM (default: `--from` with a `.pem` extension)
-        #[arg(long)]
-        output: Option<String>,
-    },
 }
 
 /// Resolved arguments for `ca enroll`.
@@ -939,7 +924,6 @@ impl Cli {
             CaCommands::CaExportAnchor { key_path, output } => {
                 self.ca_export_anchor(key_path, output).await
             }
-            CaCommands::CaMigrateKey { from, output } => self.ca_migrate_key(from, output).await,
         }
     }
 
@@ -1400,63 +1384,6 @@ impl Cli {
         );
         println!("Give this file to every node that has to check this CA. It verifies and");
         println!("never signs, so copying it costs nothing in secrecy.");
-
-        Ok(())
-    }
-
-    /// Convert a pre-PKCS#8 hex root key into a PKCS#8 PEM key file.
-    ///
-    /// The CA identity survives, because `ca_id` is derived from the public half:
-    /// credentials and revocation lists published before the conversion still verify
-    /// after it. That is what makes this a conversion rather than a re-enrollment of
-    /// every node on the network.
-    ///
-    /// It does not delete the legacy file and does not touch the configuration. Two
-    /// copies of a CA secret on one machine is exactly the state to avoid, but which
-    /// copy is safe to remove depends on what the running node has loaded, and this
-    /// command cannot know that.
-    async fn ca_migrate_key(&self, from: String, output: Option<String>) -> Result<(), String> {
-        let from = PathBuf::from(&from);
-
-        // Already converted is a different problem from convertible, and needs a
-        // different answer.
-        if ca::CaRoot::load_from_file(&from).is_ok() {
-            return Err(format!(
-                "{} is already a PKCS#8 PEM key; there is nothing to convert. If the node \
-                 will not start, check that [ca].key_path points at it.",
-                from.display()
-            ));
-        }
-
-        let ca = ca::CaRoot::load_legacy_hex_file(&from)
-            .map_err(|e| format!("Failed to read the legacy root key: {}", e))?;
-
-        let output = output
-            .map(PathBuf::from)
-            .unwrap_or_else(|| from.with_extension("pem"));
-
-        if output.exists() {
-            return Err(format!(
-                "{} already exists; not overwriting it with a second copy of the key. Pass \
-                 --output to choose another path.",
-                output.display()
-            ));
-        }
-
-        ca.save_to_file(&output, Some(0o600))
-            .map_err(|e| format!("Failed to write the converted key: {}", e))?;
-
-        println!("=== CA root key converted ===");
-        println!("From:  {}", from.display());
-        println!("To:    {} (PKCS#8 PEM, mode 0600)", output.display());
-        println!("CA id: {} — unchanged by the conversion", ca.ca_id_hex());
-        println!();
-        println!(
-            "Next: point [ca].key_path at {}, then delete {} once the node has started.",
-            output.display(),
-            from.display()
-        );
-        println!("Credentials and lists this CA published before the conversion still verify.");
 
         Ok(())
     }
@@ -2253,35 +2180,6 @@ mod tests {
                 assert_eq!(output.as_deref(), Some("/srv/www/ca.pub.pem"));
             }
             other => panic!("expected ca export-anchor, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_key_conversion_names_the_file_it_converts_and_nothing_else() {
-        let error = Args::try_parse_from(["app", "ca", "ca-migrate-key"])
-            .expect_err("converting without saying what to convert is nothing to do");
-        assert!(
-            error.to_string().contains("--from"),
-            "should name the missing flag: {error}"
-        );
-
-        match parse(&[
-            "app",
-            "ca",
-            "ca-migrate-key",
-            "--from",
-            "/var/lib/ca/root_key.hex",
-        ])
-        .command()
-        {
-            Commands::Ca(CaCommands::CaMigrateKey { from, output }) => {
-                assert_eq!(from, "/var/lib/ca/root_key.hex");
-                assert!(
-                    output.is_none(),
-                    "the .pem beside the input is decided after the config is resolved"
-                );
-            }
-            other => panic!("expected ca migrate-key, got {other:?}"),
         }
     }
 }

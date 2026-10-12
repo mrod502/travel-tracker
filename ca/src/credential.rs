@@ -3,10 +3,7 @@
 //! A credential is the CA's signature over a node's signing key. Every key,
 //! signature and identifier in it is raw bytes; the JSON form that goes into
 //! `nodes.ca_credential` writes those fields as base64 (see
-//! [`crate::jsonbytes`]), because JSON has no byte type of its own. There is no
-//! hex form of a credential — an earlier `to_hex`/`from_hex` pair concatenated
-//! fields into one hex string, could not round-trip `expires_at` or `issuer_id`,
-//! and was never used for storage.
+//! [`crate::jsonbytes`]), because JSON has no byte type of its own.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -252,9 +249,9 @@ mod tests {
         )
         .unwrap();
 
-        // The hex pair this replaced dropped `expires_at` and `issuer_id` on the
-        // floor, which silently changed what the credential claimed. The JSON form
-        // keeps every field, so a credential read back is the credential issued.
+        // Every field survives the round trip, the optional ones included. A form
+        // that dropped `expires_at` or `issuer_id` would silently change what the
+        // credential claims while still looking like the credential that was issued.
         let decoded: Credential =
             serde_json::from_str(&serde_json::to_string(&credential).unwrap()).unwrap();
         assert_eq!(decoded, credential);

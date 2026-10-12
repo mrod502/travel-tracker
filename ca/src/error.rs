@@ -104,9 +104,3 @@ impl From<std::io::Error> for CaError {
         CaError::Io(err.to_string())
     }
 }
-
-impl From<hex::FromHexError> for CaError {
-    fn from(err: hex::FromHexError) -> Self {
-        CaError::InvalidKey(format!("Hex decode error: {}", err))
-    }
-}

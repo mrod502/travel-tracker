@@ -42,9 +42,8 @@ use crate::error::{CaError, Result};
 ///
 /// # Errors
 ///
-/// * no key found — the file holds something else; if it looks like the bare-hex
-///   format this project used before PKCS#8, [`is_legacy_hex_key`] says so and the
-///   caller can name the command that converts it
+/// * no key found — the file holds something else, including any key in a format
+///   that is not PKCS#8 PEM
 /// * more than one key — a private key file holds exactly one
 /// * a key that is not an Ed25519 key
 pub fn read_signing_key_pem(contents: &str, source: &str) -> Result<SigningKey> {
@@ -172,16 +171,6 @@ pub fn write_key_file(path: &Path, contents: &str, permissions: Option<u32>) -> 
     Ok(())
 }
 
-/// Does this look like the bare-hex root key file used before PKCS#8?
-///
-/// A 32-byte secret read as the wrong format yields a confident, entirely wrong
-/// identity, so a reader that expects PEM refuses this rather than guessing — and
-/// names the command that converts it.
-pub fn is_legacy_hex_key(contents: &str) -> bool {
-    let trimmed = contents.trim();
-    trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,16 +256,6 @@ mod tests {
 
         let err = read_signing_key_pem(&both, "two.pem").unwrap_err();
         assert!(err.to_string().contains("exactly one"), "{err}");
-    }
-
-    #[test]
-    fn the_legacy_format_is_recognised_by_its_shape_only() {
-        assert!(is_legacy_hex_key(&"ab".repeat(32)));
-        assert!(is_legacy_hex_key(&format!("{}\n", "ab".repeat(32))));
-        // Not hex, the wrong length, or a PEM body.
-        assert!(!is_legacy_hex_key("zz".repeat(32).as_str()));
-        assert!(!is_legacy_hex_key(&"ab".repeat(31)));
-        assert!(!is_legacy_hex_key("-----BEGIN PRIVATE KEY-----\nMCow\n"));
     }
 
     #[test]

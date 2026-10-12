@@ -149,11 +149,8 @@ pub(crate) fn issuer_id_of(verifying_key: &VerifyingKey) -> [u8; 32] {
 /// the bytes of the thing itself — identifiers and keys go in as their raw 32
 /// bytes, not as text.
 ///
-/// *Changed 2026-10-07:* the issuer used to go in as 64 ASCII hex characters of
-/// the same digest. Nothing had published a list under the old layout, so it
-/// changed rather than being carried forward; what a signature covers should be
-/// the identifier, not one tool's spelling of it. `ca/tests/fixtures/README.md`
-/// records both layouts and how the current one was pinned.
+/// `ca/tests/fixtures/README.md` records this layout and how the pinned vector was
+/// derived from it by an implementation other than this one.
 ///
 /// The issuer arrives as bytes rather than from a key so a verifier can rebuild
 /// it; see [`verify_rsl_signature`]. `notes` is absent on purpose — it is audit

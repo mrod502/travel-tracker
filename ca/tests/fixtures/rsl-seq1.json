@@ -1,0 +1,21 @@
+{
+  "issuer_id": "vbwnFvgZ+jOxEjlAd3hg7YR0euuKk65oTX34iHBzvFE=",
+  "issued_at": "2023-11-14T22:13:20Z",
+  "expires_at": "2023-11-15T15:01:20Z",
+  "sequence_number": 1,
+  "revocations": [
+    {
+      "node_id": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+      "revoked_at": "2023-11-13T18:26:40Z",
+      "reason": "KeyCompromise",
+      "signing_public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+    },
+    {
+      "node_id": "qrvM3e7/ABEiM0RVZneImaq7zN3u/wARIjNEVWZ3iJk=",
+      "revoked_at": "2023-11-14T22:13:19Z",
+      "reason": "CaCompromise",
+      "signing_public_key": ""
+    }
+  ],
+  "signature": "VjvBxWtk+ShXKWg39QAClSZ2lkVwFChgTkQE9Hyh4Rfy01vWWly5Ojd15TB1mqBuKRpC7gFnfBPZ7wvrVRFoDw=="
+}

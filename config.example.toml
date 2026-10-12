@@ -141,12 +141,50 @@ timeout_ms = 2000
 # so a deployment can keep the root key path in one place instead of in five
 # shell histories.
 [ca]
-# env: CA_ROOT_KEY_PATH  | flag: ca-init --key-path (default: /var/lib/btmon/ca/root_key.hex)
-key_path = "/var/lib/btmon/ca/root_key.hex"
+# env: CA_ROOT_KEY_PATH  | flag: ca-init --key-path (default: /var/lib/btmon/ca/root_key.pem)
+# The root key is a PKCS#8 PEM file (-----BEGIN PRIVATE KEY-----), which `openssl
+# pkey` reads. A file in any other format is refused at load rather than guessed
+# at: a secret decoded through the wrong format yields a different CA, silently.
+key_path = "/var/lib/btmon/ca/root_key.pem"
 # env: CA_VALIDITY_DAYS  | flag: ca-enroll --validity-days (default: 90)
 validity_days = 90
 # env: CA_NODE_TYPE      | flag: ca-enroll --node-type (default: full; full, light, aggregator, signal)
 node_type = "full"
+
+# Revocation checking, asked before the node records anything
+#
+# A CA's revocation status list is what turns "I have never seen this node id"
+# into "this node id has not been revoked". It is also perishable: the list speaks
+# for a validity window, and outside that window its silence about a node means
+# nothing. So the node loads one at startup, re-reads it in the background, and
+# refuses to record when what it holds can no longer answer the question.
+#
+# Off by default, and turning it on is a commitment: the node will not start until
+# it can load a current list, signed by the anchor below, from [database]. That is
+# deliberate. A node that stores occurrences it cannot attest to looks healthy and
+# is not, which is worse than a node that visibly refuses to start. Publish a list
+# first (`app ca ca-generate-rsl`), then enable this.
+[revocation]
+# env: REVOCATION_ENABLED (default: false)
+enabled = false
+# env: REVOCATION_ANCHOR_PATH (required when enabled)
+# The CA's public key as SubjectPublicKeyInfo PEM (-----BEGIN PUBLIC KEY-----),
+# written beside the root key by `app ca ca-export-anchor`. The node reads only the
+# lists this key signed, so another CA's list can never answer for this one — and a
+# list edited after publication fails rather than quietly saying "nobody is
+# revoked".
+anchor_path = "/var/lib/btmon/ca/root_key.pub.pem"
+# env: REVOCATION_MAX_STALENESS_SECS (default: 86400)
+# How old a list may get before the node stops trusting what is *not* in it. Past
+# this bound an unlisted node is refused, not assumed valid; the entries a list does
+# make stay in force however old it is.
+max_staleness_secs = 86400
+# env: REVOCATION_REFRESH_SECS (default: 900)
+# How often to re-read the CA's list. A failed refresh keeps the last list that
+# verified — the CA being briefly unreachable is not a reason to lose the
+# revocations it already published — so only a list older than the bound above ever
+# costs the node data.
+refresh_secs = 900
 
 # Deprecated
 #

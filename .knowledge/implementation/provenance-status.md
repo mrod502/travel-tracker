@@ -419,14 +419,18 @@ every primitive needed to answer it exists and passes its own tests.
      nothing is actually gained until verification is wired into a receive path
    - **Impact:** provenance is currently write-only
 
-2. **Revocation cannot reject anything** ⚠️ HIGH
-   - `node_revocations` is written by `ca-revoke`, RSLs can be generated and signed, and the
-     checker enforces staleness correctly — in tests
-   - At runtime the checker is empty, so every node resolves to `Unknown`, which the lenient
-     recording policy accepts and the strict connection policy would reject. Since no peer
-     connections exist either, the strict policy never runs
-   - **Impact:** a compromised node's key is as valid as any other's until an operator both
-     revokes it and manually loads a list nothing loads by itself
+2. **Revocation could not reject anything** — **closed 2026-10-08**
+   - `node_revocations` is written by `ca ca-revoke`, RSLs are generated and signed, and the
+     checker enforces staleness — and since [B11](../../GAP_ANALYSIS.md) all three sit on the
+     node's write path rather than only in tests
+   - `ca ca-revoke` had a defect the closure found: it wrote `nodes.status`, while the list builder
+     reads `node_revocations`, so a revocation could be recorded and every later list published
+     saying nobody was revoked. It now writes the ledger and says plainly that publishing is a
+     separate act
+   - What closure did not cover: the *connection* half never runs, because there is no peer
+     connection to reject
+   - **Remaining impact:** none for recording. A revoked key stops producing accepted rows at the
+     next `[revocation].refresh_secs` on every node that enabled checking and holds this CA's anchor
 
 3. **No Key Rotation** ⚠️ MEDIUM
    - Long-lived keys increase attack surface
@@ -571,8 +575,10 @@ has no `unknown` variant, which is why a row with no fix must still assert one. 
 
 **Still missing, and this is the honest list:**
 - ❌ Node-side credential verification (the code exists; the call site does not)
-- ❌ CA root key in node configuration, loaded at startup
-- ❌ An RSL loader that populates a checker from `node_revocations` / `DatabaseRslManager`
+- ❌ An anchor in configuration *for credentials*. `[revocation].anchor_path` is loaded at startup and
+  verified against, and nothing else reads it
+- ✅ ~~An RSL loader that populates a checker~~ — done 2026-10-08: `ca::verified_checker` +
+  `RevocationWatch`, refreshed on `[revocation].refresh_secs`
 - ❌ A composed verification entry point reachable by an operator or a peer
 - ❌ Enrollment as a protocol rather than a CLI invocation
 
@@ -584,18 +590,25 @@ has no `unknown` variant, which is why a row with no fix must still assert one. 
 
 Ordered so each step produces an observable result rather than another untested library.
 
-1. **Load the trust anchor**
-   - Add the CA root key path to configuration (the `[ca]` section already exists)
-   - Load it at node startup and fail loudly when revocation checking is enabled but no root is configured
+1. **Load the trust anchor** — ✅ done 2026-10-08
+   - `[revocation].anchor_path` (env `REVOCATION_ANCHOR_PATH`), documented in `config.example.toml`
+   - Loaded at startup, and enabled-but-unconfigured or unreadable fails startup naming
+     `app ca ca-export-anchor` — which is the "fail loudly" this list asked for
+   - Still open for credentials: the anchor lives under `[revocation]`, so a node checking
+     credentials must not have to enable revocation checking to get a key. Promoting it to its own
+     setting is the prerequisite for step 2
 
-2. **Verify one credential, then cache it**
+2. **Verify one credential, then cache it** — ❌ still open, and now the top of the list
    - On first contact with a peer's `node_id`, verify `ca_credential` with `CaRoot::verify_credential`
    - Cache the result per node, as the architecture already prescribes
    - Surface failures in stats, not only logs
 
-3. **Populate the revocation checker**
-   - Wire `DatabaseRslManager` (already implemented) to `InMemoryRslChecker`
-   - Refresh on a schedule and expose cache age — the staleness logic is already written for it
+3. **Populate the revocation checker** — ✅ done 2026-10-08
+   - `ca::verified_checker` builds the checker from `DatabaseRslManager`'s published list, signature
+     verified, issuer taken from the anchor rather than the lookup
+   - `RevocationWatch` refreshes on `[revocation].refresh_secs` on its own task — a radio outage must
+     not age the list — and a failed refresh keeps the last list that verified
+   - Age is exposed (`cache_age`, `is_fresh`, `sequence_number`) and drives `CheckContext`
 
 4. **Add one read-side verification command**
    - There is no HTTP server to add an endpoint to, so start with `app verify <occurrence-id>`

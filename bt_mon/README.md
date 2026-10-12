@@ -246,7 +246,6 @@ async fn main() -> Result<(), bt_mon::Error> {
 **Use Cases:**
 
 - Unit testing without requiring physical hardware
-- CI/CD pipeline testing
 - Development in headless environments
 - Testing error handling scenarios
 - Prototyping and demonstration

@@ -177,7 +177,6 @@ When multiple aggregators overhear the same signal-node ping (see `architecture/
 - Field order: Fixed struct ordering (not HashMap)
 - Schema versioning: First field is `schema_version` for forward compatibility
 - All timestamps: ISO 8601 UTC format
-- All hex strings: Lowercase (consistent)
 - Determinism: Enforced by RFC 8949 deterministic encoding rules
 
 **Dependencies:** `ciborium = "0.2"`, `ed25519-dalek = "2.0"`, `hex = "0.4"`

@@ -42,7 +42,7 @@ and the phased roadmap.
 **Blockers:**
 1. Create a partition for the current month — without it every insert fails
 2. Run the migrations against PostgreSQL 18 + PostGIS + h3-pg and settle `h3index` wire behaviour (WS0)
-3. Fix the two build/test defects so CI can go green (`bt_mon` mock example, racy clock assertion)
+3. Fix the two build/test defects so `cargo check --workspace --all-targets` passes (`bt_mon` mock example, racy clock assertion)
 4. Wire one verification path end to end
 
 See [`status.md`](status.md) for the detail and [`../../GAP_ANALYSIS.md`](../../GAP_ANALYSIS.md)

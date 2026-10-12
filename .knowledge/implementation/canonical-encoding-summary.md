@@ -40,7 +40,7 @@ The signed payload includes 12 fields in **exact order**:
 ```
 0.  schema_version      -- u16 (must be first for version detection)
 1.  origin_node_id      -- bytes[32] (SHA-256 hash)
-2.  device_hash         -- text (64-char hex string)
+2.  device_hash         -- bytes[32] (SHA-256 hash)
 3.  observed_at_node_local -- text (ISO 8601 UTC timestamp)
 4.  rssi                -- i16 (signed RSSI value)
 5.  raw_payload_hex     -- text (hex-encoded BLE advertisement)

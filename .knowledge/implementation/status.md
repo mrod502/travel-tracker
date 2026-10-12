@@ -2,10 +2,12 @@
 
 Component-by-component status of the workspace against the architectural plan.
 
-**Last updated:** September 2, 2026
-**Verification basis:** every claim below was read from the working tree or produced by a
-command run in the dev container on 2026-09-02. Anything that could not be executed here
-(needing Postgres, PostGIS, h3-pg, or a Bluetooth adapter) is marked **unexercised**.
+**Last updated:** October 12, 2026 (verification basis re-checked; see
+[Verification Snapshot](#verification-snapshot-2026-09-02) for the superseded 2026-09-02 runs)
+**Verification basis:** the statements below marked *re-checked 2026-10-12* were confirmed against
+the working tree and against PostgreSQL 18.3 / PostGIS 3.6.4 / h3-pg 4.2.3 at `database:5432`.
+Everything else is as it was read on 2026-09-02. A Bluetooth adapter is still the one thing this
+container cannot offer, so no real capture has ever run here.
 
 > Deep, per-component validation against the *fully implemented* end state lives in
 > [`GAP_ANALYSIS.md`](../../GAP_ANALYSIS.md). This document is the summary; that one is the
@@ -28,11 +30,11 @@ not current. The only operator interface is the `app` CLI.
 
 | Phase | Description | Status | Notes |
 |-------|-------------|--------|-------|
-| **Phase 0** | Single-node prototype | **In progress — code-complete, never validated live** | Scan → sign → store works in code; no live capture has ever run |
-| **Phase 0.5** | CA infrastructure | **Partially done** | CA library + CLI enrollment exist; the node runtime never uses them |
+| **Phase 0** | Single-node prototype | **In progress — validated against a live database and the mock radio** | Scan → sign → store runs end to end and has been observed: migrations applied, mock-backend runs storing rows, revocation refusing a revoked node ([B11](../../GAP_ANALYSIS.md)). What has *not* run is real BLE hardware — this container has no adapter |
+| **Phase 0.5** | CA infrastructure | **Partially done** | Enrollment works, and the node runtime now does use it: `[revocation].anchor_path` + `RevocationWatch` load and verify the CA's list at startup and gate storage ([B11](../../GAP_ANALYSIS.md)). Missing is the credential half — the node still never verifies its own `ca_credential`, and there is no key rotation ([M15](../../GAP_ANALYSIS.md)) |
 | **Phase 1** | Two-node sync | **Not started** | `rust-mqtt` is a declared `app` dependency with zero references in `app/src` |
 | **Phase 2** | Federated query layer | **Not started** | Depends on Phase 1 |
-| **Phase 3** | Association detection | **Not started** | `bt_iden` exists as an isolated library; nothing consumes it |
+| **Phase 3** | Association detection | **Started, offline only** | `bt_iden` has a consumer and four tables: `app identity-replay --last 7d [--write]`, first measured pass 55 occurrences → 10 identities / 45 merges ([B12](../../GAP_ANALYSIS.md)). The node itself still calls nothing here — by design, stage 4's bar is *reviewable* merges |
 | **Phase 4** | Signal/aggregator/LoRa tier | **Not started** | `SignalPing` wire format not designed |
 | **Phase 5** | Scale to N full nodes | **Not started** | No gossip implementation, design doc only |
 | **Phase 6** | Hardening | **Not started** | No mTLS, no access control, no metrics export |
@@ -58,8 +60,8 @@ Feature gates: `default = ["btleplug"]`, plus `bluer`, `mock`, `full`.
 
 **Defect:** `bt_mon/examples/mock_backend_demo.rs` imports `bt_mon::backends::mock` but the
 example declares no `required-features = ["mock"]`, so `cargo check --workspace
---all-targets` fails with E0432 unless `--features mock` is passed. Any CI running
-`--all-targets` is red.
+--all-targets` fails with E0432 unless `--features mock` is passed — a full workspace check
+is red until the example says what it needs.
 
 **Gaps:**
 - Raw advertisement payload still not exposed for storage in `occurrences.signal_payload`.
@@ -227,7 +229,7 @@ two do not.
 | Feature | Status |
 |---------|--------|
 | SWIM implementation | ❌ Not started |
-| Node membership | ❌ Not started — `nodes.last_seen_at` / `nodes.status` are never written by any code path |
+| Node membership | ❌ Not started — `nodes.last_seen_at` has exactly one writer and it is incidental: `update_node_status` sets it while changing status (`repo/src/repositories/revocation_repo.rs:213`). No ingest path touches it, and `Suspected`/`Down` are never assigned ([M32](../../GAP_ANALYSIS.md)) |
 | Failure detection | ❌ Not started |
 
 **Status:** ❌ **Not started.** Phase 5. Design notes in `architecture/tarantool-swim.md`.
@@ -278,26 +280,46 @@ Workstream status in [`geo-h3-alignment.md`](geo-h3-alignment.md).
 | `cargo test -p app --bins` | ❌ 196 passed, 1 failed — the racy `now == now_local` assertion |
 | `cargo check --workspace --all-targets` | ❌ exit 101 — `bt_mon` mock example; 61 warnings, mostly dead code |
 
+**Re-run 2026-10-12.** All three of those failures are gone. `cargo test --workspace` with
+`DATABASE_URL` set passes **905 tests over 25 suites, 7 ignored, exit 0**, and `cargo test -p app
+--bins` passes 346. The `now == now_local` race is closed (one clock read feeds both columns, and
+the assertion runs 10,000 times now — [M24](../../GAP_ANALYSIS.md)); the repo failures were the
+absent `DATABASE_URL`, which exists. Two notes for anyone reproducing it: `TMPDIR` must point
+inside `/workspace` (the container's `/tmp` is noexec, which breaks doctests), and the workspace
+invocation is the only comparable one — `cargo clippy -p app` alone reports different dead-code
+counts because the build graph changes.
+
 Dead-code warnings worth reading as signal rather than noise: `VerifyError::InvalidSignature`,
 `VerifyError::InvalidPublicKey`, and `RevocationVerificationError::NodeRevoked` are *never
 constructed* — three error paths that exist in the type system but that no code can reach,
-which is precisely what an unwired verification workflow looks like.
+which is precisely what an unwired verification workflow looks like. **Still true on
+2026-10-12:** each appears only in its own declaration or `Display` arm (`app/src/provenance/verify.rs:48-49`,
+`ca/src/error.rs:34`). Revocation *checking* got wired ([B11](../../GAP_ANALYSIS.md)), but these
+particular variants are not the path it took.
 
 ---
 
 ## Environment Limits on Verification
 
-This dev container has no Postgres server, no PostGIS, no h3-pg, and no Docker daemon.
-Consequences:
+**Superseded 2026-10-12.** This section's premise — no Postgres, no PostGIS, no h3-pg, no Docker
+daemon — no longer holds for the database half. PostgreSQL 18.3, PostGIS 3.6.4 and h3-pg 4.2.3 are
+reachable at `database:5432`, and `db` runs against it: 13 migrations apply to an empty database,
+`db down` reverts per-migration, and 25 test suites (905 tests) run against it. What is genuinely
+still out of reach:
 
-- **No SQL in this project has ever been executed.** Schema correctness is argued from
-  documentation, not observation.
-- The two `revocation_repo` failures above are environmental, not defects.
-- The `h3index` wire-behaviour probe (WS0 in `geo-h3-alignment.md`) must run on a host with a
-  real database, and WS2/WS4 depend on its answer.
-- Nothing in Phase 0's exit criteria — live capture volume, rate-limit threshold validation,
-  24 h clock drift, "what did this node see in the last hour and where" — can be demonstrated
-  from here.
+- **A Bluetooth adapter.** Every capture figure in this repository comes from the mock backend.
+  "Devices/hour on real hardware", advertisement-field coverage, and whether `store_raw_payload`
+  ever finds bytes to store ([M23](../../GAP_ANALYSIS.md), [M28](../../GAP_ANALYSIS.md)) remain
+  unmeasured, not merely unrecorded.
+- **A second node.** Federation, sync cursors, and relay provenance cannot be exercised
+  ([B16](../../GAP_ANALYSIS.md), [M7](../../GAP_ANALYSIS.md)).
+- **Docker.** The compose stack is not startable from inside this container, and a fresh clone
+  could not start it anyway while `env_file: .env` points at a gitignored file
+  ([M35](../../GAP_ANALYSIS.md)).
+
+The `h3index` probe (WS0) has been answered — see
+[`ws0-h3index-wire-results.md`](ws0-h3index-wire-results.md) — and WS4's client-side comparison
+is the part of that thread still unbuilt.
 
 ---
 
@@ -310,12 +332,12 @@ The questions this document previously listed as open have been decided and impl
 | Canonical encoding for `signed_payload` | Canonical CBOR (RFC 8949) via `ciborium`; specified and implemented |
 | `node_id` = UUID string vs SHA-256 of signing key | SHA-256 of the Ed25519 public key, `BYTEA`, implemented in `node/identity.rs` |
 | Location: NUMERIC lat/lon vs PostGIS GEOGRAPHY | PostGIS `GEOGRAPHY(POINT,4326)`, `PostgisPoint` in the model |
-| `device_hash`: TEXT hex vs raw bytes | Raw 32-byte `BYTEA` |
+| `device_hash` representation | Raw 32-byte `BYTEA` |
 | `service_uuids` / `manufacturer_data`: JSONB vs typed | JSONB `signal_payload` column, unified across signal types |
 | Ed25519 keypairs not implemented | Implemented, persisted, tested |
 | Rate limiting not implemented | Implemented in `node/rate_limiter.rs` |
 | GPS/location not implemented | Implemented via the `PositionSource` abstraction |
-| `h3-pg` function signatures unverified | Verified against PGXN docs — **still unexercised at runtime** |
+| `h3-pg` function signatures unverified | Verified against PGXN docs **and executed** on h3-pg 4.2.3 — `h3_latlng_to_cell` returns `892a1072b5bffff` for the fixture coordinate, matching `repo::geo` |
 | Repo models do not match schema | Reconciled onto the unified `Occurrence` model |
 
 ---
@@ -325,7 +347,7 @@ The questions this document previously listed as open have been decided and impl
 1. **Make the schema accept rows dated today.** Create the current-month partition and a
    provisioning plan before any insert can succeed.
 2. **Run the migrations against a real Postgres + PostGIS + h3-pg** and settle WS0.
-3. **Fix the two build/test defects** (mock example, racy clock assertion) so CI can be green.
+3. **Fix the two build/test defects** (mock example, racy clock assertion) so `cargo check --workspace --all-targets` and `cargo test --workspace` pass.
 4. **Wire one verification path end to end** — load a CA root, verify a peer's
    `ca_credential` once, cache it, and consult a *populated* RSL — so provenance produces an
    accept/reject decision rather than only a signature.

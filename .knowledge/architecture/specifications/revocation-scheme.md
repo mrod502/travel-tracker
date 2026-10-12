@@ -476,6 +476,10 @@ impl RevocationPolicy for ConnectionPolicy {
 
 ## Database Schema
 
+The authoritative schema is `db/src/migrations/`; this sketch is the original design.
+Keys, signatures and identifiers are `BYTEA` in both — the same raw bytes the program
+holds, with no encoding applied to fit a column type.
+
 ```sql
 -- Node revocation tracking
 CREATE TABLE node_revocations (
@@ -495,7 +499,7 @@ CREATE TABLE node_revocations (
     signing_public_key BYTEA NOT NULL,
     
     -- ID of the CA that issued this revocation
-    revoked_by_ca VARCHAR(255) NOT NULL,
+    revoked_by_ca BYTEA NOT NULL,
     
     -- Optional: original credential's issued_at (for audit trail)
     original_issued_at TIMESTAMPTZ,
@@ -525,7 +529,7 @@ CREATE TABLE rsl_snapshots (
     sequence_number BIGSERIAL PRIMARY KEY,
     
     -- CA identifier
-    issuer_id VARCHAR(255) NOT NULL,
+    issuer_id BYTEA NOT NULL,
     
     -- When this RSL was issued
     issued_at TIMESTAMPTZ NOT NULL,
@@ -536,8 +540,8 @@ CREATE TABLE rsl_snapshots (
     -- Number of revocations in this RSL
     revocation_count INTEGER NOT NULL,
     
-    -- CA signature (hex-encoded)
-    signature TEXT NOT NULL,
+    -- CA signature
+    signature BYTEA NOT NULL,
     
     -- SHA-256 hash of the full RSL payload (for integrity verification)
     payload_hash BYTEA NOT NULL,

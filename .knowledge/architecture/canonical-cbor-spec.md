@@ -91,7 +91,7 @@ this code, so v1 is decoded and never re-encoded, and the version number — not
 document's shape — decides which rules apply to it.
 
 **Key changes from previous spec:**
-- `device_hash` is now **Bytes (32-byte SHA-256 hash)** instead of Text (hex string)
+- `device_hash` is **Bytes (32-byte SHA-256 hash)**
 - `device_address` is now **Optional Bytes** instead of Text
 - `signal_type` added as explicit field
 - Signal-specific fields (service_uuids, manufacturer_data, raw_payload_hex) moved into `signal_payload` for extensibility
@@ -660,8 +660,8 @@ database, so there was nothing to preserve. Version 1 was untouched.
 ### 2026-08-14 — original specification
 
 Twelve-field signed set, `ciborium` selected over MessagePack/JSON/Protobuf/bincode, RFC 8949
-§4.2.1 adopted as the determinism rule, `device_hash`/`device_address` moved from hex text to
-bytes, signal-specific fields folded into `signal_payload`.
+§4.2.1 adopted as the determinism rule, `device_hash`/`device_address` as bytes,
+signal-specific fields folded into `signal_payload`.
 
 ---
 

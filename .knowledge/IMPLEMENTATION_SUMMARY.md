@@ -106,7 +106,6 @@ One critical blocker remains to be resolved before Phase 0 can proceed:
 | `service_uuids` = JSONB | `service_uuids` = `BYTEA[]` | Type mismatch - schema and repo don't agree |
 | `manufacturer_data` = JSONB | Structured fields in repo | Loss of flexibility for complex manufacturer data |
 | Location = PostGIS GEOGRAPHY | Location = NUMERIC lat/lon | Loses PostGIS spatial functions |
-| `device_hash` = TEXT (hex) | `device_hash` = BYTEA (32 bytes) | Storage and comparison differences |
 
 ---
 

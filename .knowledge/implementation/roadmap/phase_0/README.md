@@ -359,8 +359,8 @@ pub struct SystemClock;  // Uses chrono::Utc::now()
    - Model: `Option<PostgisPoint>` ✅ **FIXED** in current code
 
 2. **Device Hash Type**
-   - Schema: `TEXT` (hex string, 64 chars)
-   - Model: `Vec<u8>` (32 bytes) ❌ **MISMATCH**
+   - Schema: `BYTEA` (32 raw bytes)
+   - Model: `Vec<u8>` (32 bytes) ✅ **FIXED** — one value in both layers
 
 3. **Manufacturer Data**
    - Schema: `JSONB` (flexible structure)
@@ -372,19 +372,11 @@ pub struct SystemClock;  // Uses chrono::Utc::now()
 
 ### Required Fixes
 
-**Device Hash Format Decision Needed:**
+**Device Hash Format — decided: raw bytes**
 
-Option A (Schema): Store as TEXT hex string
-- Pros: Human-readable in SQL, debuggable
-- Cons: 2x storage (64 bytes vs 32)
-- Model change: `device_hash: String`
-
-Option B (Model): Store as BYTEA raw bytes
-- Pros: Compact (32 bytes)
-- Cons: Not human-readable in SQL
-- Schema change: `device_hash BYTEA`
-
-**Recommendation:** Option A (TEXT hex) for Phase 0 simplicity, can migrate to BYTEA later if storage becomes critical.
+`device_hash` is `BYTEA` holding the 32 bytes of the hash, and the model carries the
+same bytes (`Vec<u8>` in `repo::models::Occurrence`) — one value in the program and in
+the column, with no encoding step on either side of a read or a write.
 
 ---
 

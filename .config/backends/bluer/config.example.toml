@@ -1,12 +1,17 @@
 # btmon Configuration - bluer backend (Linux/BlueZ only)
 #
-# Backend: bluer (Linux-specific, BlueZ/D-Bus based, more GATT features)
-# Requires the `bluer` cargo feature and a physical Bluetooth adapter.
-# The bluer backend connects to the system's default BlueZ adapter.
+# Backend: bluer (Linux-specific, BlueZ/D-Bus based)
+# Needs a physical Bluetooth adapter.
+#
+# NOT USABLE BY `app` YET. Building with --features bluer compiles bt_mon's BlueZ backend into the
+# binary and selects nothing: App::run constructs btleplug or the mock, and there is no branch that
+# calls create_bluer_monitor_with_config. Every setting below is read regardless of which backend
+# runs; only the backend choice is missing. Until that branch exists this is a working configuration
+# for a node on btleplug and nothing more — see app/README.md, "Bluetooth Backend Selection", for the
+# change required.
 #
 # Usage:
-#   cargo run --bin app --features bluer --no-default-features \
-#     -- --config-file .config/backends/bluer/config.toml
+#   cargo run --bin app -- --config-file .config/backends/bluer/config.toml
 #
 # Copy this file to config.toml and modify as needed
 

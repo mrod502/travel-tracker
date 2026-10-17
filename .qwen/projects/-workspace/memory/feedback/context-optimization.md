@@ -14,7 +14,6 @@
 - `FULLNODE_INTEGRATION_HANDOFF.md` — Contains important handoff documentation not yet reviewed
 
 ### 3. New Files Created
-- `.qwen/RUST_GUIDE.md` — Rust development conventions (agent-harness agnostic location)
 - `.qwen/FAST_PROMPT.md` (~100 lines) — Concise context for fast/explore subagents
 - `.qwen/CONTEXT.md` — Project context summary (see below)
 
@@ -29,7 +28,6 @@
 
 ### Full Context (Main Agent)
 - `.qwen/FAST_PROMPT.md` — System overview and current status
-- `.qwen/RUST_GUIDE.md` — Rust conventions (when relevant)
 - `.knowledge/AGENTS.md` — Knowledge base index with blind spots
 - Relevant skill files (automatically loaded by keyword triggers)
 - Project memory (`MEMORY.md`)
@@ -52,7 +50,6 @@
 | Purpose | Location |
 |---------|----------|
 | Project README | `/workspace/README.md` — User-facing project overview |
-| Rust conventions | `.qwen/RUST_GUIDE.md` — Language-specific best practices |
 | Fast agent context | `.qwen/FAST_PROMPT.md` — Concise system overview for subagents |
 | Knowledge base | `.knowledge/AGENTS.md` — Comprehensive documentation index |
 | Skills | `.qwen/skills/` — Domain-specific expertise (CBOR, H3, provenance) |

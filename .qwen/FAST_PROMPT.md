@@ -1,141 +1,95 @@
-# Fast Agent Context — Bluetooth Tracking System
+# Fast Agent Context — BLE Occurrence Tracking
 
-## System Overview
+Load this first, then answer the question that was asked. Everything below is meant to be stable.
+**Current progress is deliberately not in this file** — see "Where truth lives".
 
-This is a **decentralized Bluetooth Low Energy (BLE) device tracking system** that deploys a network of nodes to scan advertisement traffic, associate observations with GPS location, and detect co-location patterns between devices.
+## What the system is
 
-**Key principle**: Privacy by design — the system tracks devices only, with NO person identity linkage anywhere in the schema.
+Nodes scan Bluetooth LE advertisements, stamp each sighting with an H3 location, sign it, and
+append it to a Postgres occurrence row. The query shape is: *what did this node see, when, where*.
 
-## Node Tiers (Build Order)
+Invariants that do not move:
 
-1. **Full node** (Phase 0 — IN PROGRESS) — Owns geo-partition, answers federated queries, local Postgres/PostGIS
-2. **Light node** (Phase 2) — Scans + forwards to full node
-3. **Signal node** (Phase 3) — Cheap LoRa-based coverage extension, stationary/pre-registered
-4. **Aggregator node** (Phase 3) — Bridges signal nodes to MQTT
+- **Self-certifying node identity** — `node_id` = SHA-256 of the node's Ed25519 signing public key.
+- **An occurrence is a signed assertion** — canonical CBOR payload + signature, verifiable offline.
+  Downstream derivation therefore never rewrites `occurrences`; derived tables are written separately.
+- **Schema changes go through migrations only** (`db` crate). Never hand-edit a table.
 
-## Core Technologies
+## Workspace — six crates
 
-| Technology | Purpose |
-|------------|---------|
-| **PostgreSQL + PostGIS** | Geo-partitioned storage with H3 indexing |
-| **h3-pg extension** | H3 geospatial indexing (res 6 for ownership, res 9 for occurrences) |
-| **Ed25519 + CBOR** | Cryptographic provenance signing (canonical encoding) |
-| **mTLS (step-ca)** | Node identity and secure communication |
-| **bt_mon** | Bluetooth scanning library (btleplug/bluer backends) |
-| **MQTT / LoRa** | Network transport (MQTT for full/aggregator, LoRa for signal) |
+| Crate | Role |
+|-------|------|
+| `app` | Node binary: CLI, capture → sign → store, CA operations, queries |
+| `bt_mon` | BLE scanning library (backends: `btleplug`, `bluer`, `mock`) |
+| `bt_iden` | Probabilistic device-identity resolution (evidence scoring, merge decisions) |
+| `repo` | sqlx data layer — models and repositories |
+| `db` | Migration tool (`up` / `down` / `reset` / `new-migration`) |
+| `ca` | Certificate-authority library (enrollment, revocation list) |
 
-## Critical Current Status (Phase 0)
+## Where truth lives (newest first)
 
-### ✅ Completed
-- bt_mon (BLE scanning) — functional
-- Database schema — core tables exist
-- Node identity generation — working
-- Rate limiting — implemented
-- CLI enhancements — config files, query mode, stats
+1. `GAP_ANALYSIS.md` — the live defect register (blocking / major / minor, with evidence).
+2. `.knowledge/implementation/status.md` — component-by-component summary.
+3. `.knowledge/implementation/roadmap.md` — phase plan.
+4. Dated files under `gap_analysis/` and `.knowledge/implementation/` are snapshots; check the
+   `Last updated:` line before quoting one.
 
-### 🚨 Blockers (Must Resolve Before Phase 0 Exit)
-1. **Repo model / schema misalignment** — Models in `repo/src/models/` don't match database schema (see `.knowledge/implementation/repo-divergence.md`)
-2. **Provenance signing** — Not yet implemented (CBOR + Ed25519)
-3. **H3 geo-indexing integration** — Schema exists, not integrated into storage flow
+`README.md` lists "Web Framework: Axum" — that is **aspirational**. There is no HTTP API and no web
+framework in any `Cargo.toml`; the only operator interface is the `app` CLI. Do not go looking for
+routes.
 
-### 📊 Implementation Status Summary
-| Component | Status |
-|-----------|--------|
-| bt_mon (BLE scanning) | ✅ Functional |
-| Database schema | ⚠️ Partial (divergences need fixing) |
-| Repository layer | ❌ Broken (models don't match schema) |
-| App (scanning + storage) | ⚠️ Partial (basic flow works, missing provenance) |
-| MQTT / networking | ❌ Not started |
-| Provenance & signing | ❌ Not started |
-| H3 geo-indexing | ⚠️ Partial (schema exists, not integrated) |
+## Environment limits (this container)
 
-## Key Design Principles
+- **No Bluetooth adapter.** Exercise the capture path with `--use-mock-backend` **and** `--features
+  mock`. The flag itself is accepted by every build — `app --help` lists it without the feature — but
+  the branch that constructs the simulated radio is what the feature compiles in, so a run that looks
+  like it is on the mock backend is on btleplug. Never conclude a scan path works or fails from real
+  radio behaviour here.
+- **Postgres is reachable** at host `database:5432` (credentials in `.env.database`). Postgres +
+  PostGIS + h3-pg are installed, so schema work can be verified for real.
+- **`/tmp` is mounted `noexec`** — doctests fail with `Permission denied (os error 13)` unless
+  `TMPDIR=/workspace/target/tmp`. (`cargo test --all-targets` skips doctests, so it looks fine.)
+- **Cap link parallelism** with `-j 2` on workspace-wide `cargo test` / `clippy --all-targets`; at
+  default parallelism the linker gets `signal 9 [Killed]`. That is memory, not a code fault.
+- **No CI.** Never create `.github/` or workflow files.
 
-- **Decentralized coordination** — gossip-based membership (SWIM), no central registry
-- **Self-certifying node identity** — `node_id` = SHA-256(signing_public_key)
-- **Independent provenance** — every occurrence signed by origin node, verifiable offline
-- **Eventual consistency** — append-only records, conflict-free by construction
-- **H3 geo-partitioning** — time RANGE + geography LIST partitions
+## Map
 
-## When to Invoke Skills
-
-- **`/skill canonical-cbor`** — CBOR serialization, signing occurrence data, signature verification
-- **`/skill h3-geospatial-indexing`** — H3 geospatial indexing, spatial queries, location storage
-- **`/skill provenance-verification`** — Node identity, occurrence authenticity, signature verification
-
-## Key File Paths (Quick Reference)
-
-### Application Code
-- `app/src/main.rs` — CLI entry point
+- `app/src/main.rs`, `app/src/cli.rs` — entry point and the full clap surface (flags, subcommands)
 - `app/src/app.rs` — FullNode orchestration
-- `app/src/config.rs` — Configuration management
-- `app/src/node/` — FullNode, identity, rate limiter
-- `app/src/provenance/` — CBOR encoding, signing, verification
-- `repo/src/models/occurrence.rs` — Database models (may be out of sync with schema)
-- `repo/src/repositories/` — Repository layer
+- `app/src/config/` — layered config (flag > file > env > default)
+- `app/src/node/` — `full.rs`, `identity.rs`, `observation.rs`, `rate_limiter.rs`, `device_id.rs`, `revocation.rs`
+- `app/src/identity/` — device identity: `fingerprint.rs`, `adapt.rs`, `store.rs`, `replay.rs`
+- `app/src/position/` — position sources: `gps`, `fixed`, `mock`, `fallback`, `cache`
+- `app/src/provenance/` — `encode.rs` (canonical CBOR), `payload.rs`, `sign.rs`, `verify.rs`
+- `repo/src/models/`, `repo/src/repositories/`, `repo/src/geo.rs` (H3 cell types)
+- `db/src/migrations/` — **the schema is authoritative for table shape**
+- `ca/src/`, `bt_iden/src/`, `bt_mon/src/backends/`
+- `.knowledge/AGENTS.md` — knowledge-base index; `AGENTS.md` (repo root) — Rust conventions and project rules
 
-### Database
-- `db/src/migrations/` — PostgreSQL migration scripts
-- `.env.database` — Database connection credentials
-
-### Knowledge Base
-- `.knowledge/architecture/overview.md` — System design deep dive
-- `.knowledge/architecture/data-model.md` — Database schema reference
-- `.knowledge/architecture/provenance.md` — Security & signing design
-- `.knowledge/implementation/status.md` — Component-by-component status
-- `.knowledge/implementation/repo-divergence.md` — Model/schema mismatches
-
-## Quick Commands
+## Commands
 
 ```bash
-# Database migrations
-cargo run --bin db -- migrate apply
-
-# Run the app
-cargo run --bin app -- monitor
-
-# Query occurrences
+cargo run --bin app -- --help
+cargo run --bin app --features mock -- --use-mock-backend monitor   # scan path without an adapter
 cargo run --bin app -- query --last "1h"
-
-# View stats
 cargo run --bin app -- stats
+cargo run --bin app -- identity-replay --last 24h   # read-only unless --write
 
-# Run tests
-cargo test
+cargo run --bin db -- new-migration <name>          # never edit applied migrations
+cargo run --bin db -- --host database up            # full arg list: README.md:61
 
-# Format and lint
-cargo fmt && cargo clippy
+cargo fmt
+TMPDIR=/workspace/target/tmp cargo clippy --workspace --all-targets -j 2
+TMPDIR=/workspace/target/tmp cargo test --workspace -j 2
 ```
 
-## Subagent Model Selection
+## Reporting contract
 
-This project has **solar-powered fast agents** configured for offloading computational work:
-
-| Agent Name | Use Case | Model |
-|------------|----------|-------|
-| `fast-explore` | Code exploration, searching, discovery | qwen3.6-27b (solar) |
-| `fast-general` | General tasks, code modifications | qwen3.6-27b (solar) |
-| `researcher-27b` | Research and information gathering | qwen3.6-27b (solar) |
-
-**How to use:**
-```
-# Instead of generic agent tool, specify the named agent:
-agent → subagent_type: "fast-explore" or "fast-general"
-```
-
-This allows you to distribute workload across solar-powered compute resources.
-
-## Current Phase: Phase 0 — Single-Node Prototype
-
-**Exit criteria**: Working single-node system that captures Bluetooth occurrences with provenance signatures and stores them in the database.
-
-**Next actions**:
-1. Fix repo model to align with database schema
-2. Implement provenance signing (CBOR + Ed25519)
-3. Integrate H3 geo-indexing into storage flow
-4. Validate capture volume with real hardware
-
----
-
-*For complete architecture details, see `.knowledge/AGENTS.md`*
-*For Rust coding conventions, see `.qwen/RUST_GUIDE.md`*
+- Give `file:line` for every claim about code. Read it; do not infer it from a name.
+- Separate **observed** from **inferred**. "Not found" is a valid and useful answer — say it
+  instead of guessing.
+- If a doc and the code disagree, report both and trust the code.
+- Do not modify files, run migrations, or write to the database unless the task explicitly asks.
+- Budget is tight: prefer targeted searches over whole-file reads, and do not paste large files
+  into your answer.

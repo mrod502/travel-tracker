@@ -25,7 +25,19 @@ This is a Rust application for a DB/HTTP server application for tracking travel 
 | Path | Purpose |
 |------|---------|
 | `db/` | Database migration crate - PostgreSQL schema setup and migration management via CLI |
+| `bt_mon/` | Bluetooth LE monitoring crate - scanning, discovery, GATT I/O and device events behind a pluggable backend (btleplug / bluer / mock) |
 
+### Crate-specific agent guides
+
+- **`bt_mon/`** — Reach for this crate for anything that touches the Bluetooth radio: scanning, device discovery, GATT reads/writes, subscriptions, and the `DeviceEvent` stream that occurrence recording is fed from. Load @bt_mon/AGENTS.md before editing it or depending on it — the three backends differ sharply in what they can report (`raw_payload` means something different on each, and only `mock` is runnable in this container), and that file says which claim is verified by a test and which is still waiting on hardware.
+
+
+## Agents: Research/Exploration
+
+When a task has a research/exploration phase, launch the explore agent in the background
+first, then continue with work that doesn't depend on its findings. Do not duplicate the
+searches it's running. Incorporate its report when the notification arrives, before
+implementing on top of it. **IMPORTANT:** use agents `fast-explore` and `fast-general`  over the builtin `explore`/`general`
 
 
 ## IMPORTANT RULES
@@ -176,13 +188,7 @@ serde = { version = "1.0", features = ["derive"] }
    - Split into crates for parallel compilation
    - Use incremental compilation (enabled by default)
 
-2. **Runtime Performance**
-   - Use `cargo-flamegraph` for profiling
-   - Use `criterion` for benchmarking
-   - Profile with `perf` or `valgrind`
-   - Enable LTO for release builds
-
-3. **Memory Management**
+2. **Memory Management**
    - Use `Arc<T>` for shared ownership across threads
    - Use `Rc<T>` for single-threaded shared ownership
    - Use `Box<T>` for heap allocation

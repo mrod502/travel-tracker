@@ -2,7 +2,13 @@
 
 Component-by-component status of the workspace against the architectural plan.
 
-**Last updated:** October 12, 2026 (verification basis re-checked; see
+**Last updated:** October 14, 2026 (`bt_mon` tech-debt pass: the two silent-failure defects in the
+backends closed, bluer's event stream and advertisement data implemented, the advertisement-payload
+fork decided and recorded in [`raw-payload-decisions.md`](raw-payload-decisions.md) — item-by-item
+status, including what still needs a radio, in
+[`bt_mon/TECH_DEBT.md`](../../bt_mon/TECH_DEBT.md); previous pass October 13, 2026 — device identity:
+M37 closed, M36 re-scoped, B15 deferred, see
+[`device-identity-decisions.md`](device-identity-decisions.md); see
 [Verification Snapshot](#verification-snapshot-2026-09-02) for the superseded 2026-09-02 runs)
 **Verification basis:** the statements below marked *re-checked 2026-10-12* were confirmed against
 the working tree and against PostgreSQL 18.3 / PostGIS 3.6.4 / h3-pg 4.2.3 at `database:5432`.
@@ -30,7 +36,7 @@ not current. The only operator interface is the `app` CLI.
 
 | Phase | Description | Status | Notes |
 |-------|-------------|--------|-------|
-| **Phase 0** | Single-node prototype | **In progress — validated against a live database and the mock radio** | Scan → sign → store runs end to end and has been observed: migrations applied, mock-backend runs storing rows, revocation refusing a revoked node ([B11](../../GAP_ANALYSIS.md)). What has *not* run is real BLE hardware — this container has no adapter |
+| **Phase 0** | Single-node prototype | **In progress — validated against a live database, the mock radio, and real hardware** | Scan → sign → store runs end to end and has been observed: migrations applied, mock-backend runs storing rows, revocation refusing a revoked node ([B11](../../GAP_ANALYSIS.md)). On 2026-10-12 a node captured over a real adapter (btleplug on macOS) and stored 2,140 occurrences with `geo_cell_fine` and `geo_cell_macro` populated and present inside the signed bytes — the half of Stage 1's exit criterion that had never been observed. On 2026-10-13 the same run over BlueZ on Linux stored its own rows with the same generated cells, so the write path is observed on both supported platforms. What neither platform produced on those two runs is a device address — `[M36](../../GAP_ANALYSIS.md)` (CoreBluetooth) and `[M37](../../GAP_ANALYSIS.md)` (the BlueZ identifier parsed against the wrong shape, discarding the MAC inside it). **M37 was closed on 2026-10-13:** the platform identifier is normalised inside `bt_mon` (`DeviceId::from_platform_id`, `bt_mon/src/types.rs:103`), so a Linux row now carries `id_source: "ble_mac"` and a non-NULL `device_address`, and `device_address_links` can be fed from that platform; verified against a scratch database and pinned by tests, not on a radio — this container has no adapter. **M36 was re-scoped the same day** from a platform limit to a gap in the backend in use (the owner reports MAC addresses readable on macOS via `system_profiler`, unverified here) and is followed up as `[M38](../../GAP_ANALYSIS.md)`, Major not Blocking. **B15** (keyed `device_hash`) was **deferred by the owner on 2026-10-13** — the scheme is unchanged and pinned to golden vectors in `app/src/node/device_id.rs`, with the reasoning and the unimplemented keyed design in [`device-identity-decisions.md`](device-identity-decisions.md) |
 | **Phase 0.5** | CA infrastructure | **Partially done** | Enrollment works, and the node runtime now does use it: `[revocation].anchor_path` + `RevocationWatch` load and verify the CA's list at startup and gate storage ([B11](../../GAP_ANALYSIS.md)). Missing is the credential half — the node still never verifies its own `ca_credential`, and there is no key rotation ([M15](../../GAP_ANALYSIS.md)) |
 | **Phase 1** | Two-node sync | **Not started** | `rust-mqtt` is a declared `app` dependency with zero references in `app/src` |
 | **Phase 2** | Federated query layer | **Not started** | Depends on Phase 1 |
@@ -49,24 +55,34 @@ Feature gates: `default = ["btleplug"]`, plus `bluer`, `mock`, `full`.
 
 | Feature | Planned | Implemented | Notes |
 |---------|---------|-------------|-------|
-| Cross-platform BLE scanning | Yes | Yes | `backends/{btleplug,bluer,mock}.rs` |
-| Device discovery | Yes | Yes | Implemented |
-| GATT client operations | Yes | Yes | Read/write/subscribe |
-| Raw advertisement capture | Partial | Partial | Device info exposed; raw payload fields not surfaced in the API |
-| Advertisement type detection | Partial | Partial | `UpdateField` enum exists; no full BLE AD-structure parser |
-| Mock backend | — | Yes | Behind the `mock` feature |
+| Cross-platform BLE scanning | Yes | Yes | `backends/{btleplug,bluer,mock}.rs`; every backend publishes `DeviceEvent`s |
+| Device discovery | Yes | Yes | Scan re-armed on `scan_interval`; a lapsed controller session cannot leave a node deaf |
+| GATT client operations | Yes | Yes | Read/write (with or without an att response); notifications and indications on all three backends |
+| Raw advertisement capture | Partial | **Per backend** | bluer re-frames the structures BlueZ parsed and labels them `Reconstructed`; btleplug exposes none and says so; the mock carries real `Captured` structures. See [`raw-payload-decisions.md`](raw-payload-decisions.md) |
+| Advertisement type detection | Partial | Partial | `UpdateField` tracks what moved; no full AD-structure parser here — `bt_iden::ad` parses them downstream |
+| Radio health | — | Yes | `DeviceMonitor::health()`: powered/requested/discovering, re-arm and stream-open counters, sticky last error |
+| Mock backend | — | Yes | Behind `mock`; honours `MonitorConfig` through `MockConfig::from`, injects notifications, enforces its own permission flags |
 
-**Status:** ✅ **Functional for Phase 0** — 26 lib tests pass.
+**Status:** ✅ **Functional for Phase 0** — 129 lib tests, 4 integration tests and 29 doctests pass
+(`--all-features`, rustc 1.98.1), and the crate carries zero clippy warnings under
+`cargo clippy --workspace --all-targets`.
 
-**Defect:** `bt_mon/examples/mock_backend_demo.rs` imports `bt_mon::backends::mock` but the
-example declares no `required-features = ["mock"]`, so `cargo check --workspace
---all-targets` fails with E0432 unless `--features mock` is passed — a full workspace check
-is red until the example says what it needs.
+**What the 2026-10-14 pass changed:** the two silent-failure defects in the backend `app` runs
+(`notifications()` an empty stream that leaked a task per call; bluer addressing every GATT operation
+at the adapter's own MAC), bluer's missing event stream and missing advertisement data, the mock's
+inert simulation fields, the `Error` variants nothing ever raised, and the fact that neither real
+backend had any test reach at all. `bt_mon/TECH_DEBT.md` is the item-by-item record, including which
+claims are still waiting on a radio — the crate's runtime behaviour on real hardware is unchanged by
+that pass in the sense that it has never been observed here.
 
 **Gaps:**
-- Raw advertisement payload still not exposed for storage in `occurrences.signal_payload`.
-- No AD-structure parsing to populate `ble_address_type` / `adv_type` faithfully.
-- RSSI sampling rate is not configurable, which rate-limit validation needs.
+- No AD-structure parser in this crate, so `ble_address_type` / `adv_type` are still not derived from
+  what the radio heard.
+- A reconstructed payload cannot support an argument from absence, and `occurrences` has no column to
+  say which kind a stored `raw_payload_hex` was — see
+  [`raw-payload-decisions.md`](raw-payload-decisions.md).
+- `app/src/app.rs` still maps `MonitorConfig` onto `MockConfig` by hand; the crate now owns that
+  mapping.
 
 ---
 
@@ -256,7 +272,7 @@ Workstream status in [`geo-h3-alignment.md`](geo-h3-alignment.md).
 
 | Component | Phase 0 ready | Notes |
 |-----------|---------------|-------|
-| **bt_mon (BLE scanning)** | ✅ Yes | Works; raw payload and AD parsing still missing |
+| **bt_mon (BLE scanning)** | ✅ Yes | Works on all three backends; notifications and device events implemented everywhere; advertisement bytes per backend (bluer reconstructs and labels, btleplug exposes none); no AD-structure parser in this crate |
 | **bt_iden (identity resolution)** | n/a — Phase 3 | Complete library, no consumer |
 | **Database schema** | ⚠️ Partial | Authored; never executed; no partition for the current month |
 | **Repository layer** | ✅ Yes | Models now match the schema; `h3o` used |
@@ -268,6 +284,15 @@ Workstream status in [`geo-h3-alignment.md`](geo-h3-alignment.md).
 | **HTTP API** | ❌ No | Absent from both the code and the dependency tree |
 
 ---
+
+**Re-run 2026-10-14 (`bt_mon` only).** After the tech-debt pass: `cargo test -p bt_mon
+--all-features` is **129 unit + 4 integration + 29 doctests (3 ignored), 0 failures**, and
+`cargo clippy --workspace --all-targets` reports **81 warnings — app 73, repo 6, ca 2, bt_mon 0**,
+down from 83 with two in `bt_mon`. Every feature combination compiles and documents warning-free
+(`--no-default-features` alone, then `btleplug`, `bluer`, `mock`, `full`). The workspace numbers
+above are unchanged by this pass; the container still has no Bluetooth adapter, so none of the
+runtime behaviour of the two real backends has been observed — see the hardware-pending list in
+`bt_mon/TECH_DEBT.md`.
 
 ## Verification Snapshot (2026-09-02)
 
@@ -288,6 +313,14 @@ absent `DATABASE_URL`, which exists. Two notes for anyone reproducing it: `TMPDI
 inside `/workspace` (the container's `/tmp` is noexec, which breaks doctests), and the workspace
 invocation is the only comparable one — `cargo clippy -p app` alone reports different dead-code
 counts because the build graph changes.
+
+**Re-run 2026-10-13** (`cargo test --workspace -j 2`): **920 tests over 25 suites, 7 ignored**, no
+failures — the 905 above plus 15 tests added with the M37 fix — and `cargo test -p app --bins`
+passes 353 (from 346). Reaching that baseline first required repairing a pre-existing compile error
+in `app`'s test target: `app/src/config/layered.rs` used `DEFAULT_REVOCATION_MAX_STALENESS_SECS` and
+`DEFAULT_REVOCATION_REFRESH_SECS` in its assertions without importing them, so `cargo test
+--workspace` failed to build with 0 tests run. The fix is a test-scoped `use`; production code was
+untouched, and the same command then reproduced the 2026-10-12 figures exactly.
 
 Dead-code warnings worth reading as signal rather than noise: `VerifyError::InvalidSignature`,
 `VerifyError::InvalidPublicKey`, and `RevocationVerificationError::NodeRevoked` are *never

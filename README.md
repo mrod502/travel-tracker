@@ -15,8 +15,10 @@ This system deploys a network of nodes that scan Bluetooth advertisement traffic
 - **Gap Analysis** (what is real vs. what the end state requires): [`GAP_ANALYSIS.md`](GAP_ANALYSIS.md)
 - **Phase 0 Roadmap**: [`.knowledge/implementation/roadmap/phase_0/README.md`](.knowledge/implementation/roadmap/phase_0/README.md)
 - **Revocation Workflow**: [`REVOCATION_WORKFLOW.md`](REVOCATION_WORKFLOW.md)
+- **BlueZ Backend Handoff** (make the node selectable on bluer, then verify on real hardware):
+  [`BLUEZ_HANDOFF.md`](BLUEZ_HANDOFF.md)
 - **Example Configuration**: [`config.example.toml`](config.example.toml)
-- **CLI Usage**: `cargo run --bin app -- --help` (there is no separate handoff document)
+- **CLI Usage**: `cargo run --bin app -- --help` — the CLI has no separate reference document
 
 ## Tech Stack
 
@@ -138,16 +140,14 @@ cargo run --bin app -- ca ca-revoke
 cargo run --bin app -- ca ca-info
 cargo run --bin app -- ca ca-generate-rsl
 cargo run --bin app -- ca ca-export-anchor # publishes the CA public key for other nodes
-cargo run --bin app -- ca ca-migrate-key --from root_key.hex   # legacy hex key → PKCS#8
 ```
 
 Both key files are standard formats rather than one of this project's own: the root key is
 PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`, mode `0600`) and the published anchor is that same
 key as SubjectPublicKeyInfo PEM (`-----BEGIN PUBLIC KEY-----`, world-readable, since its whole
-use is being copied onto other machines). `openssl pkey` reads either. A root key written as
-bare hex by an earlier release is refused at load rather than guessed at, and the error names
-the command above; the conversion leaves the CA's id alone, so every credential and revocation
-list it published beforehand still verifies.
+use is being copied onto other machines). `openssl pkey` reads either. A key file in anything
+other than PKCS#8 PEM is refused at load rather than guessed at, because a secret read through
+the wrong decoder yields a confident, entirely wrong identity.
 
 ### How a key is represented
 
@@ -163,8 +163,7 @@ Hex is a display format and nothing else, which is why no wire format in this pr
 it: a signed document that embeds an identifier as one tool's spelling of its bytes is
 signing the spelling. Node keys follow the same rule — `node_identity.pem` (PKCS#8, `0600`)
 and `node_identity.pub.pem` (SPKI, written on every start so it cannot outlive the secret it
-belongs to) — and the JSON-with-hex file an earlier release wrote is converted on first start:
-same secret, same node id, old file renamed to `node_identity.json.bak` for you to delete.
+belongs to).
 
 Enroll a node by handing the CA the public file rather than retyping its contents:
 
@@ -192,11 +191,17 @@ advertisement bytes in `signal_payload.ble.raw_payload_hex`, inside the signatur
 Off by default. Turn it on when there is a CA whose lists this node should believe:
 
 ```bash
-cargo run --bin app -- ca ca-export-anchor                 # /var/lib/btmon/ca/root_key.pub.pem
-cargo run --bin app -- ca ca-revoke --node-id <hex>        # if there is anyone to revoke
-cargo run --bin app -- ca ca-generate-rsl                  # publish the list
+cargo run --bin app -- ca ca-export-anchor                          # /var/lib/btmon/ca/root_key.pub.pem
+cargo run --bin app -- ca ca-revoke --node-id <hex> --reason key-compromise
+cargo run --bin app -- ca ca-generate-rsl                           # publish the list
 # then [revocation].enabled = true, with anchor_path pointing at the file above
 ```
+
+`ca-revoke` records the revocation and publishes nothing; it reads no root key, because holding the
+key is what publication proves. `ca-generate-rsl` is the act that signs, and until it runs, no node
+can see the revocation — the command says so rather than implying the node is already stopped.
+Reasons: `unspecified` (default), `key-compromise`, `ca-compromise`, `ceased-operation`,
+`policy-violation`, `superseded`, `hold`.
 
 With it on, the node loads its CA's list at startup, re-reads it every
 `[revocation].refresh_secs`, and asks it before storing an occurrence. A revocation only takes
@@ -241,9 +246,9 @@ that was told about it stops accepting its data.
 | Crate | Purpose | State |
 |-------|---------|-------|
 | `app` | FullNode binary: scan → rate-limit → sign → store, plus the CA CLI | Implemented; verification and revocation are wired into the runtime but never exercised over a network (no P2P transport) |
-| `bt_mon` | BLE scanning library (btleplug / bluer / mock) | Working; raw advertisement payload not yet exposed |
+| `bt_mon` | BLE scanning library (btleplug / bluer / mock) | Working; advertisement bytes only where the backend exposes them — bluer re-frames BlueZ's parsed properties and labels them `Reconstructed`, btleplug reports `None`, the mock carries what it was configured with |
 | `repo` | sqlx models, repositories, and the client-side H3 module | Aligned with the schema |
-| `db` | Migration tool (`new-migration`, `up`, `down`, `reset`) | 14 migrations; applied by every `#[sqlx::test]` database and by `db up` against a real server |
+| `db` | Migration tool (`new-migration`, `up`, `down`, `reset`) | 13 migrations; applied by every `#[sqlx::test]` database and by `db up` against a real server |
 | `ca` | CA root, credentials, revocation status lists, policies | Library complete; the node consults it at runtime for its key and its revocation list |
 | `bt_iden` | Probabilistic device identity resolution | Library; driven offline by `app identity-replay`, which writes the derived tables |
 

@@ -1621,6 +1621,58 @@ mod tests {
         }
     }
 
+    /// B15 was deferred on 2026-10-13 (`.knowledge/implementation/device-identity-decisions.md`),
+    /// so the scheme in force is the one every stored row was written under. This pins
+    /// that at the signature level rather than in prose: a row carrying a MAC-derived
+    /// `device_hash` is signed, stored, read back, and verified over the stored bytes.
+    ///
+    /// It is the test that has to keep passing when B15 is eventually decided. Keying
+    /// the hash changes the value of a signed field, so *new* rows will verify and old
+    /// ones will not, and the only thing standing between that and a quiet break is a
+    /// test that says which bytes a given identifier must produce.
+    #[test]
+    fn a_stored_signature_over_a_mac_derived_device_hash_verifies() {
+        let identity = test_identity();
+        let device = beacon("Harbor Beacon", -71);
+
+        let device_identity = derive_device_identity(device.id.as_str());
+        let occurrence = signed_occurrence(
+            &identity,
+            &device,
+            &device_identity,
+            epoch(),
+            epoch(),
+            Some(&fix(PositionOrigin::Fixed)),
+            ble_signal_payload(&device, &device_identity, false),
+        )
+        .expect("signing the row");
+
+        // The hash is the unsalted SHA-256 of the six address bytes — the deferred
+        // scheme, named here in the test that checks its signature.
+        assert_eq!(
+            hex::encode(&occurrence.device_hash),
+            hex::encode(&device_identity.hash)
+        );
+        assert!(device_identity.mac_derived());
+
+        let signature = ed25519_dalek::Signature::try_from(occurrence.signature.as_slice())
+            .expect("64-byte signature");
+        identity
+            .verify(&occurrence.signed_payload, &signature)
+            .expect("a stored signature must verify over the stored payload");
+
+        // And the signed field is the row's field, byte for byte: a verifier holding
+        // only the row and the node's key is checking the same identifier.
+        let CanonicalPayload::V2(payload) = signed(&occurrence) else {
+            panic!("a node running this build writes v2");
+        };
+        assert_eq!(payload.device_hash, occurrence.device_hash);
+        assert_eq!(
+            payload.device_address.as_deref(),
+            occurrence.device_address.as_deref()
+        );
+    }
+
     #[test]
     fn the_signature_names_every_column_the_node_authors() {
         let identity = test_identity();
@@ -1992,6 +2044,37 @@ mod tests {
             ble_signal_payload(&device, &derive_device_identity(device.id.as_str()), true);
 
         assert!(!ble(&payload).contains_key("raw_payload_hex"), "{payload}");
+    }
+
+    /// M37 end to end: a peripheral heard through BlueZ arrives as
+    /// `hci0/dev_F4_FE_FB_CC_78_58`, and the row has to come out carrying the
+    /// MAC that was inside it all along.
+    ///
+    /// Before the fix this exact input produced `id_source: "opaque_id"`, a NULL
+    /// `device_address`, and a hash of a string containing the node's own adapter
+    /// name — so `device_address_links` could not be fed from Linux at all, and
+    /// the same device was a different one behind a second dongle.
+    #[test]
+    fn a_peripheral_heard_through_bluez_is_stored_with_its_address() {
+        let bluez_id = bt_mon::DeviceId::from_platform_id("hci0/dev_F4_FE_FB_CC_78_58");
+        let device = BluetoothDevice::new(bluez_id.clone(), bluez_id.to_string());
+
+        let device_identity = derive_device_identity(device.id.as_str());
+        let payload = ble_signal_payload(&device, &device_identity, false);
+        assert_eq!(ble(&payload)["id_source"], serde_json::json!("ble_mac"));
+        assert_eq!(ble(&payload)["mac_derived"], serde_json::json!(true));
+        assert_eq!(ble(&payload)["address"], serde_json::json!("f4fefbcc7858"));
+
+        let row = build_from(&test_identity(), &device, None, epoch(), epoch(), payload);
+        assert_eq!(
+            row.device_address,
+            Some(vec![0xF4, 0xFE, 0xFB, 0xCC, 0x78, 0x58])
+        );
+        assert_eq!(
+            row.device_hash,
+            derive_device_identity("F4:FE:FB:CC:78:58").hash,
+            "the adapter name must not be part of what gets hashed"
+        );
     }
 
     #[test]

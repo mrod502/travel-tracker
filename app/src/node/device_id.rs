@@ -274,4 +274,77 @@ mod tests {
         assert_eq!(IdentifierSource::Uuid.as_str(), "uuid");
         assert_eq!(IdentifierSource::Opaque.as_str(), "opaque_id");
     }
+
+    /// Which adapter heard a device is not part of the device, so it must never
+    /// reach the bytes that get hashed.
+    ///
+    /// This is the composition the two crates got wrong in M37: `bt_mon` spelled
+    /// the identifier `hci0/dev_F4_FE_FB_CC_78_58`, this module's MAC parser
+    /// rejected it, and the adapter name went into the hash with the `OPAQUE_TAG`
+    /// in front. Testing each crate alone would not have caught it — only the
+    /// handover between them does — so this test runs the real btleplug spelling
+    /// through the real normaliser and then through the real hash.
+    #[test]
+    fn the_adapter_name_cannot_reach_the_hash() {
+        let observed = |adapter: &str| {
+            let id =
+                bt_mon::DeviceId::from_platform_id(&format!("{adapter}/dev_F4_FE_FB_CC_78_58"));
+            derive_device_identity(id.as_str())
+        };
+
+        let through_hci0 = observed("hci0");
+        let through_hci1 = observed("hci1");
+
+        assert_eq!(
+            through_hci0.hash, through_hci1.hash,
+            "one peripheral became two devices because the adapter name was hashed"
+        );
+        assert_eq!(through_hci0.source, IdentifierSource::BleMac);
+        assert!(through_hci0.mac_derived());
+        assert_eq!(
+            through_hci0.address,
+            Some(vec![0xF4, 0xFE, 0xFB, 0xCC, 0x78, 0x58])
+        );
+        // And it is the same identity the node would have recorded for a backend
+        // that reports the address bare — Windows, Android, or the mock beacon.
+        assert_eq!(
+            through_hci0.hash,
+            derive_device_identity("F4:FE:FB:CC:78:58").hash
+        );
+    }
+
+    /// The deferred scheme, pinned to its output bytes.
+    ///
+    /// B15 — whether `device_hash` should be keyed at all — was **deferred by the
+    /// owner on 2026-10-13**, so unsalted SHA-256 stays (see
+    /// `.knowledge/implementation/device-identity-decisions.md`). A decision to leave
+    /// something alone is the easy kind to lose: the next reader to work through the
+    /// enumeration argument reaches for HMAC, and the change then arrives dressed as a
+    /// refactor rather than as the signature-level break it is. These vectors are what
+    /// makes that impossible — any key moves every one of them.
+    #[test]
+    fn the_unkeyed_scheme_is_pinned_by_its_own_bytes() {
+        // SHA-256 over the six address bytes, untagged: what `device_hash` has held
+        // since before this module existed.
+        assert_eq!(
+            hex::encode(derive_device_identity("AA:BB:CC:DD:EE:FF").hash),
+            "17226b1f68aebacdef0746450f642874638b295707ef73fb2c6bb7f88e89929f"
+        );
+        // The address M37 was captured with, once the adapter prefix is stripped.
+        assert_eq!(
+            hex::encode(
+                derive_device_identity(
+                    bt_mon::DeviceId::from_platform_id("hci0/dev_F4_FE_FB_CC_78_58").as_str()
+                )
+                .hash
+            ),
+            "3208d1bd8edef774ab2e7900fc731a14387c43a792f4206b3b69117d5fe8ea27"
+        );
+        // And the opaque branch — what every Linux row actually carried before the M37
+        // fix. Recorded so those rows stay reproducible, not because the scheme is good.
+        assert_eq!(
+            hex::encode(derive_device_identity("hci0/dev_F4_FE_FB_CC_78_58").hash),
+            "5787b901912176b300ca33221b64e57020830c5f4602ba95b1bbdcb605a8dfcf"
+        );
+    }
 }

@@ -7,7 +7,8 @@ This application monitors Bluetooth Low Energy (BLE) devices and stores discover
 - Real-time Bluetooth device scanning and monitoring
 - Automatic storage of device discoveries in PostgreSQL
 - Configurable scan intervals
-- Multiple Bluetooth backends (btleplug cross-platform, bluer Linux-specific)
+- Bluetooth via `bt_mon`: the btleplug radio or a simulated one (see
+  [Bluetooth Backend Selection](#bluetooth-backend-selection))
 - Environment variable and CLI argument configuration
 - Comprehensive logging with configurable levels
 
@@ -208,15 +209,34 @@ CREATE INDEX idx_occurrences_device_address ON bluetooth_occurrences(device_addr
 
 ## Bluetooth Backend Selection
 
-By default, the application uses the `btleplug` backend (cross-platform). You can switch to the `bluer` backend (Linux-specific) by building with the appropriate features:
+The node builds one of two monitors at startup:
 
 ```bash
-# Default (btleplug backend)
+# Default: btleplug, against a physical adapter
 cargo run --bin app
 
-# Linux-specific bluer backend
-cargo run --bin app --features bluer --no-default-features
+# The mock radio: no hardware, a handful of simulated beacons on the air
+cargo run --bin app --features mock -- --use-mock-backend monitor
 ```
+
+Options go *before* the subcommand — `app monitor --use-mock-backend` is a clap error (exit 2), not a
+silently accepted flag. `monitor` may be left off; it is the default subcommand.
+
+The `mock` build feature is what makes the switch mean anything. The flag itself is accepted in every
+build, and so are `BT_USE_MOCK_BACKEND=true` and `[bluetooth].use_mock_backend`, but without the
+feature the branch that would construct the simulated radio is not compiled in and the node opens
+btleplug anyway.
+
+**The `bluer` cargo feature is not a backend switch.** `--features bluer` turns on `bt_mon/bluer`,
+which compiles the BlueZ backend into the binary — and nothing in `app` constructs one, so the node
+still runs btleplug. Adding `--no-default-features` does not turn btleplug off either: `app`'s default
+feature set is empty, and its dependency is declared without `default-features = false`, so `bt_mon`
+keeps its own `default = ["btleplug"]`.
+
+Running the node on bluer is a code change, not a build flag: a branch where `App::run` builds its
+`Box<dyn DeviceMonitor>` that calls `bt_mon::create_bluer_monitor_with_config`. The library side is
+ready and documented in [`bt_mon/README.md`](../bt_mon/README.md); until that branch exists, the
+config example under `.config/backends/bluer/` describes a backend the node cannot be pointed at.
 
 ## Permissions
 

@@ -29,8 +29,7 @@ use super::flags::Flags;
 use super::{
     AppConfig, BluetoothConfig, CaConfig, DatabaseConfig, LogConfig, NodeConfig, RevocationConfig,
     DEFAULT_CA_KEY_PATH, DEFAULT_CA_NODE_TYPE, DEFAULT_CA_VALIDITY_DAYS, DEFAULT_LOG_LEVEL,
-    DEFAULT_RATE_LIMIT_MS,
-    DEFAULT_SCAN_INTERVAL_MS, DEFAULT_STREAM_REOPEN_DELAY_MS,
+    DEFAULT_RATE_LIMIT_MS, DEFAULT_SCAN_INTERVAL_MS, DEFAULT_STREAM_REOPEN_DELAY_MS,
 };
 
 /// Environment variables read by the env layer.
@@ -615,6 +614,10 @@ fn parse_gps_backend(raw: &str) -> Result<GpsBackend, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the assertions below need these; the resolver takes them through
+    // `RevocationConfig::default()`, so importing them at module scope would be
+    // an unused import in every non-test build.
+    use crate::config::{DEFAULT_REVOCATION_MAX_STALENESS_SECS, DEFAULT_REVOCATION_REFRESH_SECS};
     use std::collections::HashMap;
 
     /// An env layer with exactly these variables.

@@ -23,11 +23,25 @@
 //! | name | `name` | `advertised_name`, else `ble.name` |
 //! | manufacturer | `manufacturer_data` | `ble.manufacturer_data` |
 //! | advertised service list | `service_data` keys — `Derived` | `ble.service_uuids` — `Derived` |
-//! | layout, appearance, connectability | only with `raw_payload` | only with `ble.raw_payload_hex` |
+//! | layout, appearance, connectability | only with `raw_payload`, which btleplug never gives | only with `ble.raw_payload_hex` |
 //!
 //! The service list is `Derived` on both paths because it is read off *service data*: a
 //! device advertising a service without data, or a stack that has not resolved GATT yet,
 //! changes that list without changing the advertisement it was scored against.
+//!
+//! A payload is not one kind of evidence, and the last row depends on which kind it is.
+//! `bt_mon` labels every payload it hands over (`RawPayloadSource::{Captured,
+//! Reconstructed}`): captured bytes are what the controller heard, a reconstructed payload
+//! is BlueZ's parsed advertisement properties re-framed into AD structures — ordered by AD
+//! type rather than on-air order, and limited to the types BlueZ considers safe to expose.
+//! So the absence of a structure in a reconstructed payload is not a fact about the
+//! advertisement, and scoring it as one would let the resolver conclude a device *omitted*
+//! something its own stack never reported. `occurrences` carries no column for
+//! `raw_payload_source`, so a stored row cannot say which kind its hex came from, and a
+//! replay has to read every stored payload as the weaker kind: present structures are
+//! evidence, absences are not. Adding that column is what would let a replay tell them
+//! apart; until then the live adapter must put the source on the observation rather than
+//! inferring it.
 //!
 //! Nothing here is wired into the live pipeline. The stored-row adapter exists so a
 //! decision can be replayed and read before anything acts on it in real time.

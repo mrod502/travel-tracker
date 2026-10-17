@@ -140,6 +140,20 @@ pub struct Decision {
     /// Other identifiers already under this identity — the part a reader can check
     /// against the real world.
     pub with_identifiers: Vec<String>,
+    /// Whether this decision joined an identifier of a different kind into the
+    /// identity, which makes whatever matched them **not comparable**.
+    ///
+    /// `adapt` keys an observation with no address on six bytes of
+    /// `occurrences.device_hash`, because that is the only identifier the row has.
+    /// Six bytes of a hash and six bytes reported by a radio are then compared by
+    /// the same exact-address feature, and that feature is unweighted and
+    /// decisive — so a match between the two is a coincidence of representation,
+    /// not evidence that one device was seen two ways. The merge is still reported
+    /// rather than suppressed, because the batch is a review tool and a suppressed
+    /// decision cannot be argued with; it is flagged so that nothing downstream can
+    /// read it as a cross-source identification. See
+    /// `.knowledge/implementation/device-identity-decisions.md` (M36).
+    pub non_comparable_join: bool,
 }
 
 impl Decision {
@@ -267,6 +281,30 @@ impl ReplayReport {
         scored.iter().sum::<f64>() / scored.len() as f64
     }
 
+    /// Decisions that joined identifiers of two different sources.
+    ///
+    /// Reported separately from the refusals because these were *not* refused: they
+    /// are the decisions whose evidence compares a radio-reported address with a
+    /// hash prefix, and so cannot be read as identifying one device across sources.
+    pub fn non_comparable_joins(&self) -> usize {
+        self.decisions
+            .iter()
+            .filter(|decision| decision.non_comparable_join)
+            .count()
+    }
+
+    /// The identity scheme every one of these rows was written under.
+    ///
+    /// `device_hash` is unsalted SHA-256 and always has been (B15 is open, so there
+    /// is no second scheme to distinguish yet). The replay states it rather than
+    /// leaving a reader to infer it, because the day B15 lands, a report line that
+    /// does not say which scheme produced its identifier cannot be compared against
+    /// a report line from before the change. See
+    /// `.knowledge/implementation/device-identity-decisions.md`.
+    pub fn identity_scheme(&self) -> &'static str {
+        "sha256-unsalted-v1"
+    }
+
     /// The pass as text, for a terminal or a log file.
     pub fn render_text(&self) -> String {
         use std::fmt::Write;
@@ -280,6 +318,12 @@ impl ReplayReport {
             self.identity_count(),
             self.merge_count(),
             self.mean_coverage(),
+        );
+        let _ = writeln!(
+            out,
+            "   identity scheme {scheme} (B15 open: every device_hash here is unsalted \
+             SHA-256, so no line is comparable with one written under a keyed scheme)",
+            scheme = self.identity_scheme(),
         );
 
         for decision in &self.decisions {
@@ -316,6 +360,25 @@ impl ReplayReport {
             if !decision.missing.is_empty() {
                 let _ = writeln!(out, "       not observed: {}", carried(&decision.missing));
             }
+            if decision.non_comparable_join {
+                let _ = writeln!(
+                    out,
+                    "       NOT COMPARABLE: {} joined an identifier of source {} into an \
+                     identity held by another source — the identifier kinds are not the same \
+                     datum (see device-identity-decisions.md, M36)",
+                    decision.decision.as_str(),
+                    decision.identifier_source,
+                );
+            }
+        }
+
+        let non_comparable = self.non_comparable_joins();
+        if non_comparable > 0 {
+            let _ = writeln!(
+                out,
+                "-- non-comparable decisions: {non_comparable} — these join identifiers from \
+                 different sources and must not be read as cross-source identity --"
+            );
         }
 
         let refusals = self.refusals();
@@ -436,6 +499,13 @@ pub fn replay(observations: &[FeedObservation], options: &ReplayOptions) -> Repl
             .map(|tracked| tracked.identifier_names())
             .unwrap_or_default();
 
+        // Read before `absorb` too, which is what makes this "the identity held a
+        // different kind of identifier" rather than "this identity has more than one
+        // source in it now" — the latter would be true of the observation itself.
+        let non_comparable_join = tracked
+            .get(&identity)
+            .is_some_and(|tracked| tracked.spans_other_source(feed.identifier.source));
+
         tracked
             .entry(identity)
             .or_insert_with(|| Tracked::new(identity))
@@ -464,6 +534,7 @@ pub fn replay(observations: &[FeedObservation], options: &ReplayOptions) -> Repl
                 .map(|(feature, weight)| (feature.label(), weight))
                 .collect(),
             with_identifiers,
+            non_comparable_join,
         });
 
         if let (Some(node), Some(cell)) = (feed.observer_node_id.clone(), feed.geo_cell_macro) {
@@ -653,6 +724,20 @@ impl Tracked {
         identifier.last_seen = identifier.last_seen.max(feed.occurred_at);
     }
 
+    /// True when this identity already holds an identifier from a different source,
+    /// so any match with the incoming one compares two kinds of thing.
+    ///
+    /// `ble_mac` bytes come off a radio and are globally comparable. `uuid` and
+    /// `opaque_id` bytes are a hash prefix of a host-assigned identifier, unique to
+    /// the host that assigned it. `derived` is six bytes of `device_hash` from a row
+    /// that recorded no address at all. None of those is the same datum as another,
+    /// and the resolver compares them with the same decisive exact-address feature.
+    fn spans_other_source(&self, source: &'static str) -> bool {
+        self.identifier_sources
+            .iter()
+            .any(|recorded| recorded != source)
+    }
+
     fn identifier_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .identifiers
@@ -770,6 +855,135 @@ mod tests {
 
     fn node(seed: u8) -> Vec<u8> {
         vec![seed; 32]
+    }
+
+    /// The same feed, but arrived under a chosen identifier source.
+    ///
+    /// `feed` can only say `ble_mac`, and the question M36 asks is precisely what
+    /// happens when the source is *not* a reported address: `adapt` keys such a row
+    /// on six bytes of `device_hash`, and the resolver compares those bytes with the
+    /// same decisive exact-address feature it uses for a MAC.
+    fn feed_from(
+        observation: AdvertisementObservation,
+        node: &[u8],
+        source: &'static str,
+        reported: bool,
+    ) -> FeedObservation {
+        let bytes = *observation.address.as_bytes();
+        let mut hash = Vec::with_capacity(32);
+        hash.extend_from_slice(&bytes);
+        hash.resize(32, 0x5a);
+        FeedObservation {
+            identifier: super::super::adapt::ObservedIdentifier {
+                bytes,
+                source,
+                reported,
+            },
+            occurred_at: at(observation.timestamp.micros_since_epoch().unwrap() as i64 / 1_000_000),
+            observer_node_id: Some(node.to_vec()),
+            geo_cell_macro: Some(cell(LAT)),
+            device_hash: Some(hash),
+            occurrence_id: None,
+            observation,
+        }
+    }
+
+    /// M36: a CoreBluetooth identifier is unique to the host that assigned it, so a
+    /// decision that joins one to a radio-reported address is comparing two kinds of
+    /// thing. It is still shown — the batch exists so decisions can be argued with,
+    /// not so they can be hidden — but it is labelled, so nothing downstream can read
+    /// it as cross-source identity.
+    #[test]
+    fn a_decision_across_identifier_sources_is_reported_as_non_comparable() {
+        let address = [0xf0, 0xee, 0, 0, 0, 1];
+        let observations = vec![
+            feed_from(
+                talkative(1_000, address, "Sensor A", 0x004c),
+                &node(1),
+                "ble_mac",
+                true,
+            ),
+            // No address in the row at all; these six bytes are `device_hash`'s prefix,
+            // and they coincide with the address the first row's radio reported.
+            feed_from(
+                talkative(1_010, address, "Sensor A", 0x004c),
+                &node(1),
+                "derived",
+                false,
+            ),
+        ];
+
+        let report = replay(&observations, &options());
+
+        assert!(
+            !report.decisions[0].non_comparable_join,
+            "the first observation joins nothing, so there is nothing to be non-comparable with"
+        );
+        assert!(
+            report.decisions[1].non_comparable_join,
+            "a derived hash prefix was absorbed as if it were a reported address"
+        );
+        assert_eq!(report.non_comparable_joins(), 1);
+        // And the persisted identity says so too, because its fingerprint keys on the
+        // source and `mixed` is a different key from either single-source fingerprint.
+        assert_eq!(
+            report.identities[0].fingerprint.identifier_source, "mixed",
+            "a mixed-source identity must not hash to the same fingerprint as a clean one"
+        );
+
+        let text = report.render_text();
+        assert!(text.contains("NOT COMPARABLE"), "{text}");
+        assert!(
+            text.contains("non-comparable decisions: 1"),
+            "the summary must count them: {text}"
+        );
+    }
+
+    /// The control for the test above: two observations of the same kind merge with no
+    /// warning, so the flag reports the cross-source case rather than every merge.
+    #[test]
+    fn two_observations_under_the_same_source_are_not_flagged() {
+        let address = [0xf0, 0xee, 0, 0, 0, 1];
+        let observations = vec![
+            feed_from(
+                talkative(1_000, address, "Sensor A", 0x004c),
+                &node(1),
+                "ble_mac",
+                true,
+            ),
+            feed_from(
+                talkative(1_010, address, "Sensor A", 0x004c),
+                &node(1),
+                "ble_mac",
+                true,
+            ),
+        ];
+
+        let report = replay(&observations, &options());
+
+        assert_eq!(report.non_comparable_joins(), 0);
+        assert!(!report.render_text().contains("NOT COMPARABLE"));
+        assert_eq!(
+            report.identities[0].fingerprint.identifier_source, "ble_mac",
+            "one clean source stays itself"
+        );
+    }
+
+    /// The scheme the report states, and why stating it is not decoration.
+    #[test]
+    fn the_report_names_the_identity_scheme_it_replayed() {
+        let report = replay(
+            &[feed_from(
+                talkative(1_000, [0xf0, 0xee, 0, 0, 0, 1], "Sensor A", 0x004c),
+                &node(1),
+                "ble_mac",
+                true,
+            )],
+            &options(),
+        );
+
+        assert_eq!(report.identity_scheme(), "sha256-unsalted-v1");
+        assert!(report.render_text().contains("sha256-unsalted-v1"));
     }
 
     fn options() -> ReplayOptions {

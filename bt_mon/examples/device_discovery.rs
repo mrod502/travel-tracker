@@ -6,12 +6,13 @@
 //! # Running the example
 //!
 //! ```bash
-//! # Using the default (btleplug) backend
+//! # btleplug backend (the default; this example is gated on that feature)
 //! cargo run --example device_discovery
-//!
-//! # Using the bluer backend (Linux only)
-//! cargo run --example device_discovery --features bluer --no-default-features
 //! ```
+//!
+//! For the BlueZ backend see [`bluer_scan_and_gatt.rs`](bluer_scan_and_gatt.rs), which
+//! also covers connect, service discovery, reads and notifications — the calls that need
+//! a radio to verify and that this example does not exercise.
 //!
 //! # Requirements
 //!

@@ -6,12 +6,12 @@
 //! # Running the example
 //!
 //! ```bash
-//! # Using the default (btleplug) backend
+//! # btleplug backend (the default; this example is gated on that feature)
 //! cargo run --example subscribe_notifications -- <device_id> <characteristic_uuid>
-//!
-//! # Using the bluer backend (Linux only)
-//! cargo run --example subscribe_notifications --features bluer --no-default-features -- <device_id> <characteristic_uuid>
 //! ```
+//!
+//! The same path on the BlueZ backend is in
+//! [`bluer_scan_and_gatt.rs`](bluer_scan_and_gatt.rs).
 //!
 //! # Arguments
 //!
@@ -30,6 +30,12 @@
 //! # Subscribe to Heart Rate Measurement (0x2A37)
 //! cargo run --example subscribe_notifications -- AA:BB:CC:DD:EE:FF 00002a37-0000-1000-8000-00805f9b34fb
 //! ```
+//!
+//! # What arrives
+//!
+//! `notifications()` is one stream per device carrying every frame that device sends,
+//! including frames another consumer subscribed for. Each frame names the characteristic it
+//! arrived on and, on the backends that know it, the service that owns it.
 
 use bt_mon::{create_btleplug_monitor, CharacteristicUuid, DeviceId, DeviceMonitor, GattClient};
 use futures_util::stream::StreamExt;
@@ -114,6 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Notification from {}: {:02x?}",
             notification.characteristic, notification.value
         );
+        if let Some(service) = notification.service {
+            debug!("  Service: {}", service);
+        }
 
         // Try to decode as UTF-8 string
         if let Ok(text) = std::str::from_utf8(&notification.value) {
@@ -123,20 +132,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // For heart rate monitors, decode the value
         if notification.characteristic
             == CharacteristicUuid::parse_str("00002a37-0000-1000-8000-00805f9b34fb")?
+            && notification.value.len() >= 2
         {
-            if notification.value.len() >= 2 {
-                let flags = notification.value[0];
-                let heart_rate_is_16bit = (flags & 0x01) == 0;
+            let flags = notification.value[0];
+            let heart_rate_is_16bit = (flags & 0x01) == 0;
 
-                if heart_rate_is_16bit {
-                    if notification.value.len() >= 4 {
-                        let hr = u16::from_le_bytes([notification.value[1], notification.value[2]]);
-                        info!("  Heart Rate: {} bpm", hr);
-                    }
-                } else {
-                    let hr = notification.value[1];
+            if heart_rate_is_16bit {
+                if notification.value.len() >= 4 {
+                    let hr = u16::from_le_bytes([notification.value[1], notification.value[2]]);
                     info!("  Heart Rate: {} bpm", hr);
                 }
+            } else {
+                let hr = notification.value[1];
+                info!("  Heart Rate: {} bpm", hr);
             }
         }
     }

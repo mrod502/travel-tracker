@@ -46,6 +46,13 @@ required-features = ["btleplug"]
 name = "subscribe_notifications"
 required-features = ["btleplug"]
 
+# The bluer analogue of the three above: scan, connect, discover, read, notify. Gated on
+# `bluer` because it calls the BlueZ entry point, and because the paths it exercises are
+# the ones only a radio can verify.
+[[example]]
+name = "bluer_scan_and_gatt"
+required-features = ["bluer"]
+
 [[example]]
 name = "mock_backend_demo"
 required-features = ["mock"]

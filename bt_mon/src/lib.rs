@@ -2,15 +2,24 @@
 //!
 //! This library provides a unified interface for discovering and interacting with
 //! Bluetooth Low Energy (BLE) devices. It abstracts over the underlying backend,
-//! supporting both `btleplug` (cross-platform) and `bluer` (Linux/BlueZ).
+//! supporting `btleplug` (cross-platform), `bluer` (Linux/BlueZ), and a `mock`
+//! simulated radio.
 //!
-//! # Features
+//! # What this crate does
 //!
-//! - Device discovery and scanning
+//! - Scanning, with a scan that keeps itself armed rather than lapsing silently
 //! - Device connection and disconnection
-//! - GATT service and characteristic discovery
-//! - Characteristic read/write operations
-//! - Characteristic notification subscription
+//! - GATT service and characteristic discovery, read and write
+//! - Notification and indication subscription, as a per-device stream
+//!   ([`GattClient::notifications`]) that carries every frame of that device
+//!   regardless of who subscribed
+//! - [`DeviceEvent`]s: what the radio said about a device, and which fields moved
+//!   ([`changed_device_fields`])
+//! - [`MonitorHealth`]: whether the monitor is able to hear the radio at all, which
+//!   no device event can express — a dead adapter otherwise looks like an empty room
+//!
+//! This crate exposes no GATT *server* and no BLE advertiser. It is a central that
+//! scans and talks to peripherals.
 //!
 //! # Backend Selection
 //!
@@ -41,20 +50,34 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), bt_mon::Error> {
 //! use bt_mon::{DeviceMonitor, create_btleplug_monitor};
+//! use futures::StreamExt;
 //!
 //! // Create a monitor using the btleplug backend (cross-platform)
 //! let monitor = create_btleplug_monitor().await?;
 //!
+//! // Open the event stream *before* scanning: a stream opened later only sees the
+//! // reports that arrive after it (bluer and the mock replay what they have already
+//! // cached, btleplug does not).
+//! let mut events = monitor.device_events().await?;
+//!
 //! // Start scanning for devices
 //! monitor.start_scan().await?;
 //!
-//! // Get discovered devices
-//! let devices = monitor.devices().await?;
-//! println!("Found {} devices", devices.len());
-//!
+//! while let Some(event) = events.next().await {
+//!     println!("{event:?}");
+//! }
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Reading a payload
+//!
+//! [`BluetoothDevice::raw_payload`] is not the same kind of thing on every backend:
+//! btleplug never exposes the bytes, bluer rebuilds the structures BlueZ reported,
+//! the mock carries what it was configured with.
+//! [`BluetoothDevice::raw_payload_source`] says which of those a given value is, and
+//! [`RawPayloadSource::Reconstructed`] means the payload's *silences* are not evidence
+//! that an advertising structure was absent. See [`types`] for the table.
 
 // Core modules
 pub mod config;
@@ -66,14 +89,14 @@ pub use config::{adapter_matches, MonitorConfig, DEFAULT_SCAN_INTERVAL};
 pub use error::{BackendKind, Error, Result};
 pub use types::{
     BluetoothDevice, CharacteristicProperties, CharacteristicUuid, DeviceId, GattCharacteristic,
-    GattService, ServiceUuid, ValueNotification,
+    GattService, RawPayloadSource, ServiceUuid, ValueNotification,
 };
 
 // Monitor traits
 pub mod monitor;
 
 // Re-export traits for convenience
-pub use monitor::{DeviceMonitor, GattClient};
+pub use monitor::{DeviceMonitor, GattClient, MonitorHealth};
 
 // Re-export event types
 //
@@ -163,9 +186,16 @@ pub async fn create_btleplug_monitor_with_config(
 
 /// Create a new Bluetooth monitor using the bluer backend (Linux/BlueZ only).
 ///
-/// This function is only available when the `bluer` feature is enabled.
-/// The bluer backend provides Linux-specific features like GATT server support
-/// and BLE advertising, but requires BlueZ 5.43+ and is Linux-only.
+/// This function is only available when the `bluer` feature is enabled. It needs
+/// BlueZ 5.43+ and a reachable D-Bus, and it is Linux-only.
+///
+/// What it does differently from `btleplug`: it talks to BlueZ directly, so
+/// `services_resolved` is BlueZ's own answer rather than a proxy for the link,
+/// discovery is re-opened when the D-Bus subscription ends, and
+/// [`raw_payload`](BluetoothDevice::raw_payload) carries the advertising structures
+/// BlueZ reported — rebuilt from its typed properties and labelled
+/// [`RawPayloadSource::Reconstructed`], because BlueZ does not hand over the bytes
+/// and their on-air order is not among the things it says.
 ///
 /// # Errors
 ///
@@ -221,7 +251,12 @@ pub async fn create_bluer_monitor_with_config(
 ///
 /// - Simulated device discovery and connection
 /// - Configurable error responses for testing error handling
-/// - Simulated GATT services and characteristics
+/// - Simulated GATT services and characteristics, with `allow_read` /
+///   `allow_write` / `allow_subscribe` enforced in addition to the declared
+///   properties
+/// - Injected notifications
+///   ([`send_notification`](backends::mock::MockMonitor::send_notification)) and an
+///   optional automatic replay of configured values on a cadence
 /// - Configurable delays to simulate network/Bluetooth latency
 ///
 /// The return type is the concrete [`MockMonitor`](backends::mock::MockMonitor)
@@ -260,7 +295,7 @@ pub async fn create_mock_monitor() -> Result<crate::backends::mock::MockMonitor>
 /// `create_mock_monitor` builds a harness: the room is empty until the caller
 /// adds a device to it, so a scan of an unattended run discovers nothing. Put
 /// advertisers in the config to get an environment instead — see
-/// [`MockConfig::with_advertiser_count`].
+/// [`with_advertiser_count`](backends::mock::MockConfig::with_advertiser_count).
 ///
 /// [`MockConfig`]: backends::mock::MockConfig
 ///
@@ -292,9 +327,26 @@ pub async fn create_mock_monitor_with_config(
 
 #[cfg(test)]
 mod tests {
+    /// Smoke test for the surface a consumer compiles against: the names re-exported here
+    /// exist, are usable, and say what the documentation says they say. A re-export that
+    /// disappears breaks downstream, not this crate, which is why it is checked at the root.
     #[test]
-    fn test_library_compiles() {
-        // This test just verifies that the library compiles with default features
-        assert!(true);
+    fn the_crate_root_offers_what_it_promises() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<crate::MonitorConfig>();
+        assert_send_sync::<crate::BluetoothDevice>();
+        assert_eq!(
+            crate::MonitorConfig::new().scan_interval,
+            crate::DEFAULT_SCAN_INTERVAL,
+            "the documented default cadence has to be the one a default configuration uses"
+        );
+
+        // `None` on both halves is the "this backend exposes no advertisement bytes"
+        // spelling, and it is the shape a device starts in before any radio touches it.
+        let device =
+            crate::BluetoothDevice::new(crate::DeviceId::new("AA:BB:CC:DD:EE:FF"), String::new());
+        assert_eq!(device.raw_payload, None);
+        assert_eq!(device.raw_payload_source, None);
     }
 }

@@ -18,11 +18,14 @@ use std::fmt;
 /// Unique identifier for a Bluetooth device.
 ///
 /// This is a backend-agnostic string wrapper that uniquely identifies
-/// a Bluetooth device. The format is platform-specific:
+/// a Bluetooth device. Backends report it in a platform-specific form, so
+/// construct it with [`DeviceId::from_platform_id`] rather than from the raw
+/// string unless the platform has already been accounted for:
 ///
-/// - On Linux/BlueZ: MAC address (e.g., "AA:BB:CC:DD:EE:FF")
-/// - On macOS: UUID string
-/// - On Windows: Platform-specific identifier
+/// - On Linux/BlueZ: the D-Bus object path tail, `hci0/dev_AA_BB_CC_DD_EE_FF`,
+///   which carries the adapter the device was heard on
+/// - On macOS: a host-local UUID — CoreBluetooth exposes no address to a central
+/// - On Windows/Android: a bare colon-separated MAC address
 ///
 /// # Example
 ///
@@ -55,6 +58,106 @@ impl DeviceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Normalise a backend's peripheral identifier into the form downstream
+    /// consumers are told to expect: a bare, colon-separated, uppercase MAC
+    /// address whenever the platform put one in the identifier at all.
+    ///
+    /// This exists because the adapter a device was heard on is not part of the
+    /// device. BlueZ spells its `PeripheralId` `hci0/dev_F4_FE_FB_CC_78_58` — a
+    /// slash, a `dev_` marker, and underscores — and an identifier hashed with
+    /// the `hci0` still attached makes the same peripheral a different device on
+    /// a node that has a second dongle plugged in, or on the same node after a
+    /// reboot that renumbers the adapters.
+    ///
+    /// What it does, in order:
+    ///
+    /// 1. drop everything up to and including the last `/` (the D-Bus object
+    ///    path's adapter component), so the adapter cannot survive into the
+    ///    identifier even in a spelling this function has not been shown;
+    /// 2. turn `dev_XX_XX_XX_XX_XX_XX` into `XX:XX:XX:XX:XX:XX`;
+    /// 3. strip an `hci<digits>:` prefix, the spelling the `btleplug` backend's
+    ///    own comment originally claimed.
+    ///
+    /// Anything else passes through: a CoreBluetooth UUID has no address to
+    /// extract — Apple exposes none to a central — and Windows and Android
+    /// already report a bare MAC. An identifier that still is not a MAC after
+    /// this is the consumer's signal that it has no address, not a format error.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use bt_mon::DeviceId;
+    ///
+    /// // The identifier btleplug actually emits on BlueZ.
+    /// assert_eq!(
+    ///     DeviceId::from_platform_id("hci0/dev_F4_FE_FB_CC_78_58").as_str(),
+    ///     "F4:FE:FB:CC:78:58",
+    /// );
+    /// // A CoreBluetooth UUID: unchanged, because there is no address in it.
+    /// assert_eq!(
+    ///     DeviceId::from_platform_id("9cc22dd0-ff98-0ed2-b717-fe430544851b").as_str(),
+    ///     "9cc22dd0-ff98-0ed2-b717-fe430544851b",
+    /// );
+    /// ```
+    pub fn from_platform_id(raw: &str) -> Self {
+        Self(normalize_platform_id(raw))
+    }
+}
+
+/// See [`DeviceId::from_platform_id`] for what each step is for.
+fn normalize_platform_id(raw: &str) -> String {
+    // The adapter lives in front of the last slash, so dropping the prefix is
+    // what keeps it out of every branch below — including a future spelling whose
+    // tail this function does not recognise.
+    let tail = raw
+        .rsplit_once('/')
+        .map_or(raw, |(_, tail)| if tail.is_empty() { raw } else { tail });
+
+    if let Some(mac) = bluez_dev_marker(tail) {
+        return mac;
+    }
+
+    if let Some((prefix, rest)) = tail.split_once(':') {
+        if is_adapter_name(prefix) && !rest.is_empty() {
+            return rest.to_uppercase();
+        }
+    }
+
+    tail.to_string()
+}
+
+/// `dev_XX_XX_XX_XX_XX_XX` as `XX:XX:XX:XX:XX:XX`, requiring six pairs of hex
+/// digits so a device whose name happens to start with `dev_` is not mistaken
+/// for an address.
+fn bluez_dev_marker(tail: &str) -> Option<String> {
+    let groups: Vec<&str> = tail.strip_prefix("dev_")?.split('_').collect();
+    if groups.len() != 6 {
+        return None;
+    }
+
+    let mut mac = String::with_capacity(17);
+    for group in groups {
+        // The same two-hex-digit check `app`'s MAC parser applies, so a group
+        // this accepts is one that parser will not reject afterwards.
+        let mut chars = group.chars();
+        match (chars.next(), chars.next(), chars.next()) {
+            (Some(hi), Some(lo), None) if hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit() => {}
+            _ => return None,
+        }
+        if !mac.is_empty() {
+            mac.push(':');
+        }
+        mac.push_str(&group.to_ascii_uppercase());
+    }
+    Some(mac)
+}
+
+/// `hci0`, `hci1`, … — and not a hostname that merely starts with those letters.
+fn is_adapter_name(prefix: &str) -> bool {
+    prefix
+        .strip_prefix("hci")
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
 }
 
 impl fmt::Display for DeviceId {
@@ -201,16 +304,73 @@ pub struct BluetoothDevice {
     pub service_data: HashMap<ServiceUuid, Vec<u8>>,
     /// Whether services have been resolved.
     pub services_resolved: bool,
-    /// The advertisement payload as the backend reported it, undecoded.
+    /// The advertisement payload, as advertisement structures, from the data this
+    /// backend's stack reported.
     ///
     /// Distinct from [`manufacturer_data`](Self::manufacturer_data) and
     /// [`service_data`](Self::service_data), which are the fields the backend
-    /// parsed *out* of these bytes. Whether they exist at all depends on the
-    /// backend: a stack that hands over parsed properties only (btleplug on
-    /// BlueZ does exactly this) leaves this `None`, so `None` means "this
-    /// backend does not expose the raw payload", never "the device advertised
-    /// nothing".
+    /// parsed *out* of these bytes. What can be in here is decided by what the
+    /// stack hands over, and it differs per backend:
+    ///
+    /// | backend | `raw_payload` |
+    /// |---|---|
+    /// | `btleplug` | always `None` — `PeripheralProperties` carries parsed fields only, so there are no per-AD-type bytes to re-frame and no raw buffer |
+    /// | `bluer` | the advertisement re-framed as Length-Type-Data structures, built from the AD types BlueZ reported (`AdvertisingFlags`, `AdvertisingData`, `ManufacturerData`, `ServiceData`) |
+    /// | `mock` | the bytes the simulated advertiser says it put on the air |
+    ///
+    /// So `None` means "this backend does not expose the advertisement contents",
+    /// never "the device advertised nothing".
+    ///
+    /// Two limits on the `bluer` form, because a stored payload gets read back as
+    /// evidence later:
+    ///
+    /// * **It is re-framed, not captured.** BlueZ parses the on-air buffer, so the
+    ///   structures are re-assembled from its properties and their *order* need not
+    ///   match the air. Byte equality between two payloads is meaningful only as
+    ///   "this device's advertisement changed", never as "these two reports came
+    ///   from the same capture".
+    /// * **A structure that is absent may be absent because the stack did not
+    ///   report it.** BlueZ exposes only the AD types it parses, and the name is
+    ///   deliberately left out of the payload — BlueZ's `Name` may come from GATT
+    ///   resolution rather than the advertisement, and a structure invented from it
+    ///   would be an advertisement that never happened. Consumers must treat a
+    ///   missing AD type in a `bluer` payload as *unknown*, not as proof the device
+    ///   omitted it.
     pub raw_payload: Option<Vec<u8>>,
+    /// Where [`raw_payload`](Self::raw_payload) came from, and `None` exactly when
+    /// `raw_payload` is `None`.
+    ///
+    /// This exists because a stored advertisement gets read back as evidence. A
+    /// payload re-framed from a stack's parsed properties says something different
+    /// from one the radio handed over: in the re-framed form an AD type that is not
+    /// in it may be missing because the stack never reported it, so a consumer that
+    /// reasons from *absence* has to know which kind of payload it is holding. That
+    /// cannot be recovered from the bytes, and it is not recoverable from "which
+    /// backend was compiled in" once the row has crossed a federated link, so it
+    /// travels with the payload.
+    ///
+    /// Set only by [`with_raw_payload`](Self::with_raw_payload) (captured) and
+    /// [`with_reconstructed_raw_payload`](Self::with_reconstructed_raw_payload), so
+    /// the two fields cannot disagree. Not a tracked field: a backend cannot change
+    /// where its data came from part-way through a stream, so this never appears in
+    /// [`UpdateField`](crate::monitor::events::UpdateField).
+    pub raw_payload_source: Option<RawPayloadSource>,
+}
+
+/// Where a device's [`BluetoothDevice::raw_payload`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RawPayloadSource {
+    /// The octets as the radio reported them. Every AD type the device put on the
+    /// air is in here, and one that is absent was not advertised.
+    Captured,
+    /// Re-framed as Length-Type-Data structures from the advertisement properties
+    /// the stack exposed — see [`BluetoothDevice::raw_payload`] for the two limits
+    /// that follow (order is not the on-air order; an absent AD type is unknown,
+    /// not evidence of absence).
+    ///
+    /// A consumer that scores the *presence* of an AD structure may use this. A
+    /// consumer that scores its absence must not.
+    Reconstructed,
 }
 
 impl BluetoothDevice {
@@ -229,6 +389,7 @@ impl BluetoothDevice {
             service_data: HashMap::new(),
             services_resolved: false,
             raw_payload: None,
+            raw_payload_source: None,
         }
     }
 
@@ -273,15 +434,48 @@ impl BluetoothDevice {
         self
     }
 
-    /// Attach the undecoded advertisement payload.
+    /// Attach advertisement bytes the radio reported, labelled
+    /// [`RawPayloadSource::Captured`].
     ///
-    /// Backends that receive the advertisement as a byte string use this to pass
-    /// it through verbatim; see [`BluetoothDevice::raw_payload`] for what `None`
-    /// means to a consumer.
+    /// Use this only for bytes that *are* the advertisement. A payload re-assembled
+    /// from a stack's parsed properties is
+    /// [`with_reconstructed_raw_payload`](Self::with_reconstructed_raw_payload), and
+    /// the difference is what lets a consumer downstream tell an absent AD structure
+    /// from one the stack never reported — see
+    /// [`BluetoothDevice::raw_payload`](Self::raw_payload).
     pub fn with_raw_payload(mut self, payload: impl Into<Vec<u8>>) -> Self {
         self.raw_payload = Some(payload.into());
+        self.raw_payload_source = Some(RawPayloadSource::Captured);
         self
     }
+
+    /// Attach advertisement bytes re-framed from the properties the stack reported,
+    /// labelled [`RawPayloadSource::Reconstructed`].
+    pub fn with_reconstructed_raw_payload(mut self, payload: impl Into<Vec<u8>>) -> Self {
+        self.raw_payload = Some(payload.into());
+        self.raw_payload_source = Some(RawPayloadSource::Reconstructed);
+        self
+    }
+}
+
+/// One `Length-Type-Data` advertisement structure, as it goes over the air.
+///
+/// `None` when the data cannot be expressed as one structure: the length byte
+/// counts itself and the type, so 254 bytes of payload is the most that fits. A
+/// caller building a payload from stack-reported properties skips such a structure
+/// rather than truncating it, because a half-copied AD type is a lie about what the
+/// device advertised.
+#[cfg(any(feature = "bluer", feature = "mock"))]
+pub(crate) fn ad_structure(kind: u8, data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() > 254 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(data.len() + 2);
+    out.push((data.len() + 1) as u8);
+    out.push(kind);
+    out.extend_from_slice(data);
+    Some(out)
 }
 
 /// Represents a GATT service.
@@ -530,6 +724,16 @@ impl CharacteristicProperties {
 pub struct ValueNotification {
     /// The characteristic that sent the notification.
     pub characteristic: CharacteristicUuid,
+    /// The service containing [`characteristic`](Self::characteristic), when the
+    /// backend can attribute the frame to one.
+    ///
+    /// [`GattClient::notifications`](crate::monitor::GattClient::notifications) is
+    /// per device and carries every characteristic subscribed on it, so a consumer
+    /// multiplexing several subscriptions needs this to tell frames apart when two
+    /// services expose the same characteristic uuid. Each backend fills it from
+    /// what its own stack reports: btleplug from the service uuid on the frame,
+    /// bluer and the mock from the service the subscription was opened through.
+    pub service: Option<ServiceUuid>,
     /// The notification value.
     pub value: Vec<u8>,
     /// Optional timestamp when the notification was received.
@@ -543,6 +747,7 @@ impl ValueNotification {
     pub fn new(characteristic: CharacteristicUuid, value: Vec<u8>) -> Self {
         Self {
             characteristic,
+            service: None,
             value,
             timestamp: Some(std::time::Instant::now()),
         }
@@ -554,9 +759,16 @@ impl ValueNotification {
     pub fn without_timestamp(characteristic: CharacteristicUuid, value: Vec<u8>) -> Self {
         Self {
             characteristic,
+            service: None,
             value,
             timestamp: None,
         }
+    }
+
+    /// Name the service this frame came from.
+    pub fn with_service(mut self, service: ServiceUuid) -> Self {
+        self.service = Some(service);
+        self
     }
 
     /// Get the notification value as a slice.
@@ -714,5 +926,114 @@ mod tests {
         let cloned = device.clone();
         assert_eq!(device.id, cloned.id);
         assert_eq!(device.name, cloned.name);
+    }
+
+    /// The identifier captured on real BlueZ hardware on 2026-10-13 (M37), where
+    /// every one of 173 rows hashed `hci0/dev_F4_FE_FB_CC_78_58` because nothing
+    /// recognised this spelling. A btleplug bump that changes it again has to
+    /// break this test rather than silently change what a node hashes.
+    #[test]
+    fn the_bluez_peripheral_id_becomes_a_bare_mac() {
+        assert_eq!(
+            DeviceId::from_platform_id("hci0/dev_F4_FE_FB_CC_78_58").as_str(),
+            "F4:FE:FB:CC:78:58"
+        );
+        // The whole object path, in case a future Display stops stripping it.
+        assert_eq!(
+            DeviceId::from_platform_id("/org/bluez/hci0/dev_F4_FE_FB_CC_78_58").as_str(),
+            "F4:FE:FB:CC:78:58"
+        );
+        // Lowercase from a stack that prints it that way is the same address.
+        assert_eq!(
+            DeviceId::from_platform_id("hci0/dev_f4_fe_fb_cc_78_58").as_str(),
+            "F4:FE:FB:CC:78:58"
+        );
+    }
+
+    /// The spelling `peripheral_id_to_device_id`'s own comment claimed, which the
+    /// fix still has to honour: stripping the adapter prefix off a colon form.
+    #[test]
+    fn the_colon_spelling_the_old_comment_claimed_still_works() {
+        assert_eq!(
+            DeviceId::from_platform_id("hci0:AA:BB:CC:DD:EE:FF").as_str(),
+            "AA:BB:CC:DD:EE:FF"
+        );
+        assert_eq!(
+            DeviceId::from_platform_id("hci12:aa:bb:cc:dd:ee:ff").as_str(),
+            "AA:BB:CC:DD:EE:FF"
+        );
+    }
+
+    /// A CoreBluetooth identifier carries no address — Apple exposes none to a
+    /// central — so rewriting it would invent one.
+    #[test]
+    fn a_core_bluetooth_uuid_passes_through_unchanged() {
+        let uuid = "9cc22dd0-ff98-0ed2-b717-fe430544851b";
+        assert_eq!(DeviceId::from_platform_id(uuid).as_str(), uuid);
+    }
+
+    /// An identifier with no address in it at all stays as it arrived, minus the
+    /// adapter: the consumer's job is to report "no address", not to guess.
+    #[test]
+    fn an_identifier_with_no_address_passes_through_unchanged() {
+        assert_eq!(
+            DeviceId::from_platform_id("some-device-path").as_str(),
+            "some-device-path"
+        );
+        assert_eq!(DeviceId::from_platform_id("").as_str(), "");
+        // A Windows or Android id already arrives bare.
+        assert_eq!(
+            DeviceId::from_platform_id("AA:BB:CC:DD:EE:FF").as_str(),
+            "AA:BB:CC:DD:EE:FF"
+        );
+    }
+
+    /// The adapter a device was heard on must not survive into the identifier —
+    /// which is the half of M37 that made one peripheral look like two devices.
+    #[test]
+    fn the_adapter_name_never_survives() {
+        for adapter in ["hci0", "hci1", "hci37"] {
+            assert_eq!(
+                DeviceId::from_platform_id(&format!("{adapter}/dev_F4_FE_FB_CC_78_58")).as_str(),
+                "F4:FE:FB:CC:78:58"
+            );
+        }
+        // An unrecognised tail still loses the adapter rather than keeping it.
+        assert_eq!(
+            DeviceId::from_platform_id("hci0/something_else").as_str(),
+            "something_else"
+        );
+    }
+
+    /// `dev_` is a BlueZ marker, not a general prefix: accepting fewer than six
+    /// pairs, or non-hex pairs, would turn a name into an address.
+    #[test]
+    fn a_partial_or_malformed_dev_marker_is_not_read_as_a_mac() {
+        for raw in [
+            "dev_F4_FE_FB_CC_78",
+            "dev_F4_FE_FB_CC_78_58_99",
+            "dev_F4_FE_FB_CC_78_ZZ",
+            "dev_F4_FE_FB_CC_78_5",
+            "device_not_an_address",
+        ] {
+            assert_eq!(
+                DeviceId::from_platform_id(raw).as_str(),
+                raw,
+                "{raw} was rewritten into an address it does not contain"
+            );
+        }
+    }
+
+    /// `hci` as the start of a word is not an adapter number.
+    #[test]
+    fn only_a_numbered_adapter_prefix_is_stripped() {
+        assert_eq!(
+            DeviceId::from_platform_id("hciX:AA:BB:CC:DD:EE:FF").as_str(),
+            "hciX:AA:BB:CC:DD:EE:FF"
+        );
+        assert_eq!(
+            DeviceId::from_platform_id("hci:AA:BB:CC:DD:EE:FF").as_str(),
+            "hci:AA:BB:CC:DD:EE:FF"
+        );
     }
 }

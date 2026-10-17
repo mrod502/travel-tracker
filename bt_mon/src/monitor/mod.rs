@@ -10,8 +10,10 @@ use crate::monitor::events::{DeviceEventStream, NotificationStream};
 use crate::types::{BluetoothDevice, CharacteristicUuid, DeviceId, GattService};
 
 pub mod events;
+pub mod health;
 
 pub use events::{DeviceEvent, NotificationEvent, UpdateField};
+pub use health::MonitorHealth;
 
 /// Device monitoring interface for discovering and tracking Bluetooth devices.
 ///
@@ -82,12 +84,32 @@ pub trait DeviceMonitor: Send + Sync {
     /// Returns an error if event stream cannot be created.
     async fn device_events(&self) -> Result<DeviceEventStream>;
 
-    /// Check if currently scanning.
+    /// Whether this monitor believes a scan is happening right now.
+    ///
+    /// This is the radio's state, not the operator's request: a backend that has been
+    /// told the adapter is off, or that cannot re-arm a scan that lapsed, answers
+    /// `false` even though a `start_scan` is still in effect. Use
+    /// [`MonitorHealth::scanning_requested`] when the question is what was asked for,
+    /// and [`Self::health`] when it is why the two disagree.
     ///
     /// # Errors
     ///
     /// Returns an error if scanning status cannot be determined.
     async fn is_scanning(&self) -> Result<bool>;
+
+    /// What this monitor can say about its own ability to hear the radio.
+    ///
+    /// A [`DeviceEvent`](DeviceEvent) is a report about a device, so a radio that was
+    /// toggled off, an event stream that ended, or a scan that will not re-arm had no
+    /// way to reach a consumer at all — a dead adapter looked exactly like an empty
+    /// room, and a node reported nothing while claiming to scan. These counters are that
+    /// other channel, readable by anything long-running enough to poll.
+    ///
+    /// `None` means this backend measures nothing. It is deliberately different from a
+    /// snapshot of zeroes: one is a fact about the build, the other would be an alarm.
+    fn health(&self) -> Option<MonitorHealth> {
+        None
+    }
 }
 
 /// GATT client interface for interacting with connected devices.

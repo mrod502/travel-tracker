@@ -6,12 +6,12 @@
 //! # Running the example
 //!
 //! ```bash
-//! # Using the default (btleplug) backend
+//! # btleplug backend (the default; this example is gated on that feature)
 //! cargo run --example connect_and_read -- <device_id>
-//!
-//! # Using the bluer backend (Linux only)
-//! cargo run --example connect_and_read --features bluer --no-default-features -- <device_id>
 //! ```
+//!
+//! The same calls on the BlueZ backend are in
+//! [`bluer_scan_and_gatt.rs`](bluer_scan_and_gatt.rs).
 //!
 //! # Arguments
 //!
